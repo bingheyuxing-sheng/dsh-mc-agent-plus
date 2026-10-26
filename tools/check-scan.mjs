@@ -10,7 +10,7 @@
  */
 import { readFileSync } from 'node:fs'
 import { Vec3 } from 'vec3'
-import { scanAround, statNameOf } from '../src/world-scan.mjs'
+import { scanAround, statNameOf, statMatches } from '../src/world-scan.mjs'
 
 let pass = 0
 let fail = 0
@@ -129,7 +129,12 @@ section('⑥ 水/岩浆分「源头」和「流动」（2026-10-26 用户：“�
   const flow = scanAround(b, { radius: 2, height: 1, name: 'flowing_water' })
   ok(flow.total === 1 && flow.found?.[0] === '1,70,0', 'name=flowing_water 只找到流动那格', JSON.stringify(flow.found))
   const src = scanAround(b, { radius: 2, height: 1, name: 'water' })
-  ok(src.total === 1 && src.found?.[0] === '0,70,0', 'name=water 只找到源头那格', JSON.stringify(src.found))
+  ok(src.total === 2, 'name=water 源头 + 流动都找到（族名不做过滤）', String(src.total))
+  ok((src.blocks ?? []).some((x) => x.stat === 'flowing_water'),
+    '每条用 stat 标出是哪种（流动那条标了）', JSON.stringify(src.blocks))
+  ok(statMatches('flowing_lava', 'lava') && statMatches('lava', 'lava'), 'name=lava 也匹配流动岩浆')
+  ok(!statMatches('water', 'flowing_water') && !statMatches('lava', 'flowing_lava'), '点流动的只给流动的')
+  ok(!statMatches('flowing_water', 'lava') && !statMatches('oak_log', 'water'), '不串族')
 }
 
 console.log(`\n${fail ? '❌' : '✅'} ${pass} 通过 / ${fail} 失败`)

@@ -3684,8 +3684,9 @@ export function apply(ctx, rawConfig) {
       /* 🔵 2026-10-26 用户：「现在流动的水 scan 出来也是水，区分一下」——
        *    1.13+ 水/岩浆只有 `water`/`lava` 一个名字，源头和流动靠 `level` 状态区分。
        *    现在统计和点名都拆开了：要流动水就传 `flowing_water`，别再传 `water` 然后嫌它少。 */
-      + '\n· 水/岩浆按状态分开：`water`（源头）/`flowing_water`（流动）/`lava`（源头）/`flowing_lava`（流动），'
-      + '`name` 也按这个认。',
+      + '\n· 占比里水/岩浆按状态分开：`water`（源头）/`flowing_water`（流动）/`lava`/`flowing_lava`。'
+      + '`name` 传族名（`water`/`lava`）会连流动的一起找（每条用 `stat` 标出是哪一种）；'
+      + '只想找流动的就传 `flowing_water`/`flowing_lava`。',
     parameters: {
       radius: { type: 'number', description: '水平半径（默认 16，上限 48）' },
       height: { type: 'number', description: '垂直范围 ±（默认 4，上限 16）' },

@@ -44,6 +44,21 @@ export function statNameOf (blk) {
   return lv === 0 ? n : (n === 'water' ? 'flowing_water' : 'flowing_lava')
 }
 
+/**
+ * `name` 点名时判断这一格算不算。
+ *
+ * 🔴 2026-10-27 用户追问「scan lava 会输出流动的吗」之后定的语义：
+ *    · 传族名 `water` / `lava` ⇒ **这一族全要**（源头 + 流动）。查危险、找避让路线时
+ *      漏掉流动岩浆就等于漏掉一半危险，所以族名不做过滤；
+ *    · 传 `flowing_water` / `flowing_lava` ⇒ 只要流动的那部分。
+ * 占比统计不受影响，仍然是源头、流动各占一行。
+ */
+export function statMatches (stat, want) {
+  if (!want) return false
+  if (stat === want) return true
+  return (want === 'water' || want === 'lava') && stat === `flowing_${want}`
+}
+
 export function scanAround (b, { radius = 16, height = 4, name = null, limit = 10, y = null } = {}) {
   /* 半径默认 16 = **1 区块**（2026-10-13 用户要求，先定 32 后改回 16）：一次扫 33×33 格，
    * 找树 / 找矿 / 找水源够用，又不至于每次调用都查几万格。上限 48 留给显式传大半径的场合。 */
@@ -87,7 +102,7 @@ export function scanAround (b, { radius = 16, height = 4, name = null, limit = 1
         /* 点名与计数都走 `statNameOf`：`water` 只认源头，`flowing_water` 只认流动 */
         const stat = statNameOf(blk)
         if (name) {
-          if (stat === name) {
+          if (statMatches(stat, name)) {
             /* 🔴 2026-10-08 第五份审计报告 ③：以前只 `found.push` 再 `slice(0, limit)` ——
              *    而三层循环是 `dx → dz → dy`，所以"前 N 个"全落在 x/z 最负的那个角
              *    （半径 24 时能差 30 多格）。AI 于是跑去够不着的地方挖，或据此判"附近没有"。
@@ -102,7 +117,7 @@ export function scanAround (b, { radius = 16, height = 4, name = null, limit = 1
               const p = blk.getProperties?.()
               if (p && Object.keys(p).length) state = p
             } catch { state = null }
-            found.push({ pos: `${pos.x},${pos.y},${pos.z}`, d: Math.round(d * 10) / 10, state })
+            found.push({ pos: `${pos.x},${pos.y},${pos.z}`, d: Math.round(d * 10) / 10, state, stat })
           }
         } else counts.set(stat, (counts.get(stat) ?? 0) + 1)
       }
@@ -134,6 +149,9 @@ export function scanAround (b, { radius = 16, height = 4, name = null, limit = 1
           pos: f.pos,
           distance: f.d,
           ...(crop ? { age: crop.age, maxAge: crop.maxAge, ripe: crop.ripe } : {}),
+          /* 传族名（water/lava）点名时，把这一条到底是源头还是流动标出来 ——
+           * 否则 `name:"lava"` 一次返回十几条，看不出哪条是流过来的。 */
+          ...(f.stat && f.stat !== name ? { stat: f.stat } : {}),
           ...(f.state ? { state: f.state } : {}),
         }
       }),
