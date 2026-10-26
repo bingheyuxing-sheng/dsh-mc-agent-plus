@@ -1,7 +1,7 @@
 # dsh-mc-agent —— 让 DSH 里的 AI 真的去玩 Minecraft
 
 在 [DeepSeek Harness](https://github.com/deepseek-ai/dsh)（DSH）里给 AI 一副**能动手的身体**：
-40 个 `mc_*` 工具，覆盖进服、寻路、挖矿、合成、熔炼、存取箱子、村民交易、睡觉种地、按图盖房、看第一人称画面、记账。
+41 个 `mc_*` 工具，覆盖进服、寻路、挖矿、合成、熔炼、存取箱子、村民交易、睡觉种地、按图盖房、看第一人称画面、记账。
 它不是在"描述"游戏，是真的在玩。
 
 本仓库是 [whale-craft](https://github.com/yzi1b/whale-craft)（作者 yzi1b）的魔改版，改名 `dsh-mc-agent`。
@@ -53,7 +53,7 @@ pnpm add mineflayer-pathfinder mineflayer-collectblock mineflayer-tool mineflaye
 ## 自检（不连服务器也能跑）
 
 ```bash
-node tools\check-all.mjs          # 43 项，几分钟
+node tools\check-all.mjs          # 80 项，几分钟
 node tools\check-all.mjs --fast   # 跳过 selfcheck
 ```
 

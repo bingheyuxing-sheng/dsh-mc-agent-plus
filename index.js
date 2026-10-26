@@ -76,6 +76,7 @@ import { buildConnectPrompt } from './src/connect-prompt.mjs'
 import { waitForEvents } from './src/wait.mjs'
 import { launchBoat } from './src/boat.mjs'
 import { lookTrack } from './src/look-track.mjs'
+import { WorldRegistry, WORLDS_FILE, WORLDS_DIR, UNCONNECTED_KEY, addrKeyOf, isOwnHost, normalizeHost, safeWorldDir, worldNameFromMotd } from './src/worlds.mjs'
 
 export const name = 'dsh-mc-agent'
 export const inject = ['webServer', 'tools']
@@ -466,6 +467,14 @@ export function apply(ctx, rawConfig) {
   const stateDir = resolveStateDir({ dshHomePath, stateDirOverride: process.env.DSH_MC_AGENT_DIR })
   registry.lockDir = stateDir      // 会话锁文件也放插件自己的家（别写进插件包目录）
 
+  /* ── 世界登记表（`<插件状态目录>/worlds.json`）：记忆「按世界分」时由它认定"哪个世界" ──────
+   * 用户 2026-10-26：MC 设置里加选项「按世界存记忆 / 按会话存记忆」，
+   * 且「因为如果是 dhcp 地址有可能会变」→ 不能直接拿地址当世界标识，得有一张可编辑的
+   * 「地址 → 世界」对应表（同一个世界可以挂多个地址，DHCP 换地址后把新地址指过去即可）。
+   * 详见 src/worlds.mjs 顶部注释。
+   * ------------------------------------------------------------------------ */
+  const worlds = new WorldRegistry(join(stateDir, WORLDS_FILE), { log: (m) => logLine(m) })
+
   /* ── 记忆 / 提示词：挂在**会话工作区**下，不再假设"插件装在工作区里" ──────────────
    * 抽取成标准插件后，包可能装在 `node_modules/` 或任意目录，**不能**再用 `__dirname/..` 推工作区。
    * 正路：宿主给工具的 `exec.agent.session.header.cwd` 就是该会话的工作区（tool-fs 同款来源）。
@@ -479,14 +488,13 @@ export function apply(ctx, rawConfig) {
     return typeof cwd === 'string' && cwd.trim() !== '' ? cwd : null
   }
 
-  /* ── 记忆按会话分（本机补丁 2026-10-06，用户要求）────────────────────────────
-   * 起因：用户 m07514「现在不同会话用的是同一份记忆，我新建存档和会话了，它还是之前的」。
-   * 之前的记忆根是**全局**的（`config.memoryDir` 一设，所有会话共用一份），
-   * 所以换个存档/换个会话，AI 读到的还是上一个世界的 progress.md / landmarks.md。
-   * 打开后：`<memoryDir>/sessions/<短会话 id>/`，新会话 = 干净记忆（RULES.md 等从基根播种）。
-   * 🔴 **默认关**（`memoryPerSession !== true` 就完全走老路径）——这样默认布局、上游自检
-   *    （selfcheck 里好几处靠"记忆根 = 工作区或临时目录"）行为一字不变；
-   *    要开：`mc_admin_config set memoryPerSession true`。
+  /* ── 记忆按什么分（用户 2026-10-26：「在 mc 设置里添加选项，可选按世界存记忆还是按会话存记忆」）──
+   * `memoryScope` 三态（见 src/config.mjs）：
+   *   · `'world'` = `<基根>/worlds/<世界目录>/`：同一世界开几个会话都共享一份，换世界换一份；
+   *   · `'session'`         = `<基根>/sessions/<短会话 id>/`（2026-10-06 的补丁，现在只是取值之一）；
+   *   · `'shared'`          = 老行为：全部共用基根（老配置 `memoryPerSession:false` 迁移过来就是它）。
+   * 世界由 `src/worlds.mjs` 的登记表认定：服务器按地址、本地按存档名（`localWorldName`）；
+   * 还没连过 / 认不出地址 → `<基根>/worlds/_unconnected/`（先放临时筐，绝不跟别的世界混在一起）。
    * ------------------------------------------------------------------------ */
   /** 会话 id（agent.id；拿不到就 null）—— 记忆按会话分时用它当文件夹名 */
   const agentIdOf = (agent) => {
@@ -515,17 +523,77 @@ export function apply(ctx, rawConfig) {
     return id
   }
 
-  /** 记忆**基根**（不含按会话分的子目录）—— 播种时要的是它，不能用 memoryRootFor（它可能已落到会话根） */
+  /** 记忆**基根**（不含按世界/按会话分的子目录）—— 播种、默认提示词版本同步要的都是它 */
   const memoryBaseFor = (cwd) => {
     const explicit = process.env.DSH_MC_AGENT_MEMORY_DIR ?? pluginConfig.memoryDir
     return explicit || (cwd ? join(cwd, '.dsh-mc-agent') : (process.env.DSH_MC_AGENT_DIR ? stateDir : join(stateDir, 'memory')))
   }
 
+  /**
+   * 这个会话当前连的**世界**（登记表条目）；拿不到连接信息就 null。
+   * 地址没登记过 → **自动登记**一个新世界（名字先取地址，之后可在「MC设置 → 记忆」里改名/归并）。
+   * 只在 `memoryScope === 'world'` 时被调用（别的模式不碰登记表，行为与升级前一致）。
+   */
+  const worldOfSession = (agentId = null) => {
+    const sess = agentId ? registry.peek(agentId) : null
+    let conn = null
+    try { conn = sess?.bot?.connectionView?.() ?? null } catch { conn = null }
+    const host = normalizeHost(conn?.host)
+    if (!host) return null
+    // 本机**与局域网**都按存档名认（用户 2026-10-26：「局域网的 192.168.1.4:25565 联机，但还是按服务器存」）
+    const local = isOwnHost(host)
+    /* 存档名从哪来（只有自己开的服才这么认）：
+     *   ① 进服时 ping 到的 MOTD 里 ` - ` 后面那段（`Bluezi - test` ⇒ `test`，见 learnWorldFromMotd）
+     *   ② 设置里手填的「本地存档名」（`localWorldName`）
+     *   ③ 都没有 ⇒ 退回 `localhost:<端口>` / `<ip>:<端口>`
+     * 服务器名称（MOTD 前半段）**不参与** —— 用户 2026-10-26：「服务器名称不要影响世界名」。 */
+    const localName = local ? (worlds.motdWorld(host, conn?.port) || pluginConfig.localWorldName) : ''
+    const addr = addrKeyOf(conn, { localName })
+    if (!addr) return null
+    const hit = worlds.byAddr(addr)
+    if (hit) return hit
+    try {
+      return worlds.ensure({ addr, name: local ? (localName || addr) : addr, local })
+    } catch (e) {
+      logDebug(`世界登记失败（记忆先落到 ${UNCONNECTED_KEY}）：${e?.message ?? e}`)
+      return null
+    }
+  }
+
+  /**
+   * 进服后认一下**世界名**（用户 2026-10-26 指出的界面那行 `Bluezi - test`）：
+   * 「对局域网开放」的 MOTD 固定是 `<玩家名> - <世界名>`，后半段就是存档名。
+   * 认出来就写进内存缓存，`worldOfSession` 随即按它落目录 —— 比手填准，DHCP 换 IP 也不受影响。
+   * 🔴 专用服不认：MOTD 是服主随手写的（「欢迎来到xx」），认错会把记忆扔进奇怪的目录。
+   * 失败一律静默（ping 不到就沿用设置里的存档名），绝不阻断进服。
+   * @returns {Promise<string>} 认出来的世界名；没认出来 = 空串
+   */
+  const learnWorldFromMotd = async (sess) => {
+    if (pluginConfig.memoryScope !== 'world') return ''
+    let conn = null
+    try { conn = sess?.bot?.connectionView?.() ?? null } catch { return '' }
+    const host = normalizeHost(conn?.host)
+    if (!host || !isOwnHost(host)) return ''
+    const port = Number(conn?.port) || 25565
+    try {
+      const p = await statusPing({ host, port, timeoutMs: 1500 })
+      const wn = worldNameFromMotd(p?.motd)
+      // 认不出来就清掉旧缓存（同一个地址换了存档、或服主改了 MOTD 格式）—— 别拿旧世界名硬套
+      worlds.setMotdWorld(host, port, wn)
+      if (wn) logDebug(`MOTD 认出世界名：${wn}（${host}:${port}）`)
+      return wn
+    } catch { return '' }
+  }
+
+  /** 记忆根（按 `memoryScope` 分；三态的落点见上面那段注释） */
   const memoryRootFor = (cwd, agentId = null) => {
     const base = memoryBaseFor(cwd)
-    if (pluginConfig.memoryPerSession !== true) return base
+    const scope = pluginConfig.memoryScope
+    if (scope === 'shared') return base
     const id = agentId ?? (cwd ? lastAgentByCwd.get(cwd) ?? null : null)
-    return id ? join(base, 'sessions', sessionDirName(id)) : base
+    if (scope === 'session') return id ? join(base, 'sessions', sessionDirName(id)) : base
+    const w = worldOfSession(id)
+    return w ? join(base, WORLDS_DIR, w.dir) : join(base, WORLDS_DIR, UNCONNECTED_KEY)
   }
 
   /**
@@ -751,7 +819,7 @@ export function apply(ctx, rawConfig) {
    *   只显示**这个会话的记忆文件在哪**（lessons.md / world.md …），并且能打开文件夹」。
    * 🔴 目录照旧由服务端推导（`memoryRootFor`），**不接受客户端给的任意路径**。
    * ------------------------------------------------------------------------ */
-  const memoryDirView = (dir) => {
+  const memoryDirView = (dir, { agentId = null } = {}) => {
     let entries = []
     try { entries = readdirSync(dir, { withFileTypes: true }) } catch { entries = [] }
     const files = []
@@ -770,10 +838,19 @@ export function apply(ctx, rawConfig) {
     const rank = (n) => (n === 'README.md' ? 0 : 1)
     files.sort((a, b) => rank(a.name) - rank(b.name) || a.name.localeCompare(b.name))
     dirs.sort((a, b) => a.name.localeCompare(b.name))
+    const scope = pluginConfig.memoryScope
+    const world = scope === 'world' ? worldOfSession(agentId) : null
     return {
       dir,
       exists: existsSync(dir),
-      memoryPerSession: pluginConfig.memoryPerSession === true,
+      /** 记忆分法（`world` / `session` / `shared`）—— 页面顶部的选择器读它 */
+      memoryScope: scope,
+      /** 兼容老字段：以前只有"按会话分"一个开关 */
+      memoryPerSession: scope === 'session',
+      /** `memoryScope === 'world'` 时：这份记忆属于哪个世界（没连过 = null，目录落在 `_unconnected`） */
+      world: world ? worlds.viewOf(world) : null,
+      /** 本地存档名（页面上的输入框读它；只有连本地服才有意义） */
+      localWorldName: pluginConfig.localWorldName,
       files,
       dirs,
     }
@@ -882,7 +959,13 @@ export function apply(ctx, rawConfig) {
     accounts.ensureDefaults()
   }
   /** 「连接到MC」弹窗的服务器地址历史（**全局**，只存地址；见 src/serverhistory.mjs） */
-  const serverHistory = new ServerHistory({ dir: stateDir })
+  const serverHistory = new ServerHistory({ dir: stateDir, log: logLine })
+  /* 🔴 2026-10-26 审计：`loadFailed` / `loadError` 这对访问器是 2026-10-15 为"读失败要说一声"加的，
+   *   但加完之后**没有任何地方读它** ⇒ 服务器历史读坏了照样静默按空跑。照 accounts 的样子在这里报一次。 */
+  if (serverHistory.loadFailed) {
+    logLine(`🔴 服务器地址历史读取失败，已按空跑（列表是空的，但之后新记的会覆盖写回）：${serverHistory.loadError ?? '原因不明'}`
+      + `\n　　→ 文件：${serverHistory.file}`)
+  }
   // 凭据服务可能晚就绪 → 必须 ctx.inject 等（老教训：apply() 时 ctx.get() 常是 undefined）
   ctx.inject(['credentials'], (scope) => {
     accounts.credentials = scope.get('credentials') ?? null
@@ -1249,6 +1332,12 @@ export function apply(ctx, rawConfig) {
       // 「MC设置 → 文件分享」：开关 + base（只有"在线"这一种方式，见 config.mjs `expressEnabled`）
       expressEnabled: pluginConfig.expressEnabled,
       expressBase: pluginConfig.expressBase,
+      /* 「MC设置 → 记忆」页顶部的两个新控件（2026-10-26）：
+       *   · memoryScope  = 记忆按什么分（world 按世界 / session 按会话 / shared 全共用）
+       *   · localWorldName = 本地存档名（服务器不广播 level-name，只能手填） */
+      memoryScope: pluginConfig.memoryScope,
+      localWorldName: pluginConfig.localWorldName,
+      memoryPerSession: pluginConfig.memoryScope === 'session',   // 兼容老前端
       // 「MC设置」入口的模式门控：前端拿这份名单 + 会话记录的 preset 就能**本地**判定
       // （不必为按钮问一次服务端；2026-09-16 事故：一次性请求失败后按钮永久消失）
       mcModePresets: pluginConfig.mcModePresets,
@@ -1581,7 +1670,7 @@ export function apply(ctx, rawConfig) {
       const cwd = await cwdOf(body)
       if (cwd) ensureMemoryRootForCwd(cwd, agentIdOf(safeAgentById(body?.sessionId ?? url?.searchParams?.get('sessionId'))))
       // 全局键 → PluginConfig（**无条件**）；三个提示词开关 → **本工作区**的 config.json（有工作区才写）
-      for (const k of ['commandWhitelist', 'allowAllCommands', 'expressEnabled', 'expressBase']) {
+      for (const k of ['commandWhitelist', 'allowAllCommands', 'expressEnabled', 'expressBase', 'memoryScope', 'localWorldName']) {
         if (body[k] !== undefined) pluginConfig.set(k, body[k])
       }
       const wsPatch = {}
@@ -1626,7 +1715,8 @@ export function apply(ctx, rawConfig) {
       const gate = await gateOf()
       if (!gate.ok) return sendJson(res, 400, { ok: false, error: gate.error })
       const sid = String(url?.searchParams?.get('sessionId') ?? '')
-      return ok(memoryDirView(memoryRootFor(gate.cwd, agentIdOf(safeAgentById(sid)))))
+      const agentId = agentIdOf(safeAgentById(sid))
+      return ok(memoryDirView(memoryRootFor(gate.cwd, agentId), { agentId }))
     }
     if (path === '/api/mc/memory/open' && req.method === 'POST') {
       const gate = await gateOf()
@@ -1634,6 +1724,82 @@ export function apply(ctx, rawConfig) {
       const sid = String(body?.sessionId ?? url?.searchParams?.get('sessionId') ?? '')
       const dir = memoryRootFor(gate.cwd, agentIdOf(safeAgentById(sid)))
       return ok(await openInFileManager(dir, body?.name ? String(body.name) : null))
+    }
+
+    /* ── 「MC设置 → 记忆」：世界登记表（`memoryScope === 'world'` 时"哪个世界"由它说了算）──────
+     * 用户 2026-10-26：「可选按世界存记忆还是按会话存记忆」+「因为如果是 dhcp 地址有可能会变」。
+     * 地址变了**不用搬文件夹**：把新地址 `link` 到同一个世界，记忆照旧接着用。
+     *   · GET  `/api/mc/worlds?sessionId=` → 当前连接地址 + 全部世界（带 `matchesCurrent`）
+     *   · POST `/api/mc/worlds` { action, … } → rename / link / unlink / remove / create
+     * 🔴 只动登记表与 `worlds/<dir>` 目录，**从不**改记忆文件内容（`remove` 默认也只删登记）。
+     * ------------------------------------------------------------------------ */
+    const worldsView = (cwd, sid) => {
+      const agentId = agentIdOf(safeAgentById(String(sid ?? '')))
+      const sess = agentId ? registry.peek(agentId) : null
+      let conn = null
+      try { conn = sess?.bot?.connectionView?.() ?? null } catch { conn = null }
+      const addr = addrKeyOf(conn, { localName: pluginConfig.localWorldName })
+      const base = memoryBaseFor(cwd)
+      const cur = addr ? worlds.byAddr(addr) : null
+      return {
+        memoryScope: pluginConfig.memoryScope,
+        localWorldName: pluginConfig.localWorldName,
+        base,
+        worldsDir: join(base, WORLDS_DIR),
+        /** 当前这个会话连的地址（没连过 = `addr: ''`）；`unconnected` = 记忆暂落 `_unconnected` */
+        current: {
+          host: conn?.host ?? null,
+          port: conn?.port ?? null,
+          addr,
+          worldId: cur?.id ?? null,
+          unconnected: !addr,
+        },
+        /** 登记表读盘失败时的原因（页面提示用；不影响记忆本身） */
+        loadError: worlds.loadError,
+        worlds: worlds.list().map((w) => worlds.viewOf(w, { addr: addr || null })),
+      }
+    }
+    if (path === '/api/mc/worlds' && req.method === 'GET') {
+      const gate = await gateOf()
+      if (!gate.ok) return sendJson(res, 400, { ok: false, error: gate.error })
+      const sid = String(url?.searchParams?.get('sessionId') ?? '')
+      return ok(worldsView(gate.cwd, sid))
+    }
+    if (path === '/api/mc/worlds' && req.method === 'POST') {
+      const gate = await gateOf()
+      if (!gate.ok) return sendJson(res, 400, { ok: false, error: gate.error })
+      const sid = String(body?.sessionId ?? url?.searchParams?.get('sessionId') ?? '')
+      const base = memoryBaseFor(gate.cwd)
+      const action = String(body?.action ?? '').trim()
+      let done = null
+      try {
+        if (action === 'create') {
+          done = { created: worlds.viewOf(worlds.create({ name: body?.name, local: body?.local === true })) }
+        } else if (action === 'rename') {
+          const r = worlds.rename(String(body?.id ?? ''), body?.name, { base })
+          done = { entry: worlds.viewOf(r.entry), moved: r.moved }
+        } else if (action === 'link') {
+          /* 不给 addr 就用**当前连接地址**（页面上"把当前地址指到这个世界"最常用） */
+          const agentId = agentIdOf(safeAgentById(sid))
+          const sess = agentId ? registry.peek(agentId) : null
+          let conn = null
+          try { conn = sess?.bot?.connectionView?.() ?? null } catch { conn = null }
+          const addr = String(body?.addr ?? '').trim() || addrKeyOf(conn, { localName: pluginConfig.localWorldName })
+          if (!addr) throw new Error('还没有连接地址：先连一次服务器，或手动填地址')
+          done = { entry: worlds.viewOf(worlds.link(addr, String(body?.id ?? ''))), addr }
+        } else if (action === 'unlink') {
+          const w = worlds.unlink(String(body?.addr ?? ''))
+          done = { entry: w ? worlds.viewOf(w) : null }
+        } else if (action === 'remove') {
+          done = { removed: worlds.viewOf(worlds.remove(String(body?.id ?? ''), { base, purge: body?.purge === true })) }
+        } else {
+          throw new Error(`未知动作 "${action}"（可用：create / rename / link / unlink / remove）`)
+        }
+      } catch (e) {
+        return sendJson(res, 400, { ok: false, error: e?.message ?? String(e) })
+      }
+      logLine(`「MC设置 → 记忆」世界登记：${action}${done?.entry?.name ? `（${done.entry.name}）` : ''}`)
+      return ok({ ...done, ...worldsView(gate.cwd, sid) })
     }
 
     /* ── 更新（「MC设置 → 更新」页，用户 2026-10-20）─────────────────────────────
@@ -2376,6 +2542,7 @@ export function apply(ctx, rawConfig) {
     if (path.startsWith('/api/mc/accounts') || path.startsWith('/api/mc/authservers')
       || path.startsWith('/api/mc/agents-md') || path === '/api/mc/config'
       || path === '/api/mc/express' || path === '/api/mc/memory' || path === '/api/mc/memory/open'
+      || path === '/api/mc/worlds'
       || path === '/api/mc/update' || path === '/api/mc/update/apply'
       || path === '/api/mc/presets'
       || path === '/api/mc/servers' || path === '/api/mc/lan') {
@@ -3093,6 +3260,8 @@ export function apply(ctx, rawConfig) {
         throw withUserHint(e, resolved.label)
       }
       sess.mode = 'active'
+      // 世界名从 MOTD 认（必须赶在 attachChatLog / 记忆根计算**之前**，否则这次进服还按旧世界落）
+      await learnWorldFromMotd(sess)
       // 记忆里的聊天记录（用户 2026-10-20）：进服就把钩子挂上，之后每条公屏都进 chat-log.md
       const chatLogRoot = attachChatLog(sess, exec?.agent)
       const ready = await sess.bot.waitForChunks()
@@ -3511,7 +3680,12 @@ export function apply(ctx, rawConfig) {
   ctx.tools.register(asTool({
     name: 'mc_scan',
     description: '扫描我周围方块：给 name 就找这种方块的位置；不给就返回方块占比（分母不含空气）。'
-      + '\n· 竖向窗口默认以脚底为中心 ±height；看高处传 `y` 指定中心。',
+      + '\n· 竖向窗口默认以脚底为中心 ±height；看高处传 `y` 指定中心。'
+      /* 🔵 2026-10-26 用户：「现在流动的水 scan 出来也是水，区分一下」——
+       *    1.13+ 水/岩浆只有 `water`/`lava` 一个名字，源头和流动靠 `level` 状态区分。
+       *    现在统计和点名都拆开了：要流动水就传 `flowing_water`，别再传 `water` 然后嫌它少。 */
+      + '\n· 水/岩浆按状态分开：`water`（源头）/`flowing_water`（流动）/`lava`（源头）/`flowing_lava`（流动），'
+      + '`name` 也按这个认。',
     parameters: {
       radius: { type: 'number', description: '水平半径（默认 16，上限 48）' },
       height: { type: 'number', description: '垂直范围 ±（默认 4，上限 16）' },
@@ -3898,26 +4072,23 @@ export function apply(ctx, rawConfig) {
       + 'mode="swim" 在水里游到 x/y/z（不给坐标就只上浮换气）。\n'
       + 'mode="boat" 开船（先 use 上船；下船用 mode="dismount"）。\n'
       + '🔴 **一次只走 10 秒**。没走到返回 `arrived:false`+`remaining`+`hint`——**再叫一次往同一目标走**。\n'
-      + '快淹死用 `mode:"swim"`（不给坐标）。\n'
-      + '🔴 **默认不挖方块**：走路一格都不挖，只绕路/跳/下蹲过缝；'
-      + '要挖必须显式 `noDig:false`。\n'
       + '🔴 默认不垫 1×1 柱（`allowTower:true` 才允许）；上高处走斜台阶会报 `pillaredWith`。\n'
-      + '🪜 **一格台阶会先试着踩上去**（量真实位移才算成功）；站上去头顶被堵就跳不起来 —— 允许挖时只清头顶那格，不挖报 `stepUp.why="no-headroom"`。\n'
+      + '🪜 **一格台阶会先试着踩上去**（量真实位移才算成功）；头顶被堵就跳不起来 —— 允许挖时只清头顶那格，不挖报 `stepUp.why="no-headroom"`。\n'
       + '🔴 走不动会分清挡着的是什么：`entity`（实体，别挖）/ `lava`（岩浆，挖不动）/ `waiting_chunks`（区块没加载，等）/ `stepUp`（一格台阶）。\n'
       + '🧭 `intent` 决定"到"的标准：near（默认）/ stand / interact（2.2 格）/ same-level。\n'
       + '🔴 **长程赶路只给 x/z 就够**（`xz:true`）：不必猜高度，按"到那一列"算（哪一层由寻路器定）—— 别编个 y 把自己挂半空。**给了 y 就按 y 走，xz 被忽略。**\n'
       + '🔴 没走到时报 `pathLen`（剩余路径几格）+ `estCalls`（还要几次调用，一次 10 秒 ≈ 43 格）。\n'
       + '🔴 结果带 `above`（头顶净空 `headroom` / `canJump`）：`canJump:false` 就是跳不起来（`note` 说哪格堵着），先挖开或换落点，别反复 `mode:"jump"`。\n'
       + '🔴 掐断报 `reason:"walk-hung"`（服务端不回包，不是路不通）；`digStalled`=挖方块卡在回包上。别原样第三次重叫。\n'
-      + '🔴 **卡住时按执行顺序升**（`planStep`=最后试的那级）：允许挖（`noDig:false`）时 开门→重算→跳→**挖**→后退→绕行→垫柱；'
-      + '默认不挖时**没有"挖"这一级**：开门→重算→跳→后退→绕行→垫柱。'
+      + '🔴 **卡住时按执行顺序升**（`planStep`=最后试的那级）：允许挖（`noDig:false`，或自动升级那一遍）时 开门→重算→跳→**挖**→后退→绕行→垫柱；'
+      + '不挖的那一遍**没有"挖"这一级**：开门→重算→跳→后退→绕行→垫柱。'
       + '`planTried` 列出真试过哪几级。同目标 90 秒内再叫会**从上次那级接着升**。',
     parameters: {
       x: { type: 'number' },
       y: { type: 'number', description: '脚底那格：y=77 站在 76 的方块上，不是 76 那块' },
       z: { type: 'number' },
       mode: { type: 'string', description: 'walk / fly / jump / swim / boat（创造缺省 fly；jump 不需坐标；swim 不给坐标=只上浮换气；boat 要先上船）' },
-      noDig: { type: 'boolean', description: '走路时挖不挖方块（**默认不挖**）；要挖穿挡路的写 false' },
+      noDig: { type: 'boolean', description: '走路时挖不挖方块（**默认不挖**，只绕路；绕不过去会自动改成挖穿再走一遍）；写 false = 第一遍就允许挖穿挡路的' },
       xz: { type: 'boolean', description: '长程赶路：只给 x/z 就够（按"到那一列"算 GoalXZ）；给了 y 就按 y 走；写 false 等于必须给 y；fly/boat 仍必须给 y' },
       budgetMs: { type: 'number', description: 'walk/swim 最长时间（≤10000）；swim 上浮默认 9000' },
       waterRecover: { type: 'boolean', description: '游不动时自动找出口（默认 true）' },
@@ -4297,7 +4468,7 @@ export function apply(ctx, rawConfig) {
       + '🔴 **整串只跑 10 秒**（用户要求：单次调用别超过 11 秒）。没跑完会返回 `stoppedAt`（停在第几步，'
       + '从 0 数）+ `remaining` + `hint`——**再叫一次 mc_sequence，steps 从停下的那一步往后发就行**，'
       + '前面已经做完了。所以宁可拆成"一串 3~4 步"叫几次，也别写一大串（一大串跑到 10 秒就断了）。\n'
-      + '跑完会顺手报 `around`（12 格内身边有谁：名字/距离/血量，最多 6 个）—— 不用再单独叫 `mc_entities`。',
+      + '跑完会顺手报 `around`（12 格内身边有谁：名字/距离/血量，最多 6 个）—— 不用再单独查一遍周围实体。',
     parameters: {
       steps: { type: 'array', items: { type: 'object', additionalProperties: true }, description: '步骤数组（上限 64；但一次只跑得完 10 秒的量）' },
       stopOnError: { type: 'boolean', description: '出错是否停（默认 true）' },
@@ -4395,8 +4566,8 @@ export function apply(ctx, rawConfig) {
       allowDangerous: { type: 'boolean', description: '允许挖自己脚下的支撑（默认拦，下面没落脚点就掉下去）' },
       digThrough: {
         type: 'boolean',
-        description: '允不允许**挖穿挡路的方块**走过去（默认 false = 只绕路、不挖墙）。'
-          + '矿在墙后面、绕不过去、工具提示"够不着"时才传 true。',
+        description: '允不允许**挖穿挡路的方块**走过去（默认 false = 先只绕路；**绕不过去我会自动改成挖穿再走一遍**）。'
+          + '给 true 就直接走挖穿那套、省掉第一遍绕路。',
       },
     },
     output: text(),
@@ -5836,8 +6007,9 @@ export function apply(ctx, rawConfig) {
       + '`chatLog`/`chatLogDays`（聊天记录进记忆 `chat-log.md`，默认开、留 7 天）· '
       + '`expressEnabled`（文件分享开关）· '
       + '`expressBase`（分享 base，如 https://example.com）· `memoryDir`（记忆根目录）· '
-      + '`memoryPerSession`（true = 每会话一份独立记忆，看不到别的会话；'
-      + '默认 false = 共用一份）。\n'
+      + '`memoryScope`（记忆分法：`world` 按世界 / `session` 按会话 / `shared` 全共用）· '
+      + '`localWorldName`（本地存档名，服务器不广播它）· '
+      + '`memoryPerSession`（老写法：true = 按会话、false = 全共用）。\n'
       + '改完**立即生效**，落在 `$DSH_HOME/dsh-mc-agent/config.json`。',
     parameters: {
       action: { type: 'string', description: 'get（默认）/ set / unset / reset / list' },

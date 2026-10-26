@@ -10,7 +10,7 @@
  */
 import { readFileSync } from 'node:fs'
 import { Vec3 } from 'vec3'
-import { scanAround } from '../src/world-scan.mjs'
+import { scanAround, statNameOf } from '../src/world-scan.mjs'
 
 let pass = 0
 let fail = 0
@@ -68,11 +68,68 @@ section('④ y 传垃圾值不炸（当没传）')
   }
 }
 
+section('⑤ radius / height / limit 传垃圾值有兜底（2026-10-26 全量审计）')
+{
+  /* 现场：`const R = Math.min(Math.max(radius, 1), 48)` 只做隐式转数字，`'abc'` ⇒ NaN
+   * ⇒ 扫描循环一圈不跑 ⇒ **静默回"周围什么都没有"**（比报错更坑：AI 会当成"这里没矿"）。
+   * `limit` 更直接喂给 `slice(0, limit)`：负数会"砍掉最后几条"。 */
+  const b = makeBot(72, [{ x: 0, y: 72, z: 0 }])
+  for (const bad of ['abc', null, NaN, {}, '']) {
+    const r = scanAround(b, { radius: bad, height: bad, limit: bad, name: 'blue_concrete' })
+    ok(r.total === 1, `radius/height/limit=${JSON.stringify(bad)} ⇒ 回落默认值，照常扫到`, JSON.stringify({ total: r.total, radius: r.radius }))
+  }
+
+  const five = makeBot(72, [0, 1, 2, 3, 4].map((x) => ({ x, y: 72, z: 0 })))
+  const neg = scanAround(five, { radius: 6, height: 1, name: 'blue_concrete', limit: -2 })
+  ok(neg.found.length === 1, 'limit 负数 ⇒ 夹到下限 1 条（老行为 slice(0,-2) 会剩 3 条）', String(neg.found.length))
+  const huge = scanAround(five, { radius: 6, height: 1, name: 'blue_concrete', limit: 1e9 })
+  ok(huge.found.length === 5, 'limit 超大 ⇒ 全部 5 条都在（不炸）', String(huge.found.length))
+  const zero = scanAround(five, { radius: 6, height: 1, name: 'blue_concrete', limit: 0 })
+  ok(zero.found.length === 1, 'limit 0 ⇒ 也夹到 1 条（别回空列表让人以为没找到）', String(zero.found.length))
+}
+
 /* 🔴 2026-10-24 用户实机（问题清单第 12 条）：`if (isAir(...)) continue` 把 cave_air/void_air
  *    也跳过了 ⇒ 点名找它们永远是"没找到"。 */
 {
   const wsSrc = readFileSync(new URL('../src/world-scan.mjs', import.meta.url), 'utf8')
   ok(/if \(!name \|\| blk\.name !== name\) continue/.test(wsSrc), '点名查空气变体（cave_air/void_air）时放行')
+}
+
+
+section('⑥ 水/岩浆分「源头」和「流动」（2026-10-26 用户：“流动的水 scan 出来也是水”）')
+{
+  const w = (level) => ({ name: 'water', getProperties: () => (level === undefined ? {} : { level }) })
+  ok(statNameOf(w(0)) === 'water', 'level 0 = 源头 water', statNameOf(w(0)))
+  ok(statNameOf(w(1)) === 'flowing_water', 'level 1 = 流动水', statNameOf(w(1)))
+  ok(statNameOf(w(7)) === 'flowing_water', 'level 7 = 流动水', statNameOf(w(7)))
+  ok(statNameOf(w(8)) === 'flowing_water', 'level 8（往下落）= 流动水', statNameOf(w(8)))
+  ok(statNameOf({ name: 'lava', getProperties: () => ({ level: 0 }) }) === 'lava', '岩浆源头 = lava')
+  ok(statNameOf({ name: 'lava', getProperties: () => ({ level: 3 }) }) === 'flowing_lava', '流动岩浆 = flowing_lava')
+  ok(statNameOf({ name: 'water', getProperties: () => ({}) }) === 'water', '读不到 level 就按原名（不瞎报流动）')
+  ok(statNameOf({ name: 'water' }) === 'water', '连 getProperties 都没有也不炸')
+  ok(statNameOf({ name: 'water', getProperties: () => { throw new Error('x') } }) === 'water', 'getProperties 抛错也不炸')
+  ok(statNameOf({ name: 'oak_log', getProperties: () => ({ level: 0 }) }) === 'oak_log', '非水/岩浆不受影响')
+  ok(statNameOf(null) == null, 'null 不炸')
+
+  /* 一块源头水 + 一块流动水，其余是空气 */
+  const b = {
+    entity: { position: new Vec3(0, 70, 0), yaw: 0, pitch: 0 },
+    blockAt (pos) {
+      if (pos.y !== 70) return { name: 'air', getProperties: () => ({}) }
+      if (pos.x === 0 && pos.z === 0) return { name: 'water', getProperties: () => ({ level: 0 }) }
+      if (pos.x === 1 && pos.z === 0) return { name: 'water', getProperties: () => ({ level: 3 }) }
+      return { name: 'air', getProperties: () => ({}) }
+    },
+  }
+  const c = scanAround(b, { radius: 2, height: 1 })
+  const byName = Object.fromEntries((c.counts ?? []).map((x) => [x.name, x.count]))
+  ok(byName.water === 1, '占比里源头水 1 格', JSON.stringify(byName))
+  ok(byName.flowing_water === 1, '占比里流动水 1 格', JSON.stringify(byName))
+
+  const flow = scanAround(b, { radius: 2, height: 1, name: 'flowing_water' })
+  ok(flow.total === 1 && flow.found?.[0] === '1,70,0', 'name=flowing_water 只找到流动那格', JSON.stringify(flow.found))
+  const src = scanAround(b, { radius: 2, height: 1, name: 'water' })
+  ok(src.total === 1 && src.found?.[0] === '0,70,0', 'name=water 只找到源头那格', JSON.stringify(src.found))
 }
 
 console.log(`\n${fail ? '❌' : '✅'} ${pass} 通过 / ${fail} 失败`)

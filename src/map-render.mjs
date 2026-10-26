@@ -422,7 +422,11 @@ export function navSummaryOf (map, { purpose = 'overview', target = null } = {})
  * 能换算回真实坐标（`gridToWorld()`）。
  */
 export function heightmapOf (b, { radius = 32, yTop = 10, yBottom = -24 } = {}) {
-  const R = Math.min(Math.max(radius, 4), 96)
+  /* 2026-10-26 审计：与 `floorMapOf` / `sliceMapOf` 对齐 —— 原来这里只 `Math.max(radius, 4)`，
+   * 传进来非数字就是 NaN ⇒ 扫描循环一圈不跑 ⇒ 静默回一张空图（"这里什么都没有"）。 */
+  const R = Math.min(Math.max(Number(radius) || 32, 4), 96)
+  const yT = Math.min(Math.max(Number(yTop) || 10, 0), 64)
+  const yB = Math.min(Math.max(Number.isFinite(Number(yBottom)) ? Number(yBottom) : -24, -64), 0)
   const cx = Math.floor(b.entity.position.x)
   const cz = Math.floor(b.entity.position.z)
   const cy = Math.floor(b.entity.position.y)
@@ -443,7 +447,7 @@ export function heightmapOf (b, { radius = 32, yTop = 10, yBottom = -24 } = {}) 
     const row = []
     for (let dx = -R; dx < R; dx++) {
       let nm = null
-      for (let y = cy + yTop; y >= cy + yBottom; y--) {
+      for (let y = cy + yT; y >= cy + yB; y--) {
         const blk = b.blockAt(new Vec3(cx + dx, y, cz + dz))
         if (!blk) { nm = null; break }
         if (!isAir(blk.name)) { nm = blk.name; break }

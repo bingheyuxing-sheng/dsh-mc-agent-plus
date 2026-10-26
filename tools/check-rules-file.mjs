@@ -250,7 +250,9 @@ const stripComments = (s) => s.replace(/\r\n/g, '\n').replace(/\/\*[\s\S]*?\*\//
   ok(src.includes('mc_kit_memory {action:"read", path:"${fileName}"}'), '指针给了 mc_kit_memory 的读法')
   ok(src.includes('read {file_path:"${abs}"}'), '指针给了 read 的读法（绝对路径）')
   ok(src.includes('开工前先读一遍'), '指针写着"开工前先读一遍"')
-  ok(src.includes('rel: \'.dsh-mc-agent/RULES.md\',\n        title: \'提示词注入：.dsh-mc-agent/RULES.md\',\n        text: rulesPointerText({'), 'RULES.md 那条投的是指针（不是正文）')
+  /* 🔴 别把字段顺序钉死：2026-10-26 在 rel 与 title 之间插了 `anchor`（换世界要重投），
+   *    原来那条「三个字段必须紧挨着」的断言就假失败了。只要求：这条 item 里 rel 是 RULES.md、正文是指针。 */
+  ok(/rel: '\.dsh-mc-agent\/RULES\.md',[\s\S]{0,200}?text: rulesPointerText\(\{/.test(src), 'RULES.md 那条投的是指针（不是正文）')
   ok(src.includes('title: versionPromptTitle(PLUGIN_VERSION),\n        text: rulesPointerText({'), '版本提示那条投的也是指针（不是正文）')
   ok(!src.includes('text: versionPromptText()'), '不再把版本提示正文直接塞进提示词')
   ok(!src.includes('【dsh-mc-agent 行事准则（'), '不再把行事准则正文直接塞进提示词')
@@ -350,7 +352,8 @@ section('⑦b 提示词页分两块：默认提示词（基根）+ 会话提示�
   ok(src.includes("onClick: () => setConfirmDfReset(true)"), '默认那块的恢复要二次确认')
   ok(src.includes("title: '用上面「默认提示词」那一份重新播种本会话'"),
     '会话那块的「恢复为默认」= 用上面那块（不是出厂值）')
-  ok(src.includes("'⚠️ 「记忆按会话分」没开"), '两块同一文件时界面上有警示')
+  // 2026-10-26：记忆有了三态（按世界 / 按会话 / 全共用），文案从「memoryPerSession 没开」改成「不是按会话分的」。
+  ok(src.includes('记忆不是按会话分的'), '两块同一文件时界面上有警示')
   ok(!src.includes('看内置默认'), '默认那块不再给"看内置默认"的折叠（用户 2026-10-15 去掉）')
   ok(!src.includes("title: '恢复默认提示词'"), '旧的单个「恢复默认」按钮已经不在')
 }

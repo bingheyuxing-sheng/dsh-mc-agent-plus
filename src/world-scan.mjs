@@ -21,11 +21,40 @@ import { isAir, cropStageOf } from './block-names.mjs'
 import { entityNameOf, HOSTILE_RE, RANGED_RE, JUNK_RE, hostilityOf } from './entity-names.mjs'
 import { worldBoundsOf } from './world-observer.mjs'
 
+/**
+ * 统计 / 点名时用的名字：**水与岩浆按状态拆成「源头」和「流动」**。
+ *
+ * 🔴 2026-10-26 用户：「现在流动的水 scan 出来也是水，区分一下」——
+ *    1.13 之后水只有一个方块名 `water`，静止（源头）和流动全靠 `level` 状态区分：
+ *    `level === 0` 是源头；`1~7` 是流动（每流一格衰减一级）；`>= 8` 是从上往下落的瀑布。
+ *    不拆的话 `mc_scan` 的占比里"water 1200 格"根本看不出是一片湖还是一条瀑布。
+ *
+ * 只改**统计与点名**这一层：`isLiquid()` 的语义（会不会淹死 / 能不能站 / 能不能装水）一个字没动。
+ * 读不到状态时**老实按原名算** —— 宁可少分一类，也不要把一湖水平白报成"流动"。
+ */
+export function statNameOf (blk) {
+  const n = blk?.name
+  if (n !== 'water' && n !== 'lava') return n
+  let lv = null
+  try {
+    const p = blk.getProperties?.()
+    if (p && p.level !== undefined && p.level !== null) lv = Number(p.level)
+  } catch { lv = null }
+  if (lv === null || !Number.isFinite(lv)) return n
+  return lv === 0 ? n : (n === 'water' ? 'flowing_water' : 'flowing_lava')
+}
+
 export function scanAround (b, { radius = 16, height = 4, name = null, limit = 10, y = null } = {}) {
   /* 半径默认 16 = **1 区块**（2026-10-13 用户要求，先定 32 后改回 16）：一次扫 33×33 格，
    * 找树 / 找矿 / 找水源够用，又不至于每次调用都查几万格。上限 48 留给显式传大半径的场合。 */
-  const R = Math.min(Math.max(radius, 1), 48)
-  const H = Math.min(Math.max(height, 0), 16)
+  /* 🔴 2026-10-26 全量审计：这三行原来直接吃调用方给的数 —— `Math.max` 只会隐式转数字，
+   *   传进来非数字就是 NaN（`for` 一圈不跑 ⇒ **静默回"周围什么都没有"**，比报错更坑），
+   *   `limit` 更是原样喂给 `slice(0, limit)`：负数会"砍掉最后几条"、0 会回空列表。
+   *   同一文件的 `entitiesNear` 早就用 `Number(radius) || 24` 兜过，这里补齐成同一套。 */
+  const num = (v, d) => { const n = Number(v); return Number.isFinite(n) ? n : d }
+  const R = Math.min(Math.max(num(radius, 16), 1), 48)
+  const H = Math.min(Math.max(num(height, 4), 0), 16)
+  const L = Math.min(Math.max(Math.trunc(num(limit, 10)), 1), 64)
   const c = b.entity.position.floored()
   /* 🔴 2026-10-19（用户在末地亲眼看着我一层层挖）：竖向窗口是**以我的脚底为中心**的 ±H，
    *    可我站在 y=72 时怎么扫都扫不到 y=94 的头 —— 当时我连着判了三次"没有要塞/没建上"，
@@ -55,8 +84,10 @@ export function scanAround (b, { radius = 16, height = 4, name = null, limit = 1
         if (isAir(blk.name)) {
           if (!name || blk.name !== name) continue
         }
+        /* 点名与计数都走 `statNameOf`：`water` 只认源头，`flowing_water` 只认流动 */
+        const stat = statNameOf(blk)
         if (name) {
-          if (blk.name === name) {
+          if (stat === name) {
             /* 🔴 2026-10-08 第五份审计报告 ③：以前只 `found.push` 再 `slice(0, limit)` ——
              *    而三层循环是 `dx → dz → dy`，所以"前 N 个"全落在 x/z 最负的那个角
              *    （半径 24 时能差 30 多格）。AI 于是跑去够不着的地方挖，或据此判"附近没有"。
@@ -73,7 +104,7 @@ export function scanAround (b, { radius = 16, height = 4, name = null, limit = 1
             } catch { state = null }
             found.push({ pos: `${pos.x},${pos.y},${pos.z}`, d: Math.round(d * 10) / 10, state })
           }
-        } else counts.set(blk.name, (counts.get(blk.name) ?? 0) + 1)
+        } else counts.set(stat, (counts.get(stat) ?? 0) + 1)
       }
     }
   }
@@ -81,7 +112,7 @@ export function scanAround (b, { radius = 16, height = 4, name = null, limit = 1
     found.sort((a, b2) => a.d - b2.d)
     /* 🔴 2026-10-15 审计：`found` 是 `string[]`，而 `nearest` 以前塞的是内部的 `{pos,d}` 对象
      *    ⇒ 两套形状，谁把它当字符串用就会拿到 `[object Object]`。统一成字符串坐标。 */
-    const top = found.slice(0, limit)
+    const top = found.slice(0, L)
     const crops = top.map((f) => cropStageOf(name, f.state)).filter(Boolean)
     return {
       found: top.map((f) => f.pos),

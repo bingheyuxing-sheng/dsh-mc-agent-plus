@@ -198,6 +198,12 @@ window.__ModuleLoader__.load({
 [data-wc-cn-bubble]{flex:none;display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 6px 0 12px;
   border-radius:999px;background:var(--dsw-alias-bg-overlay,rgba(128,128,128,.14));
   font-size:12px;white-space:nowrap;color:var(--dsw-alias-label-primary);}
+/* 气泡里那截文字**本身是按钮**：点一下 = 把这条地址填进上面的输入框（用户 2026-10-26 要的「快捷输入」）。
+ * 右边的 × 只负责删历史 —— 两个按钮分开，点文字不会误删。 */
+[data-wc-cn-bubbletext]{padding:0;border:0;background:transparent;font:inherit;color:inherit;cursor:pointer;
+  max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+[data-wc-cn-bubbletext]:hover{text-decoration:underline;}
+[data-wc-cn-bubbletext]:disabled{opacity:.6;cursor:default;text-decoration:none;}
 [data-wc-cn-bubblex]{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;padding:0;
   border:0;background:transparent;border-radius:999px;cursor:pointer;color:var(--dsw-alias-label-tertiary);}
 [data-wc-cn-bubblex]:hover{background:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-label-primary-foreground,#fff);}
@@ -2032,7 +2038,7 @@ select[data-wc-in]{appearance:none;padding-right:22px;
           //    不说清楚的话，用户会以为"改上面那块对本会话没生效"，其实是同一处。
           dfInfo?.sharedWithSession === true
             ? React.createElement('div', { 'data-wc-warnnote': '' },
-              '⚠️ 「记忆按会话分」没开（memoryPerSession），这一块和下面的「会话提示词」其实是'
+              '⚠️ 记忆不是按会话分的（现在是「全共用」），这一块和下面的「会话提示词」其实是'
               + '同一份文件 —— 在这里改就等于改本会话。')
             : null,
           // 🔴 服务端还没重载时（改了 index.js 但 DSH 宿主没重启/没重载插件），GET 回的仍是旧形状
@@ -2171,13 +2177,42 @@ select[data-wc-in]{appearance:none;padding-right:22px;
      *   ③ 一键**用系统文件管理器打开**那个目录（点某个文件 = 在里面选中它）。
      * 🔴 路径全部由服务端推导（`GET /api/mc/memory`），前端不拼也不传路径。
      */
+    /** 「记忆分法」三个选项（用户 2026-10-26：「可选按世界存记忆还是按会话存记忆」） */
+    const MEMORY_SCOPE_UI = [
+      {
+        id: 'session',
+        label: '按会话（默认）',
+        hint: '每个会话一份独立记忆，彼此完全隔离（就是原来的开关 memoryPerSession）。',
+      },
+      {
+        id: 'world',
+        label: '按世界',
+        hint: '同一个世界开几个会话共用一份记忆，换世界自动换一份。公网服务器按地址认；本机 / 局域网（localhost、192.168.x、10.x…）按存档名认 —— 进服时从 MOTD 自动取，不用填。',
+      },
+      {
+        id: 'shared',
+        label: '全共用',
+        hint: '所有会话、所有世界共用同一份记忆（插件最早的默认行为）。',
+      },
+    ]
+
+    /**
+     * 「记忆」页（用户 2026-10-20 建页；2026-10-26 加「按世界/按会话」分法与世界登记表）。
+     *
+     * 这一页回答三件事：
+     *   ① 记忆**怎么分**（按世界 / 按会话 / 全共用）—— 顶部三选一，改的是全局配置 `memoryScope`；
+     *   ② 按世界分时「哪个世界」—— 服务器按地址认、本地按存档名认；地址变了（DHCP）就把新地址
+     *      指到同一个世界，记忆不用搬；
+     *   ③ 这个会话的记忆**落在哪个目录**、里面有哪些文件、一键打开。
+     * 🔴 换分法**不搬、不删**已有记忆：旧目录照旧留在盘上，页面上必须说清楚。
+     */
     function MemoryPane(props) {
-      const { info, busyKey, hasWorkspace, onOpen } = props
+      const { info, busyKey, hasWorkspace, onOpen, scope, onScope } = props
       const busy = busyKey !== null
       const openBusy = busyKey === 'memory:open'
       const files = Array.isArray(info?.files) ? info.files : []
       const dirs = Array.isArray(info?.dirs) ? info.dirs : []
-      const perSession = info?.memoryPerSession === true
+      const curScope = String(scope ?? info?.memoryScope ?? 'session')
       /* 标准四件套点名（用户 2026-10-20：「包括 lessons.md、world.md」）：没建也照实说没建 */
       const KNOWN_FILES = ['README.md', 'world.md', 'lessons.md', 'tasks.md']
       const missing = KNOWN_FILES.filter((n) => !files.some((f) => f.name === n))
@@ -2186,15 +2221,36 @@ select[data-wc-in]{appearance:none;padding-right:22px;
         'div',
         { 'data-wc-pane-page': 'memory' },
         React.createElement('div', { 'data-wc-sec': '' },
+          React.createElement('div', { 'data-wc-h': '' }, '记忆怎么存'),
+          React.createElement('div', { 'data-wc-acts': '' },
+            MEMORY_SCOPE_UI.map((s) => React.createElement('button', {
+              key: 'scope:' + s.id,
+              type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '',
+              'data-wc-primary': curScope === s.id ? '' : undefined,
+              disabled: busy || !hasWorkspace,
+              title: s.hint,
+              onClick: () => onScope(s.id),
+            }, s.label))),
+          React.createElement('p', { 'data-wc-hint': '' },
+            (MEMORY_SCOPE_UI.find((x) => x.id === curScope) ?? MEMORY_SCOPE_UI[0]).hint),
+          React.createElement('p', { 'data-wc-hint': '' },
+            '换分法只改"以后记忆落在哪"：已有的记忆文件不搬、也不删，旧目录还在盘上（需要时自己拷过去）。'),
+        ),
+        /* 🔴 用户 2026-10-26：「世界也不用显示」—— 整块「世界」section 连同标题一起删了。
+         * 世界名进服时从 MOTD 自动认（`learnWorldFromMotd`）、条目自动登记，页面上不需要它；
+         * 后端 `/api/mc/worlds` 和 `worldsInfo` 照旧工作（记忆落盘靠它们），只是不画出来。 */
+        React.createElement('div', { 'data-wc-sec': '' },
           React.createElement('div', { 'data-wc-h': '' }, '记忆目录'),
           React.createElement('p', { 'data-wc-hint': '' },
             info?.dir
               ? `目录：${info.dir}`
               : (hasWorkspace ? '目录：读取中…' : '还没有工作区，记忆目录读不出来。')),
           React.createElement('p', { 'data-wc-hint': '' },
-            perSession
+            curScope === 'session'
               ? '按会话分开存：这里只是本会话那一份，换个会话就是另一个目录。'
-              : '所有会话共用这一份（要分开存，把配置项 memoryPerSession 设成 true）。'),
+              : (curScope === 'world'
+                ? '按世界分开存：这里只是当前世界那一份，换个世界就是另一个目录。'
+                : '所有会话共用这一份（想分开存，把上面的「记忆怎么存」改掉）。')),
           React.createElement('div', { 'data-wc-acts': '' },
             React.createElement('button', {
               type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', 'data-wc-primary': '',
@@ -2367,6 +2423,7 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       const [error, setError] = React.useState('')
       const [settingsOpen, setSettingsOpen] = React.useState(false)
       const pickRef = React.useRef(null)
+      const addrRef = React.useRef(null)   // 地址输入框（历史气泡「快捷输入」要聚焦它）
       // 🟢 报告第 10 条：支持版本范围晚到时，催一次重渲染（值本身不读，只当"版本号"用）
       const [, setGateTick] = React.useState(0)
 
@@ -2464,6 +2521,23 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       const removeServer = (addr) => apiDelete('/api/mc/servers', { address: addr })
         .then((r) => setServers(Array.isArray(r.servers) ? r.servers : []))
         .catch((e) => setError(errorText(e)))
+      /**
+       * 「快捷输入」（用户 2026-10-26）：点历史气泡里的地址 → **填进上面的输入框并聚焦**，
+       * 光标落到末尾 —— 想改端口就接着敲，想直连再点「连接」。点了不会自己连（跟局域网行不一样）。
+       */
+      const fillAddr = (addr) => {
+        setAddress(String(addr ?? ''))
+        // 受控 input：等新 value 落到 DOM 再聚焦，否则 setSelectionRange 会按旧长度越界
+        const put = () => {
+          const el = addrRef.current
+          if (!el) return
+          el.focus()
+          const n = el.value.length
+          try { el.setSelectionRange(n, n) } catch (_) { /* 老浏览器不支持就算了 */ }
+        }
+        if (typeof requestAnimationFrame === 'function') requestAnimationFrame(put)
+        else setTimeout(put, 0)
+      }
       // 账户显示：`名字（来源）` —— **「（来源）」用灰色**（用户 2026-10-04）
       const acctLabelNode = (a) => h('span', null,
         a.name,
@@ -2504,7 +2578,7 @@ select[data-wc-in]{appearance:none;padding-right:22px;
             h('div', { 'data-wc-cn-fieldlabel': '' }, '服务器地址'),
             h('div', { 'data-wc-cn-row': '' },
               h('input', {
-                'data-wc-cn-input': '', value: address, spellCheck: false, disabled: busy,
+                'data-wc-cn-input': '', value: address, spellCheck: false, disabled: busy, ref: addrRef,
                 placeholder: 'example.com 或 example.com:25565',
                 onChange: (e) => setAddress(e.target.value),
                 onKeyDown: (e) => { if (e.key === 'Enter') connect(address, 'manual') },
@@ -2517,7 +2591,12 @@ select[data-wc-in]{appearance:none;padding-right:22px;
           // ② 历史气泡行
           servers.length
             ? h('div', { 'data-wc-cn-bubbles': '' }, servers.map((addr) => h('span', { key: addr, 'data-wc-cn-bubble': '' },
-              h('span', null, addr),
+              h('button', {
+                type: 'button', 'data-wc-cn-bubbletext': '', disabled: busy,
+                title: `填入地址框：${addr}
+（想改端口或先看一眼再连，就点这里；直接连请点右边的「连接」）`,
+                onClick: () => fillAddr(addr),
+              }, addr),
               h('button', {
                 type: 'button', 'data-wc-cn-bubblex': '', title: '移除这条历史', 'aria-label': '移除',
                 onClick: () => removeServer(addr),
@@ -2658,6 +2737,9 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       const [pluginVersion, setPluginVersion] = React.useState('')
       // 「记忆」：这个会话的记忆目录 + 里面有哪些文件（用户 2026-10-20，原来的「文件分享」整页换掉）
       const [memInfo, setMemInfo] = React.useState(null)
+      /* 记忆分法（用户 2026-10-26）：`world` 按世界 / `session` 按会话 / `shared` 全共用。
+       * 权威值在服务端（全局配置 memoryScope），这里只是给页面用的镜像 + 世界登记表快照。 */
+      const [memScope, setMemScope] = React.useState('session')
       const [upd, setUpd] = React.useState(null)
       const [wsPath, setWsPath] = React.useState('')
       const [wsExists, setWsExists] = React.useState(false)
@@ -2734,6 +2816,8 @@ select[data-wc-in]{appearance:none;padding-right:22px;
             setAllowAll(c.allowAllCommands === true)
             setInjectWc(c.injectDshMcAgentAgentsMd !== false)
             setInjectWs(c.injectWorkspaceAgentsMd === true)
+            // 记忆分法（「记忆」页顶部三选一，2026-10-26）
+            setMemScope(String(c.memoryScope ?? 'session'))
             // 记忆目录是**按工作区**的：没有工作区时那个接口直接 400，别去碰它。
             if (!hasWs) { setMemInfo(null); return null }
             return apiGet(withSid('/api/mc/memory')).then((m) => {
@@ -3026,6 +3110,17 @@ select[data-wc-in]{appearance:none;padding-right:22px;
           name ? `已在文件夹里选中 ${name}` : '已打开记忆目录'),
       [run, withSid])
 
+      /* ── 记忆分法 / 世界登记（用户 2026-10-26）──────────────────────────────
+       * 都走 run()：置忙 → 请求 → 重读（load）→ 归一化错误，成功后顶部出「已…」。
+       * 🔴 换分法**只改配置**：记忆文件一个都不动（页面上也这么写）。
+       * ------------------------------------------------------------------ */
+      const patchMemoryScope = React.useCallback((v) => {
+        const label = (MEMORY_SCOPE_UI.find((x) => x.id === v) ?? {}).label ?? String(v)
+        return run('mem:scope',
+          () => apiPatch(withSid('/api/mc/config'), { memoryScope: String(v) }),
+          `记忆分法已改成「${label}」`)
+      }, [run, withSid])
+
       if (!open) return null
 
       const busy = busyKey !== null
@@ -3049,8 +3144,9 @@ select[data-wc-in]{appearance:none;padding-right:22px;
           })
           : (tab === 'memory'
             ? React.createElement(MemoryPane, {
-              key: 'memory:' + (memInfo?.dir ?? '') + ':' + (memInfo?.files?.length ?? 0),
+              key: 'memory:' + (memInfo?.dir ?? '') + ':' + (memInfo?.files?.length ?? 0) + ':' + memScope,
               info: memInfo, busyKey, hasWorkspace, onOpen: openMemoryLocation,
+              scope: memScope, onScope: patchMemoryScope,
             })
             : (tab === 'update'
               ? React.createElement(UpdatePane, {

@@ -292,7 +292,9 @@ section('⑨ 静态检查（实体工具已并进 mc_observe 感知块、不看�
   const scanSrc = readFileSync(new URL('../src/world-scan.mjs', import.meta.url), 'utf8')
   ok(/export function entitiesNear \(b, radius = 24, \{ kind = 'all', limit = 40 \} = \{\}\)/.test(scanSrc), 'world-scan.mjs 里有 entitiesNear(b, radius, {kind, limit}) 默认值')
   ok(/export function scanAround \(b, \{ radius = 16, height = 4, name = null, limit = 10, y = null \} = \{\}\)/.test(scanSrc), 'world-scan.mjs 里有 scanAround(b, {radius, height, name, limit, y}) 默认值（半径默认 16 = 1 区块；y = 竖向窗口中心）')
-  ok(/const R = Math\.min\(Math\.max\(radius, 1\), 48\)/.test(scanSrc), 'scanAround 的半径上限是 48')
+  /* 2026-10-26 审计：半径/高度/limit 都改成走 `num()` 兜底（非数字别变 NaN ⇒ 静默回"什么都没有"），
+   * 所以这条断言跟着放宽成"夹在 1..48"，别把实现写法钉死。 */
+  ok(/const R = Math\.min\(Math\.max\((?:num\(radius, 16\)|radius), 1\), 48\)/.test(scanSrc), 'scanAround 的半径上限是 48')
   ok(/^import \{ scanAround, entitiesNear \} from '\.\/world-scan\.mjs'$/m.test(core), 'core.mjs 确实从 world-scan.mjs 导入（别只搬不接）')
   ok(/entities \(radius = 24, opts = \{\}\) \{ return entitiesNear\(this\.requireBot\(\), radius, opts\) \}/.test(core), 'entities 是薄包装（照样先 requireBot）')
   ok(/scan \(opts = \{\}\) \{ return scanAround\(this\.requireBot\(\), opts\) \}/.test(core), 'scan 是薄包装（照样先 requireBot）')

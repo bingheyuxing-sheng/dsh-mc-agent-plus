@@ -203,7 +203,7 @@ export function createInjector (deps) {
    *    （台账也清了），若不划这条线，"切出 → 再切回"会被日志里的旧记录误判成"已经投过"
    *    ⇒ **再也不投**（自检逮到过这个 bug）。
    */
-  const deliveredRelsFor = (agent, rels) => {
+  const deliveredRelsFor = (agent, items) => {
     const out = new Set()
     try {
       const from = Number(ledgerOf(agent).since) || 0
@@ -217,7 +217,15 @@ export function createInjector (deps) {
         const m = ev.data
         if (!isOurNotice(m)) continue
         const text = (m.content ?? []).map((c) => c?.text ?? '').join('')
-        for (const rel of rels) if (rel && text.includes(rel)) out.add(rel)
+        /* 🔴 2026-10-26：**不能只看文件名**。指针行里 `.dsh-mc-agent/RULES.md` 这几个字在哪个世界都一样，
+         *    只看它的话"同一个会话换了世界"会被判成"已经投过" ⇒ 新世界的指针永远不投（用户实测的坑）。
+         *    `anchor` 是那一行正文里**必然出现、且能区分目录**的绝对路径（RULES.md 的 path、版本提示的 path、
+         *    记忆根的 root）；工作区 AGENTS.md 与记忆根无关，不设 anchor（老行为）。 */
+        for (const it of items) {
+          if (!it?.rel || !text.includes(it.rel)) continue
+          if (it.anchor && !text.includes(it.anchor)) continue
+          out.add(it.rel)
+        }
       }
     } catch { /* 读不到日志就只信台账 */ }
     return out
@@ -339,7 +347,7 @@ export function createInjector (deps) {
       try {
         const p = join(workspaceRootFor(agent), 'AGENTS.md')
         const t = existsSync(p) ? readFileSync(p, 'utf8').trim() : ''
-        if (t) items.push({ rel: 'AGENTS.md', title: '提示词注入：AGENTS.md', text: t })
+        if (t) items.push({ rel: 'AGENTS.md', title: '提示词注入：AGENTS.md', text: t })   // 工作区文件，与记忆根无关 → 不设 anchor
       } catch { /* 读不到就当没有 */ }
     }
     if (wsSwitches.injectDshMcAgentAgentsMd === true) {
@@ -351,6 +359,7 @@ export function createInjector (deps) {
       //    好处：正文只在读的那一刻占上下文；用户改文件立刻生效（不用重启、不用重投）。
       items.push({
         rel: '.dsh-mc-agent/RULES.md',
+        anchor: cur.path,
         title: '提示词注入：.dsh-mc-agent/RULES.md',
         text: rulesPointerText({
           abs: cur.path,
@@ -366,6 +375,7 @@ export function createInjector (deps) {
       const vp = readVersionPrompt(vpDir, PLUGIN_VERSION)
       items.push({
         rel: versionPromptSource(PLUGIN_VERSION),
+        anchor: vp.path,
         title: versionPromptTitle(PLUGIN_VERSION),
         text: rulesPointerText({
           abs: vp.path,
@@ -387,7 +397,15 @@ export function createInjector (deps) {
     //    内容空（还没记过东西）也照样给：里面写着"怎么记"，第一轮就知道该往哪写。
     {
       const idx = memoryIndexText(memoryFor(cwd)).trim()
-      if (idx) items.push({ rel: '.dsh-mc-agent/README.md', title: '提示词注入：.dsh-mc-agent/README.md', text: idx })
+      // anchor 用记忆根：索引正文第一段就写着「根目录 `<root>`」，换世界必然不同。
+      if (idx) {
+        items.push({
+          rel: '.dsh-mc-agent/README.md',
+          anchor: String(memoryFor(cwd).root ?? ''),
+          title: '提示词注入：.dsh-mc-agent/README.md',
+          text: idx,
+        })
+      }
     }
     if (!items.length) return { delivered: false, todo: [], queued: 0, reason: 'no-items' }
 
@@ -395,10 +413,14 @@ export function createInjector (deps) {
     /* 🔴 审计：这里原来是 `?? String(agent?.ctx ? '' : '')` —— 两支都是 `''`，等于什么都没兜。
      * preset 还没认出来时指纹就是 `|<版本>`（对照 1536/3777 用的 `?? null`）。 */
     const preset = lastPresetSeen.get(agent) ?? ''
-    const fp = `${preset}|${PLUGIN_VERSION}`
+    /* 🔴 2026-10-26：指纹里**必须带记忆根**。原来只有 `preset|版本` ⇒ 同一个会话换世界（或换记忆分法）时
+     *    指纹不变、台账不清 ⇒ 三条指针（RULES.md / 版本提示 / 记忆索引）一条都不重投：
+     *    提示里的路径还指着**上一个世界**，新世界的记忆索引也拿不到（用户实测：「一个会话连两个世界」）。
+     *    带上根之后，换世界 = 换一批提示词，语义正好对上"这批提示词是给这个目录投的"。 */
+    const fp = `${preset}|${PLUGIN_VERSION}|${memoryRootFor(cwd)}`
     if (ledger.fp !== fp) { ledger.fp = fp; ledger.rel = []; ledger.items = new Map() }
 
-    const delivered = deliveredRelsFor(agent, items.map((i) => i.rel))
+    const delivered = deliveredRelsFor(agent, items)
     // 队列里**已经排着的**同名提示行：算"已经安排了"，不重复投（宿主下一个 step 会领走它）。
     const queuedRels = new Set(inbox.nextStep.filter(isOurNotice).map(noticeRelOf).filter(Boolean))
     const rels = new Set([...ledger.rel, ...delivered])

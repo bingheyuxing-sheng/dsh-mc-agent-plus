@@ -21,6 +21,7 @@
  *
  * 三条约定同其它叶子模块：不 import mineflayer、不反向 import `core.mjs`、插件实例状态走 `ctx`。
  */
+import { Vec3 } from 'vec3'
 import { callBudget } from './budget.mjs'
 import { heldSnapshotOf, restoreHeldOf } from './bridge.mjs'
 
@@ -30,6 +31,15 @@ const floor3 = (p) => ({ x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p
 const isAirName = (n) => n === 'air' || n === 'cave_air' || n === 'void_air'
 
 /** 睡觉要"点得到"床：4.5 格是服务端交互距离，留 1 格余量。 */
+/**
+ * 🔴 `bot.blockAt()` 只认真 `Vec3`：喂普通 `{x, y, z}` 会在 prismarine-world 里抛
+ *    `pos.floored is not a function`（用户 2026-10-26 实测撞到的就是这条）。
+ *    本文件所有方块查询**只从这一个口子进**，别再直接 `b.blockAt({...})`。
+ */
+const at = (b, p) => {
+  try { return b.blockAt(new Vec3(p.x, p.y, p.z)) } catch { return null }
+}
+
 export const BED_REACH = 3.5
 
 /** 一晚的时间戳窗口（原版 `Level.getTimeOfDay`：12541 入夜 / 23458 天亮）。 */
@@ -85,7 +95,7 @@ export function bedNear (b, radius = 32) {
     if (!best || d < best.d) best = { pos: floor3(p), d: Number(d.toFixed(2)) }
   }
   if (!best) return null
-  best.block = b.blockAt(best.pos)
+  best.block = at(b, best.pos)
   return best.block ? best : null
 }
 
@@ -155,12 +165,12 @@ export function farmSpotsNear (b, { radius = 4, count = 6, y = null } = {}) {
     for (let dx = -r; dx <= r; dx++) {
       for (let dz = -r; dz <= r; dz++) {
         const p = { x: Math.floor(me.x) + dx, y: base + dy, z: Math.floor(me.z) + dz }
-        const blk = b.blockAt(p)
+        const blk = at(b, p)
         if (!blk) continue
         const name = blk.name ?? ''
         const isSoil = TILLABLE.has(name) || name === 'farmland'
         if (!isSoil) continue
-        const above = b.blockAt({ x: p.x, y: p.y + 1, z: p.z })
+        const above = at(b, { x: p.x, y: p.y + 1, z: p.z })
         const aboveName = above?.name ?? 'air'
         if (!isAirName(aboveName) && !CROP_TO_SEED[aboveName]) continue
         out.push({
@@ -224,7 +234,7 @@ export async function sleepInBed (self, args = {}, ctx = {}) {
   let bed = null
   if (Number.isFinite(Number(args.x)) && Number.isFinite(Number(args.y)) && Number.isFinite(Number(args.z))) {
     bedPos = { x: Math.floor(args.x), y: Math.floor(args.y), z: Math.floor(args.z) }
-    bed = b.blockAt(bedPos)
+    bed = at(b, bedPos)
     if (!/(^|_)bed$/.test(bed?.name ?? '')) {
       return { ok: false, slept: false, reason: 'not-a-bed', at: bedPos, block: bed?.name ?? '空气', text: `那个坐标（${bedPos.x},${bedPos.y},${bedPos.z}）是 ${bed?.name ?? '空气'}，不是床。` }
     }
@@ -260,7 +270,7 @@ export async function sleepInBed (self, args = {}, ctx = {}) {
   }
 
   // ③ 躺下（先复核一次方块名 —— 走过去这十来秒里床可能被拆了）
-  const bedNow = b.blockAt(bedPos)
+  const bedNow = at(b, bedPos)
   if (!/(^|_)bed$/.test(bedNow?.name ?? '')) {
     return { ok: false, slept: false, reason: 'bed-gone', bed: bedPos, text: `床没了（那一格现在是 ${bedNow?.name ?? '空气'}）。` }
   }
@@ -348,8 +358,8 @@ export async function farmArea (self, args = {}, ctx = {}) {
   let spots = []
   if (Number.isFinite(Number(args.x)) && Number.isFinite(Number(args.y)) && Number.isFinite(Number(args.z))) {
     const p = { x: Math.floor(args.x), y: Math.floor(args.y), z: Math.floor(args.z) }
-    const blk = b.blockAt(p)
-    const above = b.blockAt({ x: p.x, y: p.y + 1, z: p.z })
+    const blk = at(b, p)
+    const above = at(b, { x: p.x, y: p.y + 1, z: p.z })
     if (!blk) return { ok: false, reason: 'unloaded', at: p, text: `那一格（${p.x},${p.y},${p.z}）没加载 —— 先走近再看。` }
     spots = [{ pos: p, soil: blk.name, above: above?.name ?? 'air', mature: CROP_TO_SEED[above?.name] ? matureOf(b, above) : null }]
   } else {
@@ -390,16 +400,16 @@ export async function farmArea (self, args = {}, ctx = {}) {
         continue
       }
       // 走够近（4 格内才能点）
-      const d = b.entity?.position ? b.entity.position.distanceTo(b.blockAt(s.pos)?.position ?? s.pos) : 0
+      const d = b.entity?.position ? b.entity.position.distanceTo(at(b, s.pos)?.position ?? s.pos) : 0
       if (d > 4) {
         const w = await self.walkTo(s.pos, { arrive: 2, intent: 'stand', noDig: true, noTower: true, budget: Math.min(Math.max(1_000, self.msLeft() - 2_000), 4_000) })
         if (!w?.arrived) { skipped.push({ pos: s.pos, why: 'unreachable', note: '走不过去' }); continue }
         await sleep(120)
       }
 
-      const soilBlk = b.blockAt(s.pos)
+      const soilBlk = at(b, s.pos)
       const abovePos = { x: s.pos.x, y: s.pos.y + 1, z: s.pos.z }
-      let above = b.blockAt(abovePos)
+      let above = at(b, abovePos)
       let aboveName = above?.name ?? 'air'
 
       // ① 上面有作物：熟了先收，没熟就跳过
@@ -409,10 +419,10 @@ export async function farmArea (self, args = {}, ctx = {}) {
           const keepCrop = CROP_TO_SEED[aboveName]
           const r = await self.breakBlock({ ...abovePos })
           await sleep(200)
-          const gone = !CROP_TO_SEED[b.blockAt(abovePos)?.name ?? '']
-          if (!gone) { failed.push({ pos: s.pos, why: 'harvest-failed', note: `收了但那一格还是 ${b.blockAt(abovePos)?.name}` }); continue }
+          const gone = !CROP_TO_SEED[at(b, abovePos)?.name ?? '']
+          if (!gone) { failed.push({ pos: s.pos, why: 'harvest-failed', note: `收了但那一格还是 ${at(b, abovePos)?.name}` }); continue }
           harvested++
-          above = b.blockAt(abovePos)
+          above = at(b, abovePos)
           aboveName = above?.name ?? 'air'
           s.reseed = keepCrop
         } else if (mature === true && !harvest) {
@@ -425,7 +435,7 @@ export async function farmArea (self, args = {}, ctx = {}) {
         if (!clear) { skipped.push({ pos: s.pos, why: 'blocked', note: `上面是 ${aboveName}（要清掉加 clear:true）` }); continue }
         await self.breakBlock({ ...abovePos })
         await sleep(200)
-        aboveName = b.blockAt(abovePos)?.name ?? 'air'
+        aboveName = at(b, abovePos)?.name ?? 'air'
         if (!isAirName(aboveName)) { failed.push({ pos: s.pos, why: 'clear-failed', note: `清不掉 ${aboveName}` }); continue }
       }
 
@@ -444,7 +454,7 @@ export async function farmArea (self, args = {}, ctx = {}) {
           failed.push({ pos: s.pos, why: 'till-failed', note: String(e?.message ?? e) }); continue
         }
         await sleep(250)
-        soilName = b.blockAt(s.pos)?.name ?? ''
+        soilName = at(b, s.pos)?.name ?? ''
         if (soilName !== 'farmland') {
           failed.push({ pos: s.pos, why: 'till-unconfirmed', note: `锄完还是 ${soilName}（可能被别的东西占了/离太远）` }); continue
         }
@@ -458,7 +468,7 @@ export async function farmArea (self, args = {}, ctx = {}) {
       if (!crop) { skipped.push({ pos: s.pos, why: 'unknown-seed', note: `不知道 ${wantSeed} 能种出什么` }); continue }
       const have = seedOf(b, wantSeed)
       if (!have) { skipped.push({ pos: s.pos, why: 'seed-out', note: `种子用完了（${wantSeed}）` }); continue }
-      const farmBlk = b.blockAt(s.pos)
+      const farmBlk = at(b, s.pos)
       const eqs = await self.equip({ name: have.seed })
       if (eqs?.equipped === false) { failed.push({ pos: s.pos, why: 'equip-failed', note: `拿不起 ${have.seed}` }); continue }
       try {
@@ -467,7 +477,7 @@ export async function farmArea (self, args = {}, ctx = {}) {
         failed.push({ pos: s.pos, why: 'sow-failed', note: String(e?.message ?? e) }); continue
       }
       await sleep(250)
-      const after = b.blockAt(abovePos)
+      const after = at(b, abovePos)
       const afterName = after?.name ?? 'air'
       if (afterName === crop || (CROP_TO_SEED[afterName] === have.seed)) {
         planted++

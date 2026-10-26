@@ -469,7 +469,7 @@ section('⑦ index.js —— 每个 mc_* 工具的 DSH 层 timeoutMs ≤ 12 秒�
   const seqAt = src.indexOf("name: 'mc_sequence'")
   const seqChunk = seqAt < 0 ? '' : src.slice(seqAt, seqAt + 4_000)
   ok(/\.\.\.aroundOf\(sess\)/.test(seqChunk), 'mc_sequence 跑完也带 around（和 mc_move 同一条读口）')
-  ok(/around/.test(seqChunk) && /mc_entities/.test(seqChunk), 'mc_sequence 描述里说明了 around（不用再叫 mc_entities）')
+  ok(/around/.test(seqChunk), 'mc_sequence 描述里说明了 around（不用再单独查周围实体）')
   const mvAt = src.indexOf("name: 'mc_move'")
   const mvChunk = mvAt < 0 ? '' : src.slice(mvAt, mvAt + 6_000)
   ok(/\.\.\.aroundOf\(sess\)/.test(mvChunk), 'mc_move 仍然带 around（两边口径一致）')

@@ -108,9 +108,28 @@ export const DEFAULT_CONFIG = {
   /** 记忆根目录；null = `<工作区>/.dsh-mc-agent` */
   memoryDir: null,
   /**
-   * 记忆按会话分（本机补丁 2026-10-06，用户 m07514 要求）。
-   * `true` = 每个会话一份独立记忆（`<记忆根>/sessions/<短会话 id>/`），新会话看不到别的存档/会话的记忆；
-   * `false`（默认）= 老行为：所有会话共用 `memoryDir` 那一份。
+   * **记忆按什么分**（用户 2026-10-26：「在 mc 设置里添加选项，可选按世界存记忆还是按会话存记忆」）。
+   *
+   *   · `'world'` = 按**世界**分：`<记忆根>/worlds/<世界目录>/`。
+   *     世界由 `src/worlds.mjs` 的登记表认定（服务器按地址、本地按存档名；DHCP 换地址可挂别名），
+   *     同一个世界开多个会话**共享**一份记忆，换世界自动换一份。
+   *   · `'session'`（**默认**，用户 2026-10-26：「默认改成按会话记忆」）= 按**会话**分：
+   *     `<记忆根>/sessions/<短会话 id>/`，各会话完全隔离。
+   *   · `'shared'` = 老行为：所有会话、所有世界共用 `memoryDir` 那一份。
+   *
+   * 三种取值由 `memoryScopeOf()` 归一；老键 `memoryPerSession` 仍然认（见 `migrate()`）。
+   */
+  memoryScope: 'session',
+  /**
+   * **本地存档名**（只有连 localhost / 127.0.0.1 这类本地服时才用）。
+   *
+   * 🔴 服务器不广播 `level-name`，插件**拿不到**真实存档名 —— 只能让用户填。
+   * 填了就按它分世界（`local:<名字>`），留空则退回 `localhost:<端口>`。换存档时改这里，等于换一份记忆。
+   */
+  localWorldName: '',
+  /**
+   * 记忆按会话分（本机补丁 2026-10-06，用户 m07514 要求）—— **已被 `memoryScope` 取代**。
+   * 现在只是兼容键：读 = `memoryScope === 'session'`；写 `true`/`false` 会同步改 `memoryScope`。
    * 默认关是为了不打扰上游自检（selfcheck 里多处靠"记忆根 = 工作区/临时目录"来断言）。
    */
   memoryPerSession: false,
@@ -478,6 +497,24 @@ export function pickPresetSource (ids, defaultId = null) {
   return set.has(d) ? d : null
 }
 
+/** 记忆分法的三种取值（`memoryScope`） */
+export const MEMORY_SCOPES = ['world', 'session', 'shared']
+
+/**
+ * 把 `memoryScope` 归一成三态之一。
+ *
+ * @param {any} raw 配置里的 `memoryScope`
+ * @param {{perSession?: any}} [opts] 老键 `memoryPerSession`（只有 `raw` 不是合法三态时才参考）
+ * @returns {'world'|'session'|'shared'} 坏值/缺省 → `'session'`（默认：按会话分）
+ */
+export function memoryScopeOf (raw, { perSession = undefined } = {}) {
+  const s = String(raw ?? '').trim().toLowerCase()
+  if (MEMORY_SCOPES.includes(s)) return s
+  if (perSession === true) return 'session'
+  if (perSession === false) return 'shared'
+  return 'session'
+}
+
 const TOP_KEYS = new Set(Object.keys(DEFAULT_CONFIG))
 const SECRET_KEYS = new Set()   // 目前没有敏感键；留个位置
 
@@ -508,17 +545,34 @@ export class PluginConfig {
   /**
    * 配置迁移（幂等；加载时跑一次，只为把**旧格式**搬到新格式）。
    *
-   * 目前一档：老的 `expressMode`（`'off' | 'online'`，还一度有 `'local'`）→ `expressEnabled` 布尔
-   * （用户 2026-10-04："文件分享以后只有在线这一种方式"）：`'online'` → `true`，其余 → `false`；
-   * 随即**删掉旧键**（免得两套语义并存）。已经写过新键就不动新键、只清旧键。
+   * 两档，**互相独立**（以前第一档不命中就 early return，第二档永远跑不到）：
+   *   ① 老的 `expressMode`（`'off' | 'online'`，还一度有 `'local'`）→ `expressEnabled` 布尔
+   *      （用户 2026-10-04："文件分享以后只有在线这一种方式"）：`'online'` → `true`，其余 → `false`；
+   *      随即**删掉旧键**（免得两套语义并存）。已经写过新键就不动新键、只清旧键。
+   *   ② `memoryPerSession`（布尔，2026-10-06 的补丁）→ `memoryScope`（三态，2026-10-26）。
+   *      只在新键**从没显式设过**时推导：`true` → `'session'`，`false` → `'shared'`。
+   *      🔴 不能一律按"没设过 = 默认 world"处理 —— 那会把老用户刻意关掉的共用记忆
+   *      在升级后悄悄变成"按世界分"，AI 会突然读不到之前记的东西。
    * 只在真改动了才落盘；落盘失败只记一条 `lastError`（**不让插件起不来**）。
    */
   migrate () {
     if (!this.data || typeof this.data !== 'object') return
-    if (!Object.prototype.hasOwnProperty.call(this.data, 'expressMode')) return
-    const online = String(this.data.expressMode ?? '').trim().toLowerCase() === 'online'
-    if (!Object.prototype.hasOwnProperty.call(this.data, 'expressEnabled')) this.data.expressEnabled = online
-    delete this.data.expressMode
+    let changed = false
+    const has = (k) => Object.prototype.hasOwnProperty.call(this.data, k)
+
+    if (has('expressMode')) {
+      const online = String(this.data.expressMode ?? '').trim().toLowerCase() === 'online'
+      if (!has('expressEnabled')) this.data.expressEnabled = online
+      delete this.data.expressMode
+      changed = true
+    }
+
+    if (!has('memoryScope') && has('memoryPerSession') && typeof this.data.memoryPerSession === 'boolean') {
+      this.data.memoryScope = this.data.memoryPerSession ? 'session' : 'shared'
+      changed = true
+    }
+
+    if (!changed) return
     try { this.save() } catch (e) { this.lastError = `配置迁移写盘失败（已按迁移后的值运行）：${e.message}` }
   }
 
@@ -561,7 +615,13 @@ export class PluginConfig {
     validate(top, rest, value)
     // 落盘前归一化（存的永远是规范形态：base 去尾斜杠）
     if (top === 'expressBase') value = normalizeExpressBase(value) ?? ''
+    if (top === 'memoryScope') value = String(value).trim().toLowerCase()
+    if (top === 'localWorldName') value = String(value).trim()
     writePath(this.data, p.split('.'), value)
+    /* 兼容键双向同步（2026-10-26）：`memoryPerSession` 是 `memoryScope` 的老写法。
+     * 两个都写进文件，谁读都对；`memoryScopeOf()` 只认 memoryScope。 */
+    if (top === 'memoryPerSession') this.data.memoryScope = value === true ? 'session' : 'shared'
+    if (top === 'memoryScope') this.data.memoryPerSession = value === 'session'
     this.save()
     return { path: p, value: this.get(p), file: this.file }
   }
@@ -622,9 +682,23 @@ export class PluginConfig {
     return typeof v === 'string' && v.trim() ? v.trim() : null
   }
 
-  /** 记忆按会话分（本机补丁 2026-10-06）：默认关 */
+  /**
+   * 记忆分法（归一成三种之一）：`'world'` / `'session'` / `'shared'`。
+   * 坏值一律回落 `'session'`（默认），并**不**偷偷改成 shared —— 用户设过什么就是什么。
+   */
+  get memoryScope () {
+    return memoryScopeOf(this.get('memoryScope'), { perSession: this.get('memoryPerSession') })
+  }
+
+  /** 本地存档名（空串 = 用 `localhost:<端口>` 当世界 key） */
+  get localWorldName () {
+    const v = this.get('localWorldName')
+    return typeof v === 'string' ? v.trim() : ''
+  }
+
+  /** 记忆按会话分（**兼容键**）：等价于 `memoryScope === 'session'` */
   get memoryPerSession () {
-    return this.get('memoryPerSession') === true
+    return this.memoryScope === 'session'
   }
 
   /** 「文件分享」开关（默认关） */
@@ -747,6 +821,18 @@ function validate (top, rest, value) {
   }
   if (top === 'memoryDir') {
     if (value !== null && typeof value !== 'string') throw new Error('memoryDir 必须是字符串（绝对路径）或 null')
+    return
+  }
+  if (top === 'memoryScope') {
+    const s = typeof value === 'string' ? value.trim().toLowerCase() : ''
+    if (!MEMORY_SCOPES.includes(s)) {
+      throw new Error(`memoryScope 只能是 ${MEMORY_SCOPES.map((x) => `"${x}"`).join(' / ')}（world=按世界分，session=按会话分，shared=全共用）`)
+    }
+    return
+  }
+  if (top === 'localWorldName') {
+    if (typeof value !== 'string') throw new Error('localWorldName 必须是字符串（本地存档名；空 = 用 localhost:端口 当世界）')
+    if (value.trim().length > 64) throw new Error('localWorldName 太长（≤64 字符）')
     return
   }
   if (top === 'allowAllCommands' || top === 'ensureMcPreset' || top === 'expressEnabled' || top === 'memoryPerSession' || top === 'stopOnDanger' || top === 'chatLog' || top === 'updateCheckOnStart') {

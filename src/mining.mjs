@@ -428,6 +428,24 @@ export async function digStair (self, {
     if (isLiquid(floor.name)) { reason = 'liquid'; break }
     if (isAir(floor.name)) { reason = 'no-floor'; break }
 
+    /* 🔴 2026-10-26 实机（用户：「dig stair 往上挖还是只挖两格会被卡住」）：
+     *   往上挖时只清了**前方**那 3 格，漏了"我自己得跳上去"这件事 —— 跳跃需要
+     *   **自己站位上方 2 格净空**（脚从 y 抬到 y+1.25、头顶到 y+3）。从水平隧道往上挖时，
+     *   自己头顶往往还是原岩 ⇒ 起跳就被顶回来，pathfinder 报 NoPath，而这一趟是
+     *   `noDig:true`（不许它自己挖）⇒ 一步就判 stuck，用户看到的就是"挖两格就卡住"。
+     *   现在往上时先把头顶那 2 格清开；往下不用清（往下是掉/走下去，不跳）。 */
+    if (up) {
+      for (const hy of [cur.y + 1, cur.y + 2]) {
+        const head = blkAt(cur.x, hy, cur.z)
+        if (!head || isAir(head.name)) continue
+        if (isLiquid(head.name)) { notes.push(`⚠ 头顶 ${cur.x},${hy},${cur.z} 是 ${head.name}，没挖`); continue }
+        try {
+          const r = await breakBlock(self, { x: cur.x, y: hy, z: cur.z }, ctx)
+          if (r?.broken) dug++
+        } catch (e) { notes.push(`⚠ 清头顶 ${cur.x},${hy},${cur.z} 没成：${e?.message ?? e}`) }
+      }
+    }
+
     for (const c of cells) {
       const blk = blkAt(c.x, c.y, c.z)
       if (!blk || isAir(blk.name)) continue
@@ -446,8 +464,20 @@ export async function digStair (self, {
       notes.push(`⚠ 走过去失败：${e?.message ?? e}`)
     }
     steps++
-    const now = b.entity.position.floored()
-    const ok = w?.arrived || (now.x === fx && now.z === fz && Math.abs(now.y - fy) <= 1)
+    let now = b.entity.position.floored()
+    let ok = w?.arrived || (now.x === fx && now.z === fz && Math.abs(now.y - fy) <= 1)
+    if (!ok && Date.now() - t0 < budgetMs) {
+      /* 🔴 一次没上去就**再试一次**，别一步就判死。两个原因：
+       *   ① movement 的上台阶动作是"先单独起跳、再叠 forward"（STEP_UP_JUMP_MS），
+       *      窄井里第一次常常差一点；
+       *   ② 刚清开的头顶方块可能还没同步到本地世界，第一次跳当然被顶回来。
+       * 以前这里一次失败直接 `stuck` + break —— 用户看到的就是"卡住"。 */
+      try {
+        const w2 = await self.walkTo({ x: fx, y: fy, z: fz }, { noDig: true, budgetMs: STAIR_STEP_MS, intent: 'stand' })
+        now = b.entity.position.floored()
+        ok = w2?.arrived || (now.x === fx && now.z === fz && Math.abs(now.y - fy) <= 1)
+      } catch (e) { notes.push(`⚠ 再走一次也没成：${e?.message ?? e}`) }
+    }
     cur = now
     if (!ok) { reason = 'stuck'; break }
     /* 平台已去掉：每步都是下降步 */
@@ -461,7 +491,7 @@ export async function digStair (self, {
     budget: '⏱ 这一轮 10 秒用完了 —— 再叫一次 `mc_dig {mode:"stair", y:' + ty + '}` 接着挖（已经挖好的不会白挖）。',
     liquid: '🌊 前面是水/岩浆，不往那边挖了 —— 换个方向（`dir:"x-"` 之类）或者先绕开。',
     'no-floor': '🕳 前面脚下是空的（深洞/矿洞），不敢再挖 —— 换个方向，或者先看看那边是什么。',
-    stuck: '⛔ 挖开了但没走过去（卡住）—— 先 `mc_observe` 看一眼，别原地重叫。',
+    stuck: '⛔ 挖开了但没走过去（卡住）—— 多半是自己头顶还堵着（跳不起来），先 `mc_observe` 看一眼，别原地重叫。',
     unloaded: '⏳ 前面的区块还没加载完 —— 等一下再叫。',
   }[reason] ?? ''
   const hint = reason === 'done' ? '' : `

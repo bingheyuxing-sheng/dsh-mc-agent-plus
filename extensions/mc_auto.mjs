@@ -1245,7 +1245,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       } else {
         L.push('· 先往外跑：\`mc_move\` 到离云心 10 格以外的落脚点')
       }
-      L.push('· 没路跑就**往上垫两格**（云贴地、不往上涨）：\`mc_move {"allowTower":true,...}\` 或先 \`mc_jump\` 脱开')
+      L.push('· 没路跑就**往上垫两格**（云贴地、不往上涨）：\`mc_move {"allowTower":true,...}\` 或先 \`mc_act {"mode":"jump"}\` 脱开')
       L.push('· **千万别站在云里射箭/砍龙** —— 箭还没到，血先掉光；先离开、再从 20 格外观望')
       L.push('· 血 < 10 就先吃东西（\`mc_act {"mode":"equip","name":"cooked_beef"}\` + \`useitem\`），边跑边吃')
       L.push('选一个**直接做**，不用问我。')

@@ -26,6 +26,7 @@
 
 import { ensureDepGuard, isLandmineError, describeDepGuard } from './dep-guard.mjs'
 import { sleep } from './async-util.mjs'
+import { patchBlockAt } from './vec-arg.mjs'
 import { dashUuid } from './accounts.mjs'
 import { makeSession } from './auth-session.mjs'
 
@@ -202,6 +203,7 @@ export async function connect (self, opts = {}, ctx = {}) {
       },
     })
     b._createdAt = Date.now()
+    patchBlockAt(b)
 
     let dupe = false
     b.on('error', (e) => { ctx.reportError?.(e) })

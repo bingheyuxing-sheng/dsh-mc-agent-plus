@@ -118,6 +118,20 @@ ok(/再叫一次 `mc_dig \{mode:"stair", y:/.test(mvSrc), '预算用完时告诉
 ok(/前面是水\/岩浆/.test(mvSrc), '遇到水/岩浆有明确说明')
 ok(/挖开了但没走过去/.test(mvSrc), '卡住时不建议原地重叫')
 
+section('10. 往上挖：自己头顶也要清（跳跃空间）+ 走失败要重试')
+{
+  ok(/if \(up\) \{\s*\n\s*for \(const hy of \[cur\.y \+ 1, cur\.y \+ 2\]\)/.test(mvSrc),
+    '往上时清自己站位上方 2 格（2026-10-26 用户「往上挖还是只挖两格会被卡住」）')
+  ok(/自己站位上方 2 格净空/.test(mvSrc), '注释写清了为什么：跳跃要自己头顶 2 格净空')
+  const headAt = mvSrc.indexOf('if (up) {')
+  const cellsAt = mvSrc.indexOf('for (const c of cells) {')
+  ok(headAt > 0 && cellsAt > headAt, '先清头顶、再挖前方（顺序不能反：头顶不清跳不上去）')
+  ok(/头顶是液体时不挖/.test(mvSrc) === false && /isLiquid\(head\.name\)/.test(mvSrc), '头顶是液体时不挖（只记一条 notes）')
+  ok(/const w2 = await self\.walkTo/.test(mvSrc), '第一次没走过去会再走一次（不是一步就 stuck）')
+  ok(/if \(!ok && Date\.now\(\) - t0 < budgetMs\)/.test(mvSrc), '重试也看预算（不硬吃满时间）')
+  ok(/头顶还堵着（跳不起来）/.test(mvSrc), 'stuck 的提示点明"头顶还堵着"')
+}
+
 console.log(`\n${'─'.repeat(60)}`)
 console.log(`check-mc-stair：pass=${pass} fail=${fail}`)
 process.exit(fail ? 1 : 0)

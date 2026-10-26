@@ -20,9 +20,13 @@ export const SERVERS_FILE = 'servers.json'
 export const MAX_SERVERS = 20
 
 export class ServerHistory {
-  /** @param {{dir:string}} opts dir = 状态目录（`$DSH_HOME/dsh-mc-agent`；自检里是临时目录） */
-  constructor ({ dir } = {}) {
+  /** @param {{dir:string, log?:(msg:string)=>void}} opts dir = 状态目录（`$DSH_HOME/dsh-mc-agent`；自检里是临时目录） */
+  constructor ({ dir, log } = {}) {
     this.dir = dir
+    /* 🔴 2026-10-26 审计：原来 record() 里写的是 `this.logger?.warn?.(...)`，可这个类**从来没有**
+     *   logger 字段（构造参数里没它、也没人往里塞）⇒ 那行永远静默，"存不下"用户完全看不见。
+     *   现在改成构造时传一个 log 函数（index.js 传 logLine）。 */
+    this.log = typeof log === 'function' ? log : null
     this.file = join(dir, SERVERS_FILE)
     this.data = { version: 1, recent: [] }
     this.lastError = null
@@ -61,8 +65,15 @@ export class ServerHistory {
       return true
     } catch (e) {
       this.lastError = `服务器历史写入失败：${e.message}`
+      this._report(this.lastError)
       return false
     }
+  }
+
+  /** 内部：失败上报（没有上报口就静默） */
+  _report (msg) {
+    if (!this.log) return
+    try { this.log(msg) } catch { /* 上报失败无所谓 */ }
   }
 
   /** 最近优先的地址列表（副本） */
@@ -77,9 +88,8 @@ export class ServerHistory {
     const addr = String(address ?? '').trim()
     if (!addr) return this.list()
     this.data.recent = [addr, ...this.data.recent.filter((a) => a !== addr)].slice(0, MAX_SERVERS)
-    /* 🟡 2026-10-15 审计（报告 E 第 9 条）：`save()` 失败只记 `lastError`，全仓无人读 ——
-     *   用户以为记下了，其实没落盘。这里补一行日志（有 logger 才打）。 */
-    if (!this.save()) try { this.logger?.warn?.(this.lastError) } catch { /* 日志失败无所谓 */ }
+    /* 存不下时 save() 内部会 _report（2026-10-26 审计：原来这里调 this.logger?.warn?，而 logger 从没被赋值） */
+    this.save()
     return this.list()
   }
 

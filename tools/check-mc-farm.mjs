@@ -19,6 +19,9 @@
  *   ⑩ 没锄头 ⇒ `no-hoe` 并指 `mc_craft wooden_hoe`；种子用完 ⇒ 跳过并不当失败；
  *   ⑪ 时间不够 ⇒ 剩下的进 `remaining`（再叫一次接着干）；
  *   ⑫ 插件面接线：`index.js` 的 `mc_act` 有 sleep/wake/farm 三个 mode + 参数，并直接调 `src/farm.mjs`（`core.mjs` 卡在 ≤1000 行，不再往门面上加薄包装）。
+ *   ⑬ `bot.blockAt()` **只认真 `Vec3`**：本文件所有查询走 `at()` 口子（用户 2026-10-26 实机撞
+ *      `pos.floored is not a function`）；另外 `src/vec-arg.mjs` 在唯一的 bot 创建点再兜一层，
+ *      纯 `{x,y,z}` 会被包成 Vec3，真 Vec3 原样放行、`null` 不炸。
  *
  * 用法：node tools/check-mc-farm.mjs
  */
@@ -28,6 +31,8 @@ import {
   hoeOf, seedOf, farmSpotsNear, sleepErrorText, SEED_TO_CROP, CROP_TO_SEED, TILLABLE,
   NIGHT_FROM, NIGHT_TO, BED_REACH,
 } from '../src/farm.mjs'
+import { Vec3 } from 'vec3'
+import { patchBlockAt, isBlockAtPatched } from '../src/vec-arg.mjs'
 
 let pass = 0
 let fail = 0
@@ -465,6 +470,54 @@ section('⑩ 插件面：mc_act 的三个 mode + 直接接线')
   ok(core.split('\n').length <= 1000, 'core.mjs 没被这条功能撑破 ≤1000 行（现在 ' + core.split('\n').length + '）')
   ok(/BED_REACH = 3\.5/.test(readFileSync(new URL('../src/farm.mjs', import.meta.url), 'utf8')) && BED_REACH === 3.5, '够得着的门槛是 3.5 格')
 }
+
+/* ---------------- ⑪ blockAt 的参数归一化（pos.floored 那个坑） ---------------- */
+section('⑪ `bot.blockAt()` 只认真 Vec3 —— 纯对象要能兜住')
+{
+  const farmSrc = readFileSync(new URL('../src/farm.mjs', import.meta.url), 'utf8')
+  // 只看代码行：注释里举反例（`b.blockAt({...})` 别这么写）不算违规
+  const farmCode = farmSrc.split('\n').filter((l) => !/^\s*(\*|\/\/|\/\*)/.test(l)).join('\n')
+  ok(!/\.blockAt\(\{/.test(farmCode), 'farm.mjs 代码里不再有 `blockAt({ ... })` 字面量（都走 at()）')
+  ok(/const at = \(b, p\) => \{/.test(farmSrc) && /new Vec3\(p\.x, p\.y, p\.z\)/.test(farmSrc), 'farm.mjs 有 at() 口子且内部转 Vec3')
+
+  // 假 bot：blockAt 只认真 Vec3（跟 prismarine-world 一样会调 pos.floored()）
+  const seen = []
+  const fake = {
+    blockAt (pos) {
+      seen.push(pos)
+      if (!pos || typeof pos.floored !== 'function') throw new Error('pos.floored is not a function')
+      return { name: 'stone', position: pos }
+    },
+  }
+  const same = patchBlockAt(fake)
+  ok(same === fake, 'patchBlockAt 返回同一个 bot（可链式）')
+  ok(isBlockAtPatched(fake), '打完标记 isBlockAtPatched=true')
+  ok(fake.blockAt({ x: 1, y: 64, z: 2 })?.name === 'stone', '纯 {x,y,z} 能过（不再抛 pos.floored）')
+  ok(seen.at(-1) instanceof Vec3, '纯对象被包成了真 Vec3', String(seen.at(-1)?.constructor?.name))
+  ok(fake.blockAt(new Vec3(3, 65, 4))?.name === 'stone' && seen.at(-1) instanceof Vec3, '真 Vec3 原样放行')
+  // 不该被改写的参数必须**原样**交给上游（是否报错由上游决定，包装层不许自己编）
+  try { fake.blockAt(null) } catch { /* 上游的脾气，不归包装层管 */ }
+  ok(seen.at(-1) === null, 'null 原样交给上游（不被包装层改写成 Vec3）')
+  try { fake.blockAt(undefined) } catch { /* 同上 */ }
+  ok(seen.at(-1) === undefined, 'undefined 原样交给上游')
+  const odd = { name: 'not-a-pos' }
+  try { fake.blockAt(odd) } catch { /* 同上 */ }
+  ok(seen.at(-1) === odd, '非坐标对象原样交给上游（不乱包）')
+
+  // 幂等：再套一次不会层层包
+  const wrappedOnce = fake.blockAt
+  patchBlockAt(fake)
+  ok(fake.blockAt === wrappedOnce, '重复 patch 是幂等的（不会层层包）')
+
+  // 接线：唯一创建点套上了
+  const conn = readFileSync(new URL('../src/connection.mjs', import.meta.url), 'utf8')
+  ok(/import \{ patchBlockAt \} from '\.\/vec-arg\.mjs'/.test(conn), 'connection.mjs 引了 vec-arg.mjs')
+  ok(/patchBlockAt\(b\)/.test(conn), 'connection.mjs 在 bot 创建后调了 patchBlockAt(b)')
+  const createAt = conn.indexOf('mineflayer.createBot({')
+  const patchAt = conn.indexOf('patchBlockAt(b)')
+  ok(createAt > 0 && patchAt > createAt, 'patchBlockAt(b) 就在 createBot 之后（同一个 bot，不漏包）')
+}
+
 
 console.log(`\n${fail === 0 ? '✅ 全过' : '❌ 有失败'}：pass=${pass} fail=${fail}`)
 process.exit(fail === 0 ? 0 : 1)
