@@ -33,6 +33,7 @@ import { heldSnapshotOf, restoreHeldOf } from './bridge.mjs'
 import { entityNameOf, pickEntity } from './entity-names.mjs'
 import { loadMcDep } from './plugins.mjs'
 import { arrowSpeedFor, solveArrowLead, solveArrowAll, ARROW_GRAVITY, ARROW_DRAG } from './ballistics.mjs'
+import { enchantListOf, enchRawName, enchRawId } from './item-ench.mjs'
 
 /** 能当箭用的物品（`tipped_arrow` 也算；`arrow` 是常态） */
 const ARROW_RE = /^(arrow|spectral_arrow|tipped_arrow)$/i
@@ -161,8 +162,18 @@ export const infiniteArrows = (b) => String(b?.game?.gameMode ?? b?.player?.game
  * 这里**不认字段名**：把附魔的容器整个序列化，看里面有没有 `infinity`。
  * 认不出就当"没有"——宁可多等 600ms 判失败，也不能把真射出去的箭判成没射。
  */
-export const itemHasInfinity = (it) => {
+export const itemHasInfinity = (it, reg = null) => {
   if (!it || typeof it !== 'object') return false
+  /* 🔴 2026-10-27：1.21 的附魔是**数字 id**（`{ enchantments: [{ id: 21, level: 1 }] }`），
+   *    光靠"序列化里找 infinity"永远找不着 ⇒ 先按结构认，名字或 registry 里认得出就算。 */
+  try {
+    for (const e of enchantListOf(it)) {
+      const nm = enchRawName(e)
+      if (nm && /infinity/i.test(nm)) return true
+      const id = enchRawId(e)
+      if (id != null && /^infinity$/i.test(String(reg?.enchantments?.[id]?.name ?? '').replace(/^minecraft:/, ''))) return true
+    }
+  } catch {}
   const hasInf = (v) => { try { return /infinity/i.test(JSON.stringify(v)) } catch { return false } }
   try { if (it.enchants != null && hasInf(it.enchants)) return true } catch {}
   try {
@@ -184,7 +195,7 @@ export const itemHasInfinity = (it) => {
 }
 
 /** 手里那把弓是不是无限的（见 `itemHasInfinity` 的形状说明） */
-export const infinityBow = (b) => itemHasInfinity(b?.heldItem)
+export const infinityBow = (b) => itemHasInfinity(b?.heldItem, b?.registry ?? null)
 
 /**
  * 附近箭矢实体的 id 集合 —— **旁证**：无限弓 / 创造模式下箭数不变，
@@ -276,6 +287,7 @@ async function shootInner (b, args = {}, ctx = {}) {
   const {
     who = null, x, y, z, count = 1, waitTime = DEFAULT_DRAW_MS, lead = true,
     weapon = 'bow', radius = 48, budget = 8_000, aim = null, maxDist = null,
+    force = false,
   } = args ?? {}
   const t = ctx.t ?? (async (p) => await p)
   const callLeft = ctx.callLeft ?? (() => budget)
@@ -382,7 +394,11 @@ async function shootInner (b, args = {}, ctx = {}) {
     if (!hit || hit.unknown) return g
     const alt = fallbackGrade(aimed, speed, { clearOf: true })
     if (alt) return { ...alt, wasBlocked: hit.name ?? '?' }
-    return { ...g, blockedBy: hit.name ?? '?' }
+    /* 🔴 2026-10-27（用户：「shoot 与目标有格挡物也会射，是不是不知道有格挡物」）：
+     *    一条清白弹道都解不出来时，以前只往结果里塞一个 `blockedBy` 字段，箭**照样放出去**。
+     *    现在连"挡在哪一格"一起带回去，由主循环拒绝放箭（说清是什么、在哪、怎么办）。 */
+    const at = hit.at ? [Math.floor(hit.at.x), Math.floor(hit.at.y), Math.floor(hit.at.z)] : null
+    return { ...g, blockedBy: hit.name ?? '?', ...(at ? { blockedAt: at } : {}) }
   }
 
   const gradeOf = async (target) => {
@@ -542,6 +558,20 @@ async function shootInner (b, args = {}, ctx = {}) {
     }
     if (callLeft() < MIN_DRAW_MS + 600) { why = '这一轮时间不够拉满弓了（要 ≥ 1 秒）'; break }
 
+    /* 🔴 2026-10-27（用户：「shoot 与目标有格挡物也会射，是不是不知道有格挡物」）：
+     *    **知道** —— 弹道采样（`blockedAlong`，步长 ≤ 0.4 格）一路都在查，也试过换高抛，
+     *    只是"一条清白弹道都解不出来"时以前只记一个 `blockedBy` 就把箭放出去了：
+     *    白费一支箭，AI 还会以为是"弓不准"。现在**被挡就不放**，并把"什么挡的、在哪一格"说清。
+     *    真要硬射（吓跑怪、清掉挡路的箭）才用 `force:true`。 */
+    if (grade.blockedBy && !force) {
+      const bt = Array.isArray(grade.blockedAt) ? grade.blockedAt : null
+      why = `弹道上有个 ${grade.blockedBy}${bt ? `（在 ${bt.join(', ')}）` : ''} 挡着 —— `
+        + '箭会直接撞在上面，所以**这一箭没放**。想打中：往旁边挪 2 格换个角度、'
+        + '站高一点或低一点，或者走近到能直着看见目标再射；'
+        + '真要硬射（只为吓跑它）加 `force:true`'
+      break
+    }
+
     /* ⑤ 瞄准 → 拉弓 → 等拉满 → **再瞄一次**（目标动了/龙在俯冲）→ 放 */
     await t(b.look(grade.yaw, grade.pitch, true), 'look', '射箭瞄准')
     await t(b.activateItem(), 'use', '拉弓')
@@ -561,7 +591,7 @@ async function shootInner (b, args = {}, ctx = {}) {
       const tHold = Date.now()
       let g = await gradeOf(target)
       if (g) await b.look(g.yaw, g.pitch, true)
-      while (g && Number(g.nearestDistance ?? 9) > goodErr
+      while (g && !g.blockedBy && Number(g.nearestDistance ?? 9) > goodErr
              && Date.now() - tHold < holdMax && callLeft() > 400) {
         await sleep(HOLD_POLL_MS)
         const g2 = await gradeOf(target)
@@ -570,7 +600,8 @@ async function shootInner (b, args = {}, ctx = {}) {
         await b.look(g.yaw, g.pitch, true)
       }
       heldMs = Date.now() - tHold
-      const stillBad = !(g && Number(g.nearestDistance ?? 9) <= goodErr)
+      /* 🔴 2026-10-27：端着的时候若发现"现在这条弹道被挡了"（目标挪到墙后面），也别撒手。 */
+      const stillBad = !(g && Number(g.nearestDistance ?? 9) <= goodErr) || Boolean(g?.blockedBy)
       /* 🔴 2026-10-19（用户：「等不到不放」）：端到上限还是不准 ⇒ **这一箭不放**。
        *    弓已经拉满了，想收回只能用原版那条路：**切快捷栏 = 取消拉弓、不发射**
        *    （`deactivateItem` 是"撒手"，在 Minecraft 里就等于放箭，所以不能拿它取消）。
@@ -582,10 +613,13 @@ async function shootInner (b, args = {}, ctx = {}) {
         /* 🔴 2026-10-20 审计：`g` 为 null 时这里会印出"最近还差 **NaN** 格" ——
          *    对 AI 来说那是一句没法用的乱码。算不出来就直说算不出来。 */
         const gap = g?.nearestDistance
-        why = `端着等了 ${(heldMs / 1000).toFixed(1)} 秒也没等到准的弹道（`
-          + (gap == null ? '最后连弹道都算不出来（目标丢了/被挡住）' : `最近还差 ${Number(gap).toFixed(2)} 格 > ${goodErr}`)
-          + '）'
-          + ' —— **这一箭没放**，箭没白扔。换个位置（同高/贴到 15 格内）或等它慢下来再射'
+        why = g?.blockedBy
+          ? `弹道被 ${g.blockedBy}${Array.isArray(g.blockedAt) ? `（在 ${g.blockedAt.join(', ')}）` : ''} 挡着 —— `
+            + '**这一箭没放**（放出去只会撞在上面）。换个角度/站位再射，非要硬射就加 `force:true`'
+          : `端着等了 ${(heldMs / 1000).toFixed(1)} 秒也没等到准的弹道（`
+            + (gap == null ? '最后连弹道都算不出来（目标丢了/被挡住）' : `最近还差 ${Number(gap).toFixed(2)} 格 > ${goodErr}`)
+            + '）'
+            + ' —— **这一箭没放**，箭没白扔。换个位置（同高/贴到 15 格内）或等它慢下来再射'
         break
       }
     }
@@ -616,7 +650,9 @@ async function shootInner (b, args = {}, ctx = {}) {
       /* 🔴 2026-10-20 审计：原来 `?? 0` 会把"算不出误差"写成 **0 = 完美命中**。 */
       aimError: grade.nearestDistance == null ? null : Number(Number(grade.nearestDistance).toFixed(2)),
       distance: target.dist != null ? Number(target.dist.toFixed(1)) : null,
-      blocked: blockedPos ? (b.blockAt?.(blockedPos)?.name ?? '?') : null,
+      /* 🔴 2026-10-27：`blocked` 以前只看 hawkeye 的 `blockInTrayect`（拼写原样，且它常常给 null）
+       *    ⇒ 我们自己采样出来的"挡路方块"在结果里根本看不见。现在两条都认。 */
+      blocked: (blockedPos ? (b.blockAt?.(blockedPos)?.name ?? '?') : (grade.blockedBy ?? null)),
       ...(blockedPos ? { blockedAt: [blockedPos.x, blockedPos.y, blockedPos.z] } : {}),
       arrowsUsed: Math.max(0, used),
       ...(aimH == null ? {} : { aimY: Number(Number(aimH).toFixed(2)) }),

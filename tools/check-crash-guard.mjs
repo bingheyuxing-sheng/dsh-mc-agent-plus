@@ -138,5 +138,31 @@ section('⑤ 白名单是冻结常量（别被人手改）')
   ok(PATH_REJECTION_NAMES.join(',') === 'PathStopped,NoPath,GoalChanged,Timeout', '四个名字一个不多一个不少', PATH_REJECTION_NAMES.join(','))
 }
 
+section('⑦ 名字不在白名单、但带 mcTimeout/mcAborted 标记：也拦（issue #3 那次崩溃）')
+{
+  await withCleanProcess(async () => {
+    const got = []
+    process.on('unhandledRejection', (r) => got.push(r?.name))
+    installRejectionGuard({ enabled: true, log: () => {} })
+
+    /* 这两条在旧版会原样转交给宿主 —— 名字都叫 `Error`，白名单认不出来。 */
+    const t = new Error('寻路 超时（200ms）：这一步在限定时间内没做完')
+    t.mcTimeout = true
+    await leak(t)
+    const b = new Error('这一轮的走路时间已经用完了')
+    b.mcBudgetOut = true
+    await leak(b)
+
+    ok(got.length === 0, '宿主一条都没收到（不会 fatal load failure）', JSON.stringify(got))
+    ok(rejectionGuardStats().swallowed === 2, '吞了 2 条', String(rejectionGuardStats().swallowed))
+    ok(rejectionGuardStats().lastFew.includes('mcTimeout'), '账上记的是标记名（看日志能认出是哪一类）', JSON.stringify(rejectionGuardStats().lastFew))
+
+    /* 不带标记的普通 Error 仍然转交 —— 别把真 bug 一起吞了。 */
+    await leak(new Error('真 bug'))
+    ok(got.length === 1 && got[0] === 'Error', '不带标记的 Error 照样转交（不掩盖真错）', JSON.stringify(got))
+    uninstallRejectionGuard()
+  })
+}
+
 console.log(`\n${fail === 0 ? '✅' : '❌'} ${pass} 通过 / ${fail} 失败`)
 process.exit(fail === 0 ? 0 : 1)

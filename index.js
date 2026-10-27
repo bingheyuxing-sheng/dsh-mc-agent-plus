@@ -3751,14 +3751,21 @@ export function apply(ctx, rawConfig) {
           }
         }
         /* 🔴 2026-10-23 审计：以前写成 `5,64,-3 距 2.1` —— 坐标和距离挤在一起看不出哪部分是坐标。 */
+        /* 🔵 2026-10-27 用户："还是没显示流动的水"：点名 `water` 现在把流动水也算进来，
+         *    但文本只给坐标 ⇒ 看不出哪几个是流动的（`stat` 早就标在返回值里了，只是没渲染）。
+         *    `world-scan.mjs` 只在"和点名的名字不一样"时才带 `stat`，所以有值就是被泛化匹配上的那个。 */
+        const statTag = (s) => (!s ? '' : s === 'flowing_water' ? ' 流动水' : (s === 'flowing_lava' ? ' 流动岩浆' : ` ${s}`))
         const items = (r.blocks ?? []).map((blk) => `(${blk.pos})`
           + `${blk.distance != null ? ` 距 ${blk.distance}` : ''}`
+          + statTag(blk.stat)
           + `${blk.ripe === true ? ' 熟' : (blk.ripe === false ? ' 没熟' : '')}`
           + `${blk.age != null && blk.maxAge != null ? ` ${blk.age}/${blk.maxAge}` : ''}`)
+        const anyTagged = (r.blocks ?? []).some((b) => b.stat)
         return {
           total: r.total ?? null, unloaded: r.unloaded ?? 0,
           text: `⛏ ${args.name}：${r.total} 个`
-            + `${found.length < r.total ? `（列最近 ${found.length} 个）` : ''}\n`
+            + `${found.length < r.total ? `（列最近 ${found.length} 个）` : ''}`
+            + `${anyTagged ? `（没标名的是 ${args.name} 本身，标了名的是同类）` : ''}\n`
             + items.join('\n')
             + `${r.cropSummary ? `\n${r.cropSummary}` : ''}`
             + `${r.unloaded ? `\n（另有 ${r.unloaded} 格未加载，不算空）` : ''}`,
@@ -4089,7 +4096,7 @@ export function apply(ctx, rawConfig) {
       y: { type: 'number', description: '脚底那格：y=77 站在 76 的方块上，不是 76 那块' },
       z: { type: 'number' },
       mode: { type: 'string', description: 'walk / fly / jump / swim / boat（创造缺省 fly；jump 不需坐标；swim 不给坐标=只上浮换气；boat 要先上船）' },
-      noDig: { type: 'boolean', description: '走路时挖不挖方块（**默认不挖**，只绕路；绕不过去会自动改成挖穿再走一遍）；写 false = 第一遍就允许挖穿挡路的' },
+      noDig: { type: 'boolean', description: '走路时挖不挖方块（**默认不挖**，只绕路；绕不过去会自动改成挖穿再走一遍）；写 false = 第一遍就允许挖，而且**按最短路线挖**（该挖就挖，不再优先绕路）' },
       xz: { type: 'boolean', description: '长程赶路：只给 x/z 就够（按"到那一列"算 GoalXZ）；给了 y 就按 y 走；写 false 等于必须给 y；fly/boat 仍必须给 y' },
       budgetMs: { type: 'number', description: 'walk/swim 最长时间（≤10000）；swim 上浮默认 9000' },
       waterRecover: { type: 'boolean', description: '游不动时自动找出口（默认 true）' },
@@ -4332,8 +4339,8 @@ export function apply(ctx, rawConfig) {
     description: '**射箭**：自动换弓、算弹道、拉满、放箭，射完报 12 格内身边有谁。\n'
       + '· 射水晶给 `x/y/z`；打龙 `who:"ender_dragon"`（自动瞄 +2.8 格）。\n'
       + '· 落点误差 > 4 格会拒射并说明"太远/角度刁"，不瞎射。'+
-      + '· 平射路径上有方块挡着（墙 / 台阶 / 树叶 / 地形）时**自动改高抛**越过去，'+
-      + '结果里 `lob:true`、`lobOver` 说清越过的是什么；都不通就说清打不着。',
+      + '· 平射路径上有方块挡着（墙 / 台阶 / 树叶 / 地形）时**自动改高抛**越过去；'+
+      + '高抛也不通就**不放箭**，说清是什么方块、挡在哪一格（`force:true` 才硬射）。',
     parameters: {
       who: { type: 'string', description: '目标实体名（如 ender_dragon）' },
       x: { type: 'number', description: '目标 x（整数格，射水晶/坐标用）' },
@@ -4345,13 +4352,14 @@ export function apply(ctx, rawConfig) {
       aim: { type: 'number', description: '瞄点高度（相对脚底格数，负数往下）；不给=自动（龙 +2.8、普通怪瞄头）' },
       maxDist: { type: 'number', description: '只射这么近的目标（格）' },
       lead: { type: 'boolean', description: '移动目标的提前量（默认开）' },
+      force: { type: 'boolean', description: '弹道被方块挡着也硬射（默认不射）' },
     },
     output: text(undefined, (a, v) => String(v?.text ?? compactJson(v))),
     timeoutMs: CALL_MS + 1_000,
     async execute(args, exec) {
       const sess = getSession(exec)
       const bot = sess.bot
-      return { ...withOutcome({ ...(await bot.shoot({ who: args.who, x: args.x, y: args.y, z: args.z, count: args.count, waitTime: args.waitTime, lead: args.lead, weapon: args.weapon, aim: args.aim, maxDist: args.maxDist })), ...bossBarsField(bot) }), ...aroundOf(sess) }
+      return { ...withOutcome({ ...(await bot.shoot({ who: args.who, x: args.x, y: args.y, z: args.z, count: args.count, waitTime: args.waitTime, lead: args.lead, weapon: args.weapon, aim: args.aim, maxDist: args.maxDist, force: args.force })), ...bossBarsField(bot) }), ...aroundOf(sess) }
     },
   }))
 

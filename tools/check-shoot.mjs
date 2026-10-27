@@ -350,6 +350,12 @@ section('⑮ 1.21 的组件附魔 + "天上多一支箭"旁证（无限弓假失
   /* ① 字段形状：三种都要认出来（不认字段名，看容器里有没有 infinity） */
   ok(itemHasInfinity({ enchants: [{ name: 'infinity', lvl: 1 }] }), '1.12 形状 `enchants:[{name,lvl}]` 认得出')
   ok(itemHasInfinity({ enchantsByName: { infinity: 1 } }), '1.16 形状 `enchantsByName:{infinity:1}` 认得出')
+  /* 🔴 2026-10-27：1.20.5+/1.21 的附魔是**数字 id**，外面还套着一层 `{ enchantments: [...] }` ——
+   *    老代码靠"序列化里找 infinity"永远找不着 ⇒ 无限弓被当成普通弓 ⇒ 明明箭还有却提示补箭。 */
+  const regInf = { enchantments: [] }
+  regInf.enchantments[21] = { name: 'infinity' }
+  ok(itemHasInfinity({ enchants: { enchantments: [{ id: 21, level: 1 }] } }, regInf), '1.21 真形状（壳 + 数字 id）也认得出无限')
+  ok(!itemHasInfinity({ enchants: { enchantments: [{ id: 32, level: 5 }] } }, regInf), '壳形状的锋利不算无限')
   const compMap = new Map([['enchantments', { data: [{ id: 'minecraft:infinity', level: 1 }] }]])
   ok(itemHasInfinity({ componentMap: compMap }), '1.21 组件形状 `componentMap.get("enchantments").data` 认得出')
   ok(itemHasInfinity({ nbt: { value: { Enchantments: [{ id: 'minecraft:infinity', lvl: 1 }] } } }), 'NBT 兜底也认得出')
@@ -664,6 +670,57 @@ section('⑳ 带 aim 抬高打高处目标：不再抛 to is not defined')
   ok(!err, 'aim:35 + 高处目标不再抛错', String(err?.message))
   ok(Array.isArray(out?.shots), '照常返回射击记录', JSON.stringify(out)?.slice(0, 80))
   ok(/crystal/i.test(String(out?.target?.name ?? '')), '认得出末影水晶这个目标', String(out?.target?.name))
+}
+
+/* ── ㉑ 弹道被方块挡着 ⇒ 不放箭（用户 2026-10-27：「shoot 与目标有格挡物也会射」） ── */
+section('㉑ 弹道被方块挡着 ⇒ 不放箭，并说清挡在哪一格')
+{
+  const BLOCKED = { ...GRADE, blockedBy: 'stone', blockedAt: [0, 71, 10] }
+  {
+    const b = makeBot({ items: [['bow', 1], ['arrow', 10]] })
+    const r = await shoot(b, { x: 0, y: 70, z: 20 }, ctxOf(() => BLOCKED))
+    ok(r.fired === 0, '被挡 ⇒ 一箭没放', String(r.fired))
+    ok(r.ok === false, 'ok:false', String(r.ok))
+    const w = String(r.why ?? '')
+    ok(/挡着/.test(w), 'why 说"挡着"', w.slice(0, 60))
+    ok(/stone/.test(w), 'why 说清是什么方块挡的', w.slice(0, 60))
+    ok(/0, 71, 10/.test(w), 'why 说清挡在哪一格', w.slice(0, 80))
+    ok(/force:true/.test(w), 'why 给出硬射的口子（force:true）', w.slice(-40))
+    ok(!b.__log.some((e) => e[0] === 'activate'), '连弓都没拉')
+    ok(!b.__log.some((e) => e[0] === 'release'), '没有撒手（撒手=放箭）')
+    ok(Array.isArray(r.shots) && r.shots.length === 0, '没有射击记录', JSON.stringify(r.shots ?? []))
+  }
+  {
+    const b = makeBot({ items: [['bow', 1], ['arrow', 10]] })
+    const r = await shoot(b, { x: 0, y: 70, z: 20, force: true }, ctxOf(() => BLOCKED))
+    ok(r.fired === 1, 'force:true ⇒ 硬射', String(r.fired))
+    ok(r.shots?.[0]?.blockedBy === 'stone', '结果如实标 blockedBy:stone', JSON.stringify(r.shots?.[0] ?? {}))
+  }
+  {
+    /* 端着的时候目标挪到墙后面（拉满 → 轮询发现被挡）⇒ 也别撒手 */
+    const b = makeBot({ items: [['bow', 1], ['arrow', 10]] })
+    b.entities = { 9: { id: 9, name: 'ender_dragon', type: 'mob', isValid: true, height: 8, position: new Vec3(0, 72, 30) } }
+    let n = 0
+    const seq = [
+      { ...GRADE, nearestDistance: 1.0 },                                             // 拉弓前：不准，但没挡
+      { ...GRADE, nearestDistance: 0.2, blockedBy: 'stone', blockedAt: [0, 73, 30] }, // 端着的这一刻被挡了
+    ]
+    const r = await shoot(b, { who: 'ender_dragon', maxDist: 40, waitTime: 5 },
+      ctxOf(() => seq[Math.min(n++, seq.length - 1)], { holdMaxMs: 400 }))
+    ok(r.fired === 0, '端着期间被挡 ⇒ 这一箭不放', String(r.fired))
+    ok(/挡着/.test(String(r.why ?? '')), 'why 说清被挡', String(r.why ?? '').slice(0, 60))
+    ok(!b.__log.some((e) => e[0] === 'release'), '没有撒手', JSON.stringify(b.__log.filter((e) => e[0] === 'release')))
+  }
+  {
+    const { readFile } = await import('node:fs/promises')
+    const src = await readFile(new URL('../src/shoot.mjs', import.meta.url), 'utf8')
+    ok(/if \(grade\.blockedBy && !force\) \{/.test(src), '放箭前有一道"被挡就不放"的闸')
+    ok(/while \(g && !g\.blockedBy/.test(src), '端着的时候也会发现"现在被挡了"')
+    ok(/Boolean\(g\?\.blockedBy\)/.test(src), 'stillBad 认 blockedBy（被挡也算"没等到好的"）')
+    ok(/const at = hit\.at \? \[Math\.floor\(hit\.at\.x\)/.test(src), 'blockedAt 报的是整格坐标')
+    ok(/force = false,/.test(src), 'shoot 支持 force')
+    ok(/blocked: \(blockedPos \? /.test(src), '结果里的 blocked 两条来源都认（hawkeye + 自己采样）')
+  }
 }
 
 console.log(`\n${fail ? '❌' : '✅'} ${pass} 通过 / ${fail} 失败`)

@@ -1105,6 +1105,43 @@ async function runPlan (bot, plan, table, timeoutMs, notes = [], msLeftFn = null
   return done
 }
 
+/** 这批产物**放得下吗**（背包满 = 产物掉地上、料白扣，2026-10-27 用户「造东西背包满了就会，一直造」）。
+ *
+ *  ① 同名物品还能叠多少（`stackSize - 已有数量`）—— 产物往往能和手里那叠合并，不该拦；
+ *  ② 空位 × stackSize；
+ *  ③ 合成过程会把某些料**吃光**，那几叠消失就是腾出槽位 —— 按计划里各配方的 `delta` 估。
+ *     ⚠️ 估不准就按 0 算：宁可少报"能腾"，也不放行之后又掉一地。
+ *  读不到背包（假 bot / 旧版本没有 `emptySlotCount`）就**放行** —— 不能因为读不到就把活儿全拒了。
+ */
+function craftRoomFor (bot, id, need, plan = null) {
+  try {
+    const inv = bot.inventory.items()
+    const stack = Number(bot.registry?.items?.[id]?.stackSize) || 64
+    let room = 0
+    for (const it of inv) if (it.type === id) room += Math.max(0, stack - it.count)
+    const free = Number(bot.inventory.emptySlotCount()) || 0
+    let freed = 0
+    try {
+      const used = new Map()
+      for (const s of plan?.steps ?? []) {
+        const d = s?.recipe?.delta
+        if (!Array.isArray(d)) continue
+        const times = Number(s.times) || 1
+        for (const x of d) {
+          if (x && Number(x.count) < 0) used.set(x.id, (used.get(x.id) ?? 0) - Number(x.count) * times)
+        }
+      }
+      for (const [mid, cnt] of used) {
+        const piles = inv.filter((i) => i.type === mid)
+        const have = piles.reduce((a, i) => a + i.count, 0)
+        if (have > 0 && cnt >= have) freed += piles.length
+      }
+    } catch { freed = 0 }
+    const ok = room + (free + freed) * stack >= need
+    return { ok, free, room, freed, stack }
+  } catch { return { ok: true, free: null, room: null, freed: 0, stack: null } }
+}
+
 export async function apply (api) {
   const { ctx, asTool, getSession, logLine } = api
   dbgLog = (m) => { if (process.env.DSH_MC_AGENT_CRAFT_DEBUG === '1') logLine(`mc_craft[调试] ${m}`) }
@@ -1119,6 +1156,7 @@ export async function apply (api) {
       + '· `list:true` 看配方/看当前能做什么；`dryRun:true` 只出计划不动手（拿不准就先 dryRun）。\n'
       + '· `count` 是"背包里**一共**要到几个"（默认 1）：已经够了就**一个都不做**，结果会如实说"一个都没做"。要"再做 4 个"就写 `{count:4, more:true}`。\n'
       + '· 🔴 连着两三次都"超时"就先 `mc_scan` 复核现场（我每次动手前都会先把合成格里的材料点回背包）。\n'
+      + '· 🔴 **背包放不下就直接拒绝、一粒料都不扣**（背包满时产物会掉地上、料白扣）。同一样东西连掉两次地就先腾空位，别硬试。\n'
       + '· `tree:true` 出**整套活儿**的依赖树（合成 + 要烧的 + 要挖的，连"挖它要什么镐"一起）——'
       + '比如 `{tree:true,name:"iron_pickaxe"}` ⇒ 铁镐 ← 铁锭 ← 烧 raw_iron ← 挖 iron_ore ← 石镐 ← 圆石… 全排出来。'
       + '**只出计划、不动手**；不知道该从哪一步开始时先看它。\n'
@@ -1244,7 +1282,39 @@ export async function apply (api) {
        *    背包满时服务端会把合成产物**掉在脚边**（`spawn_entity`），而 `bot.craft()` 照常 resolve
        *    ⇒ 背包里的数对不上，AI 却看到「✅ 合成完成」。做法：记下开工前的数与空位，
        *    收工后拿"计划声称做出来的个数"与"背包实际增量"对账，对不上就扫脚边的掉落物点名报出来。 */
-      const before0 = countOf(bot, target.item.id, null)
+      /* 🔴 2026-10-27（用户：「造东西背包满了就会，一直造」）：
+       *    背包满时服务端把产物丢在地上、**料照扣** —— 每叫一次净亏一组料，而模型看到"还差几个"
+       *    就再叫一次，于是变成"一直造"（实机日志：`diamond_chestplate ×1 产物没进背包（脚边 3 个掉落物）`）。
+       *    两道闸门：① 开工前算"这些产物放得下吗"，放不下就**一粒料都不扣**地拒绝；
+       *    ② 同一物品刚掉过地 ⇒ 只要现在还没有空位就直接拒绝，别再亏第二次（腾出空位后自动放行）。 */
+      /* `want` 是"背包里一共要几个"，闸门要算的是"还要**新做**几个"（已有的那叠能继续叠）。 */
+      const haveTarget = countOf(bot, target.item.id, null)
+      const needOut = Math.max(0, want - haveTarget)
+      const room0 = craftRoomFor(bot, target.item.id, needOut, plan)
+      const prevDrop = (() => {
+        try { return bot._craftDrop?.key === target.item.id ? Number(bot._craftDrop.n) || 0 : 0 } catch { return 0 }
+      })()
+      if (!room0.ok) {
+        const out = [...head, ...notes,
+          `⛔ **背包放不下，没开工**（一粒料都没扣）：「${target.item.name}」还要再做 ${needOut} 个`
+          + `（一共要到 ${want} 个，现在有 ${haveTarget} 个），可背包只剩 ${room0.free} 个空位、`
+          + `同名物品还能叠 ${room0.room} 个${room0.freed ? `、合成过程大概能腾出 ${room0.freed} 个位` : ''}。`,
+          ...(prevDrop
+            ? [`　而且刚才已经掉过 **${prevDrop} 次**地：料被扣走、产物留在脚边（服务端只能丢地上）。`
+              + '**别再叫同样的 mc_craft** —— 结果一样，只会再亏一组料。']
+            : []),
+          '　→ 先腾空位（任选一种）：`mc_chest` 把不值钱的存进箱子 / `mc_act {mode:"toss", name:"…"}` 丢掉一些 / '
+          + '走到脚边把掉落物捡回来（掉落物几分钟就消失）。腾出空位后再叫我，我不会白扣料。',
+        ].filter(Boolean)
+        logLine(`mc_craft：${target.item.name} ×${want} 拒绝开工（背包放不下：空位 ${room0.free}、可叠 ${room0.room}、估腾 ${room0.freed}${prevDrop ? `、刚掉地 ${prevDrop} 次` : ''}）`)
+        return {
+          text: out.join('\n'), refused: true, why: 'inventory-full',
+          freeSlots: room0.free, roomFor: room0.room, droppedBefore: prevDrop,
+        }
+      }
+      try { bot._craftDrop = null } catch { /* 假 bot */ }
+
+      const before0 = haveTarget
       const free0 = (() => { try { return bot.inventory.emptySlotCount() } catch { return null } })()
       let done
       try {
@@ -1256,6 +1326,15 @@ export async function apply (api) {
         if (e?.mcDropped) {
           const d = e.mcDropped
           const freeNow = (() => { try { return bot.inventory.emptySlotCount() } catch { return null } })()
+          /* 🔴 2026-10-27：记一笔账 —— 同一物品掉过地，下一次只要还没有空位就直接拒绝（见 room0 那段）。
+           *    不然模型会"还差 1 个 → 再叫一次 → 再掉一次"，把料一路造光。 */
+          const dropTimes = (() => {
+            try {
+              const n = (bot._craftDrop?.key === target.item.id ? Number(bot._craftDrop.n) || 0 : 0) + 1
+              bot._craftDrop = { key: target.item.id, n }
+              return n
+            } catch { return null }
+          })()
           const out = [...head, ...notes,
             `⚠️ **产物没进背包** —— 「${d.step}」的料被扣走了，背包里却没多出来。`,
             ...(freeNow === 0 ? ['　根因：**背包一个空位都没有**（服务端只能把产物丢在地上）。'] : []),
@@ -1265,9 +1344,13 @@ export async function apply (api) {
                 + '　→ `mc_move` 走过去就自动捡（掉落物几分钟就消失）']
               : ['　（脚边没扫到 —— 可能卡在合成格里，关一次窗口再看背包）']),
             '　→ **下次合成前先腾空位**：`mc_chest` 存一趟、或者丢掉点不值钱的。',
+            ...(dropTimes
+              ? [`　🔴 这已经是「${target.item.name}」第 ${dropTimes} 次掉地：**空位没腾出来之前别再叫 mc_craft**，`
+                + '我会直接拒绝（一粒料都不扣），别拿料去试。']
+              : []),
           ].filter(Boolean)
-          logLine(`mc_craft：${target.item.name} ×${want} 产物没进背包（${d.step}，脚边 ${d.drops} 个掉落物）`)
-          return { text: out.join('\n'), dropped: true, step: d.step, onGround: d.drops }
+          logLine(`mc_craft：${target.item.name} ×${want} 产物没进背包（${d.step}，脚边 ${d.drops} 个掉落物${dropTimes ? `，累计掉地 ${dropTimes} 次` : ''}）`)
+          return { text: out.join('\n'), dropped: true, step: d.step, onGround: d.drops, droppedTimes: dropTimes }
         }
         const text = [...head, ...notes, `❌ 合成中断：${e.message}`, describePlan(plan, target.item.name, want)].filter(Boolean).join('\n')
         logLine(`mc_craft：${target.item.name} ×${want} 失败：${e.message}`)
@@ -1309,9 +1392,20 @@ export async function apply (api) {
             + '关一次窗口再看看背包）')
         }
         lines.push('　→ **下次合成前先腾空位**：`mc_chest` 存一趟、或者丢掉点不值钱的。')
-      } else if (free0 !== null && free0 <= 1 && madeExpected > 0) {
-        lines.push(`⚠️ 背包只剩 ${free0} 个空位了 —— 再合成/再挖，产物和掉落物就会掉地上（几分钟就消失）。`
-          + '先去 `mc_chest` 存一趟。')
+        /* 🔴 2026-10-27：对账对不上（掉地/卡格）也记账，下一轮直接拒绝，不让它拿料反复试。 */
+        try {
+          bot._craftDrop = {
+            key: target.item.id,
+            n: (bot._craftDrop?.key === target.item.id ? Number(bot._craftDrop.n) || 0 : 0) + 1,
+          }
+        } catch { /* 假 bot */ }
+        lines.push('　🔴 空位没腾出来之前别再叫同样的 mc_craft —— 我会直接拒绝（一粒料都不扣）。')
+      } else {
+        try { bot._craftDrop = null } catch { /* 假 bot */ }
+        if (free0 !== null && free0 <= 1 && madeExpected > 0) {
+          lines.push(`⚠️ 背包只剩 ${free0} 个空位了 —— 再合成/再挖，产物和掉落物就会掉地上（几分钟就消失）。`
+            + '先去 `mc_chest` 存一趟。')
+        }
       }
       // 🔴 `mc.inventory()` 回的是 `{ text, held, items }`，**不是数组** —— 这里以前写
       // `Array.isArray(inv) ? … : []`，条件永远为假，这行"背包：…"从来没打印过。

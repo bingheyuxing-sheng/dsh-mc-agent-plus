@@ -186,11 +186,10 @@ export const DEFAULTS = {
   authPass: process.env.MC_AUTH_PASS ?? '',
   connectTimeoutMs: 45_000,
   moveBudgetMs: 40_000,
-  preferDoors: true, doorDigPenalty: 8,
-  /* 2026-10-23：耕地/土径不进 A* 的落脚点（防踩坏、防挖开挡路的）。
-   * 代价：万一耕地是**唯一通路**（唯一的水井、围栏里那块地），寻路会报 NoPath 而不是硬穿。
-   * 真遇到这种地形就把它设成 false 关掉。 */
-  protectFarmland: true,   // 优先走门/绕路：给"挖墙"加代价（2026-10-18）
+  preferDoors: true, doorDigPenalty: 8,   // 优先走门/绕路：给"挖墙"加代价（2026-10-18）
+  walkDigFirst: true, walkDigFirstCost: 0.4,   // 2026-10-27：显式 noDig:false ⇒ 挖按"多走一步"计价，走最短那条（见 src\plugins.mjs 的 digFirst）
+  /* 2026-10-23：耕地/土径不进 A* 的落脚点（防踩坏、防挖开挡路的）。代价：唯一通路时寻路报 NoPath 而不是硬穿。 */
+  protectFarmland: true,
   chatHistory: 300,
   /* 自动重连最多试几次（以前没上限、5s→…→60s 无限重试，看门狗又让 AI 干等）。 */
   maxReconnectAttempts: 5,
@@ -228,7 +227,7 @@ import { NON_FULL_BLOCK, isFullBlockItem, NO_SCAFFOLD, scaffoldingItemIds, pickP
 /* 路线图第 ④ 条第七刀：背包那一层（heldText/invSnap/invUsed/canHarvestNow/toolKinds/countOf/freeSlot）
  * 搬到 src/inventory.mjs —— 第一次搬"读 bot 实时状态"的东西，只读、不 await、不改状态。 */
 import { invSnap, invUsed, canHarvestNow, toolKinds, countOf, freeSlot,
-         inventoryView, giveItem, clearInventory, tossItem, equipFor } from './inventory.mjs'
+         inventoryView, giveItem, clearInventory, tossItem, equipFor, setEnchantRegistry } from './inventory.mjs'
 import { TIMEOUTS, CALL_MS, CALL_BUDGET_MS, callBudget, callDeadline, callSecText, budgetSecText } from './budget.mjs'
 import { entityHealth, inWaterNow, slowDigWhy, dropsNear, dropHint, blockReachOf, stateNameOf } from './world-observer.mjs'
 import { grabDrops } from './pickup.mjs'
@@ -687,7 +686,7 @@ export class McBot extends EventEmitter {
   async setupPathfinder (opts = {}) { return await setupPathfinder(this, opts) }
 
   /** 造一份 `Movements`（实现在 `src\plugins.mjs` 的 `movements`；`terrain` 是地形分类结果，导航 P2）。 */
-  #movements (terrain = null) { return movements(this, { terrain }) }
+  #movements (terrain = null, opts = null) { return movements(this, { terrain, ...(opts ?? {}) }) }
 
   /** 把现成的生态插件都挂上（实现在 `src\plugins.mjs` 的 `setupPlugins`）。 */
   async setupPlugins (opts = {}) { return await setupPlugins(this, opts) }
@@ -707,7 +706,7 @@ export class McBot extends EventEmitter {
 
   #pathCtx () {
     return {
-      movements: (terrain) => this.#movements(terrain),
+      movements: (terrain, opts) => this.#movements(terrain, opts),
       collectBusy: (b) => this.#collectBusy(b),
       cancelCollect: (b) => this.#cancelCollect(b),
       beginMove: () => this.#beginMove(),
@@ -966,7 +965,7 @@ export class McBot extends EventEmitter {
   }
 
   /** 要一个一定在线的 bot，否则抛出带原因的错（幽灵在线也认得出）—— 实现见 `src\runtime.mjs` 的 `requireBot()`。 */
-  requireBot () { return requireBotImpl(this) }
+  requireBot () { const b = requireBotImpl(this); try { setEnchantRegistry(b?.registry) } catch {} return b }   // 1.21 的附魔只有数字 id（`[{id:32,level:5}]`），换取名字要 registry —— 在这唯一的取 bot 口登记一次，说明见 inventory.setEnchantRegistry
 
 }
 

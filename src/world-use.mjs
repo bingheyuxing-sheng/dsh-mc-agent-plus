@@ -33,7 +33,7 @@ import { aimAt } from './camera.mjs'
 import { lookTrack } from './look-track.mjs'
 import { CONTAINER_RE, TOGGLE_RE, cropStageOf, isEntityItem } from './block-names.mjs'
 import { entityNameOf, pickEntity } from './entity-names.mjs'
-import { heldText, equipDestOf, durabilityOf } from './inventory.mjs'
+import { heldText, equipDestOf, durabilityOf, enchText } from './inventory.mjs'
 
 /**
  * "先瞄 → 等一拍 → 再用"里那一拍的时长（毫秒）。
@@ -579,7 +579,9 @@ export async function enchantTable (self, args = {}, ctx = {}) {
 
   // ⑤ 等三个选项到位（服务端用 craft_progress_bar 的属性包填，通常一个 tick 就到）
   const shortName = (s) => String(s ?? '?').replace(/^minecraft:/, '')
-  const enName = (id) => (id == null || Number(id) < 0 ? '?' : shortName(b.registry?.enchants?.[id]?.name ?? `#${id}`))
+  /* 🔴 2026-10-27：registry 里附魔表叫 `enchantments`（按数字 id 索引的数组），**没有** `enchants` 字段
+   *   —— 以前这里读 `b.registry?.enchants?.[id]` 永远是 undefined ⇒ 附魔台三个选项一律显示成 `#32`。 */
+  const enName = (id) => (id == null || Number(id) < 0 ? '?' : shortName(b.registry?.enchantments?.[id]?.name ?? `#${id}`))
   /* 🔴 2026-10-15 审计（报告 C 第 2 条）：这里原来要求三个选项 `level >= 0` **全成立**才算"到齐"，
    *   而 vanilla 用 `level = -1` 表示"这一项不可用"（经验不够 / 没青金石 / 这件东西不能附魔）——
    *   同文件下面的 `optLine` 自己就是这么解释 `level < 0` 的。于是"经验不够"（极常见）时
@@ -655,10 +657,10 @@ export async function enchantTable (self, args = {}, ctx = {}) {
   }
   try { if (typeof b.closeWindow === 'function') await t(Promise.resolve(b.closeWindow(table)), 'act', '关掉附魔台') } catch { /* 关不掉不影响结果 */ }
 
-  const en = Array.isArray(newItem?.enchants) ? newItem.enchants : []
-  const enText = en.length
-    ? en.map((x) => `${shortName(x?.name ?? x?.ench)} ${x?.lvl ?? x?.level ?? ''}`.trim()).join('、')
-    : null
+  /* 🔴 2026-10-27 实机（用户：「附魔台那边成功时也是"没读回附魔属性"」）：
+   *    1.21 的 `newItem.enchants` 是 `{ enchantments: [{ id, level }] }`（壳 + 数字 id），
+   *    原来只认裸数组 ⇒ 永远 `[]` ⇒ 永远是"没读回附魔属性"。现在统一走 `enchText`（带 registry）。 */
+  const enText = enchText(newItem, b.registry)
   return {
     ...base,
     enchanted: true,

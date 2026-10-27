@@ -61,6 +61,8 @@ node %USERPROFILE%\Desktop\agent\dsh-mc-agent\tools\check-mc-deps.mjs   # 装完
 
 - **禁用**：`DSH_MC_AGENT_PATHFINDER=off`，或插件配置 `pathfinder: false`。禁用后移动会安全停止，不退回手写走路器。
 - **调走路**：`walkCanDig`（默认 true，false = 只走不挖）、`walkDigCost`（默认 4，越小越愿意挖）、
+  `walkDigFirst`（默认 true：显式 `noDig:false` 时把挖按"多走一步"计价、走最短那条；
+  false = 回到"能绕就绕"）、`walkDigFirstCost`（默认 0.4，挖一格的系数，越小越爱挖）、
   `walkPlaceCost`（默认 12，**垫方块的代价**；上游默认 1 ⇒ 比挖一格还便宜，会"下坡时横向垫方块"，
   调高到比 `walkDigCost` 大才只在没别的路时垫 —— 掉坑里垫出来仍然会垫）、
   `walkMaxDropDown`（默认 3）、`walkAllowParkour`（默认 false = 不跳远；打开它对"1 格台阶卡住"没用）。
@@ -75,11 +77,14 @@ node %USERPROFILE%\Desktop\agent\dsh-mc-agent\tools\check-mc-deps.mjs   # 装完
 | 包 | 补丁 | 体检 |
 | --- | --- | --- |
 | `mineflayer-pathfinder` | ①`lib/physics.js`：`collides()` + `simulateStraight()`（贴墙穿模不算"能直走"）②`lib/movements.js`：`getMoveDiagonal` 禁掉**斜切拐角**（"怎么不动了"的根因） | `check-mc-pathfinder.mjs` 24/0 |
+| `mineflayer-pathfinder` | ③（2026-10-27）`index.js`：**`resetPath` 不再把"正常重算"当成中止**（`RESUMABLE_RESETS` 不 `stop()`、`path_reset` 无条件外发、暴露 `lastResetReason()`），`lib/goto.js` 的 `PathStopped` 带上真实理由；**垫方块改成起跳前预装备**（`placingEquipped`，以前"先起跳、再 equip、再放"在 200ms 延迟下必然摔） | `check-move-progress.mjs` 549/0、`tools/patch-mc-deps.mjs --check` |
 | `mineflayer-tool` | `lib\Tool.js` 加 `_triedChest`（空手挖方块会无限递归到 OOM） | `check-mc-deps.mjs` 第 4 段 |
 | `readable-stream` | 8 处 `require('X/')` → `require('X')`（尾斜杠地雷，会让整个 `import()` 失败） | `check-mc-deps.mjs` |
 
-前两条的完整现象/根因/实机证据见 [踩坑档案.md](踩坑档案.md) 第 2、4 条；
-成品备份在 `dsh-mc-agent\备份\pathfinder-补丁备份\`（可直接还原）。
+前两条的完整现象/根因/实机证据见 [踩坑档案.md](踩坑档案.md) 第 2、4 条（2026-10-27 那条见文末「移动老是卡」）；
+成品备份在 `dsh-mc-agent\备份\pathfinder-补丁备份\`（`index.js` / `goto.js` / `movements.js` / `physics.js`，
+可直接还原）。③ 这类可自动重放的补丁都写在 `tools/patch-mc-deps.mjs` 里，**重装依赖后跑一次**
+`node tools/patch-mc-deps.mjs` 即可（`--check` 只检查）。
 
 ## 上游复核（2026-10-06）：已经修了，只是没发布
 

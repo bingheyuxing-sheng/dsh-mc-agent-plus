@@ -1082,6 +1082,17 @@ section('⑧ 战斗策略层接线 —— attack() 真的会撤 / 会换 / 会�
     ok(outcomeOf({ ok: false, stopped: true, placed: 3, why: '血量只有5' }) === 'failed',
       '🔴 安全停（ok:false）不许因为 placed:3 被判成功')
     ok(outcomeOf({ ok: false, reason: 'aborted' }) === 'unknown', '中止是"没做完"，不是"做不成"')
+    /* 🔴 2026-10-27（用户 m02756「这个会话的 dig 和 move 根本不准确」；实测 session-514c21b6：
+     *    324 次 mc_move 里 30 次判成「✅ 已确认成功」而结果写着 `arrived:false`）。
+     *    根因是走路结果里带 `dug:3`（路上顺手挖的），被"有 dug 就算成功"那条抢了判。
+     *    走路/开船的成败**只看 arrived**，dug/placed 是副产品。 */
+    ok(outcomeOf({ arrived: false, dug: 3, moved: 5.87, reason: 'budget' }) === 'unknown',
+      '🔴 没走到 + 顺带挖了 3 块 ⇒ 结果未知，绝不许判「已确认成功」')
+    ok(outcomeOf({ arrived: false, dug: 2, reason: 'NoPath' }) === 'failed',
+      '🔴 没走到 + NoPath ⇒ failed（路径不通，重叫也没用）')
+    ok(outcomeOf({ arrived: false, moved: 0, remaining: 12, stuck: true, reason: 'stuck' }) === 'unknown',
+      '🔴 卡住是"没做完"（不是"做不成"）')
+    ok(outcomeOf({ arrived: true, dug: 0 }) === 'confirmed', '走到了照样判成功（没挖也到）')
     ok(combatOutcomeOf({ killed: false, sawDamage: true, timedOut: true }) === 'timeout',
       '🔴 打中过但时间到了 ⇒ timeout（不是 damaged）')
     ok(outcomeOf({ combat: combatOutcomeOf({ sawDamage: true, timedOut: true }) }) === 'unknown',

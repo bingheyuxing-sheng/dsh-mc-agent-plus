@@ -5,6 +5,7 @@
  * 判据（2026-10-25 三次收敛后的定稿，用户原话「改成方块前后左右有一格方块是空的就可以挖」）：
  *   ① 贴身 1 格（脚下 / 头顶 / 水平相邻 / 斜角）一律放行
  *   ② 前后左右四格只要有一格是空的（空气 / 可通行）⇒ 能挖
+ *   ②′ 四面有空**还要过视线**：眼睛到这一格的 7 条采样线全被实心方块挡住 ⇒ 拦（issue #3）
  *   ③ 四面全被实心包住 ⇒ 才是"隔着方块挖"，拦下并说清是哪面
  *   ④ 读不到方块 / 够不着 ⇒ 不拦（判不了就别拒绝干活）
  *
@@ -50,7 +51,7 @@ const TMP = []
  *   `open` = 'none'  → 前后左右四面全是 stone（四面被包 ⇒ 拦）
  *   `open` = null    → 邻居读不到（blockAt 返回 null）⇒ 判不了，不拦
  */
-const mkBot = ({ open = 'north' } = {}) => {
+const mkBot = ({ open = 'north', walls = [] } = {}) => {
   const calls = { dig: 0 }
   const state = { dug: false }
   const mk = (name, bb, x, y, z) => ({ name, type: 0, boundingBox: bb, position: new Vec3(x, y, z) })
@@ -66,7 +67,16 @@ const mkBot = ({ open = 'north' } = {}) => {
       if (!p) return null
       if (isTarget(p)) return state.dug ? mk('air', 'empty', 0, 64, 3) : target
       if (open === null) return null
-      if (open === 'north' && p.x === 0 && p.y === 64 && p.z === 2) return mk('air', 'empty', 0, 64, 2)
+      /* ⑦ 用：挡在视线中间的金矿（可以给两块，模拟"两格高的矿墙"）。 */
+      for (const w of walls) {
+        if (p.x === w.x && p.y === w.y && p.z === w.z) return mk(w.name ?? 'gold_ore', 'block', p.x, p.y, p.z)
+      }
+      /* 玩家到目标之间的走廊是空气。假 bot 的默认世界全是石头，不铺这条的话，
+       * "眼睛 → 目标"的视线采样会被整片石头挡住，⑤⑥ 里那些"应该能挖"的用例会集体误拦
+       * （真实世界里那几格本来就是空气）。 */
+      if (open === 'north' && p.x === 0 && p.y >= 64 && p.y <= 65 && p.z >= 1 && p.z <= 4) {
+        return mk('air', 'empty', p.x, p.y, p.z)
+      }
       return mk('stone', 'block', p.x, p.y, p.z)
     },
     findBlocks: () => [],
@@ -179,6 +189,25 @@ section('⑥ 贴身（脚下/头顶/水平相邻 1 格）一律放行')
   /* 离开 1 格以外才看四面：这一格四面全实心，照样拦。 */
   const far = await canSeeBlockOf(w.bot, { x: 0, y: 64, z: 3 })
   ok(far?.ok === false && far?.blocker === 'stone', '3 格外仍按四面判（不放松）', JSON.stringify(far))
+}
+
+/* ─────────── ⑦ 视线被挡：四面有空，但中间还夹着别的方块（issue #3） ─────────── */
+section('⑦ 隔着别的方块挖（前面挡着金矿、后面是钻石）')
+{
+  /* 用户原话：「面前还有金矿，但它没先挖金矿，直接挖了后面的钻石」。
+   * 旧的 ② 只看目标紧贴的四面 —— 目标旁边有矿洞开口就放行，正前方那块金矿根本没人管。
+   * 真实场景是两格高的矿墙（矿脉常叠着），7 条采样线全撞上它 ⇒ 这才叫"隔着方块挖"。 */
+  const w2 = mkBot({ open: 'north', walls: [{ x: 0, y: 64, z: 2 }, { x: 0, y: 65, z: 2 }] })
+  const r1 = await canSeeBlockOf(w2.bot, { x: 0, y: 64, z: 3 })
+  ok(r1?.ok === false, '四面有空但视线被金矿挡住 ⇒ {ok:false}', JSON.stringify(r1))
+  ok(r1?.blocker === 'gold_ore', '报出挡路块是 gold_ore', String(r1?.blocker))
+  ok(r1?.los === true, '标了 los:true（走的是视线采样这条判据）', String(r1?.los))
+  ok(r1?.at?.z === 2, 'at 指到挡路块那一格', JSON.stringify(r1?.at))
+
+  /* 只挡住下半格、上方还露着 ⇒ 明明看得见，不能拦（别把正常挖矿也卡死）。 */
+  const w1 = mkBot({ open: 'north', walls: [{ x: 0, y: 64, z: 2 }] })
+  const r2 = await canSeeBlockOf(w1.bot, { x: 0, y: 64, z: 3 })
+  ok(r2?.ok === true, '只挡住下半格、上方看得见 ⇒ 放行（不误拦）', JSON.stringify(r2))
 }
 
 for (const d of TMP) { try { rmSync(d, { recursive: true, force: true }) } catch {} }

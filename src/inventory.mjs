@@ -27,10 +27,13 @@ import { sleep } from './async-util.mjs'
 /* 第三十二刀：`equipFor` 要比较「手上这把 / 背包里最快那把」的挖掘耗时（`digMsFor` / `bestToolFor`）。
  * 依赖方向是 inventory → dig-speed → world-observer，不成环。 */
 import { digMsFor, bestToolFor } from './dig-speed.mjs'
+/* 附魔的**形状**统一在 `item-ench.mjs`（inventory / dig-speed / world-use / shoot 共用）。
+ * 2026-10-27 第二轮实机才发现 `.data` 外面还套着一层 `{ enchantments: [...] }`。 */
+import { enchantListOf, enchRawName, enchRawId, enchRawLevel } from './item-ench.mjs'
 
-/** 手上那叠的短名（`dirtx18`）；空手就是 `空手` */
+/** 手上那叠的短名（`dirtx18`、附魔的带上附魔 `diamond_swordx1（sharpness 5）`）；空手就是 `空手` */
 export function heldText (b) {
-  return b?.heldItem ? `${b.heldItem.name}x${b.heldItem.count}` : '空手'
+  return b?.heldItem ? itemText(b.heldItem, b?.registry) : '空手'
 }
 
 /**
@@ -59,7 +62,7 @@ export function equipmentOf (b) {
   const out = {}
   for (const [i, dest] of EQUIP_SLOTS) {
     const it = Array.isArray(slots) ? slots[i] : null
-    out[dest] = it ? `${it.name}x${it.count}${durSuffix(it)}` : null
+    out[dest] = it ? `${it.name}x${it.count}${enchSuffix(it, b?.registry)}${durSuffix(it)}` : null
   }
   return out
 }
@@ -94,6 +97,90 @@ export function durText (it) {
 
 /** 拼在名字后面的短尾巴（` · 耐久 120/250`）；不会磨损的回空串 */
 const durSuffix = (it) => { const s = durText(it); return s ? ` · 耐久 ${s}` : '' }
+
+/* ───────────────────────── 附魔（2026-10-27 用户："现在看不到附魔的属性"） ─────────────────────────
+ *
+ * 以前 `mc_inventory` 只报名字和数量：一把「锋利 V + 耐久 III 的钻石剑」和一把白板钻石剑
+ * 长得一模一样，而且**同名的会被合计成一叠**（`totals.set(i.name, …)`）——
+ * 附魔不同的两把剑被算成"2 把"，AI 会挑错那把去打 boss。
+ *
+ * mineflayer 的 `Item.enchants`（`prismarine-item/index.js:255` 起）回的**形状随版本不同**：
+ *   ① 1.20 及以前：`[{ lvl: 5, name: 'sharpness' }]` —— 带名字；
+ *   ② 1.20.5+ 走 `componentMap.get('enchantments').data` 分支，**协议里只有数字 id**；
+ *      而且 `.data` **不是裸数组**，外面还套着一层同名 key：`{ enchantments: [{ id: 32, level: 5 }] }`
+ *      （proto.yml 的 `SlotComponent.data: type ?` 每个 case 都是匿名 container）。
+ *      剥壳那一层在 `src/item-ench.mjs`，本模块只负责"名字/等级怎么显示"。
+ *
+ * 🔴 2026-10-27 实机（1.21.10，用户「还是看不到附魔」）：真机走的是第 ② 种，而上一版只认
+ *    `name`/`lvl`/`type`/`level`，`e.id` 那个数字被当成**名字**用了 ⇒ 界面显示「附魔 32 5」，
+ *    用户看到的就是"还是没有附魔"。数字 id 换名字只能查 registry 的 `enchantments[id].name`
+ *    （0 = aqua_affinity、32 = sharpness，按 id 索引的数组）。
+ *    ⚠️ registry 字段是 `enchantments`，**不是** `enchants`（`src/world-use.mjs` 那处就写错了）。
+ *
+ * 但 `itemText` / `enchKey` 这些调用点手里没有 bot ⇒ 这里存一份"最近一次见到的 registry"，
+ * 由 `runtime.requireBot` 每次要 bot 时登记一次（`setEnchantRegistry`）。
+ * 读不出来就当没附魔：不猜、不炸（`get enchants` 在未知版本会直接 throw）。
+ */
+
+/** 记住最近一次的 registry（只用来把附魔数字 id 换成名字） */
+let enchReg = null
+export function setEnchantRegistry (reg) {
+  if (reg && reg.enchantments) enchReg = reg
+  return enchReg
+}
+
+/** 附魔数字 id → 英文名（`32` → `sharpness`）；查不到回 `null`（不编名字） */
+export function enchNameById (id, reg = null) {
+  const n = Number(id)
+  if (!Number.isFinite(n) || n < 0) return null
+  const r = reg?.enchantments ? reg : enchReg
+  const e = r?.enchantments?.[n]
+  return typeof e?.name === 'string' ? e.name : null
+}
+
+/** 附魔列表：`[{ name: 'sharpness', lvl: 5 }]`；没附魔 / 读不到就是 `[]` */
+export function enchantsOf (it, reg = null) {
+  if (!it) return []
+  const out = []
+  /* 形状全交给 `item-ench.mjs` 剥壳（1.21 是 `{ enchantments: [{ id, level }] }`）；
+   * 这里只做两件事：有名字用名字，没名字就拿数字 id 查 registry。 */
+  for (const e of enchantListOf(it)) {
+    const lvl = enchRawLevel(e)
+    const rawName = enchRawName(e)
+    const id = enchRawId(e)
+    let name = rawName ? String(rawName).replace(/^minecraft:/, '').trim() : ''
+    /* 1.20.5+：只有数字 id。查 registry 换名字；查不到写 `#32`（明示"这个没认出来"），
+     * 绝不把裸数字当名字 —— 那正是上一版显示成「附魔 32 5」的原因。 */
+    if (!name && id != null) name = enchNameById(id, reg) ?? `#${id}`
+    if (!name) continue
+    out.push({ name, lvl })
+  }
+  return out
+}
+
+/* 等级用罗马数字（`sharpness V`）—— 和游戏里附魔书、装备提示条一个口径；
+ * 超过 X 的（自定义服会堆得很高）退回阿拉伯数字，别硬拼。 */
+const ROMAN = ['', 'I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X']
+const roman = (n) => ROMAN[n] ?? String(n)
+
+/** 附魔的人话：`sharpness V、unbreaking III`；没附魔回 `null` */
+export function enchText (it, reg = null) {
+  const es = enchantsOf(it, reg)
+  return es.length ? es.map((e) => `${e.name} ${roman(e.lvl)}`).join('、') : null
+}
+
+/** 附魔签名（合计 / 去重用）：`sharpness:5,unbreaking:3`；没附魔回空串 */
+export const enchKey = (it, reg = null) => enchantsOf(it, reg).map((e) => `${e.name}:${e.lvl}`).sort().join(',')
+
+/** 拼在名字后面的短尾巴（` · 附魔 sharpness 5`）；没附魔回空串 */
+const enchSuffix = (it, reg = null) => { const s = enchText(it, reg); return s ? ` · 附魔 ${s}` : '' }
+
+/** 名字 + 附魔的短写（`diamond_swordx1（sharpness V、unbreaking III）`）—— 手上 / 背包 / 装备栏共用一个口径 */
+export function itemText (it, reg = null) {
+  if (!it) return null
+  const es = enchText(it, reg)
+  return `${it.name}x${it.count}${es ? `（${es}）` : ''}`
+}
 
 /** 低于或等于这个比例算"快坏了"（20% —— 铁镐 250 耐久 ⇒ 剩 50 下就该提醒了） */
 export const DUR_LOW = 0.2
@@ -371,15 +458,32 @@ export function freeSlot (b, itemName = null) {
  */
 export function inventoryView (b) {
   const all = b.inventory.items()
+  /* 🔴 2026-10-27 用户："现在看不到附魔的属性"。
+   *    合计的键从 `name` 改成 `name + 附魔签名`：一把锋利 V 的钻石剑和一把白板钻石剑
+   *    以前会被算成"diamond_sword x2"，AI 挑的时候根本分不出哪把是好的。 */
   const totals = new Map()
-  for (const i of all) totals.set(i.name, (totals.get(i.name) ?? 0) + i.count)
-  const items = [...totals].map(([name, count]) => ({ name, count }))
-  const held = b.heldItem ? `${b.heldItem.name}x${b.heldItem.count}` : null
+  for (const i of all) {
+    const key = `${i.name}\u0001${enchKey(i, b?.registry)}`
+    const cur = totals.get(key)
+    if (cur) cur.count += i.count
+    else {
+      totals.set(key, {
+        name: i.name, count: i.count,
+        enchants: enchantsOf(i, b?.registry),
+        /* 附魔文本提前拼好（罗马数字口径在 `enchText` 里）—— 下面那行和 JSON 用同一份 */
+        ench: enchText(i, b?.registry),
+      })
+    }
+  }
+  const items = [...totals.values()].map(({ name, count, enchants, ench }) => ({
+    name, count, ...(enchants.length ? { enchants } : {}), ...(ench ? { ench } : {}),
+  }))
+  const held = b.heldItem ? itemText(b.heldItem, b?.registry) : null
   /* 🔴 2026-10-23 审计复查：报告 D[9] 说这两句口径重复、可以删一处 —— **不能删**。
    *    `check-core-inventory.mjs` 是照着"必须明说别再加一遍"写的（2026-10-08 实机：AI 把
    *    手上那叠和背包合计加了两遍，以为有 4 块木头、其实只有 2 块）。留着。 */
   const lines = [held ? `手上：${held}（这一叠已经算在下面的合计里，别再加一遍）` : '手上：空']
-  lines.push(items.length ? `背包（同名已合计、**含手上那叠**）：${items.map((i) => `${i.name}x${i.count}`).join('、')}` : '背包：空')
+  lines.push(items.length ? `背包（同名已合计、**含手上那叠**、附魔不同的分开算）：${items.map((i) => `${i.name}x${i.count}${i.ench ? `（${i.ench}）` : ''}`).join('、')}` : '背包：空')
   /* 🔴 2026-10-08 第五份审计旁注：`all.length` 是**叠数**（`items()` 一叠一条、不含 0-8 那九格），
    *    写"格"会让模型以为"背包只剩 3 格空位"。改成"叠"，并补一句空位。 */
   const free = (() => { try { return b.inventory.emptySlotCount() } catch { return null } })()

@@ -62,7 +62,8 @@ const mkMc = (stacks, heldIndex = null) => {
   const dir = mkdtempSync(join(tmpdir(), 'wc-inv-'))
   TMP_DIRS.push(dir)
   const mc = new McBot({ logFile: join(dir, 'check.log') })
-  const items = stacks.map(([name, count]) => ({ name, count }))
+  /* 第三项可选：额外字段（附魔 `{ enchants: [...] }`、耐久 `{ maxDurability }` 等） */
+  const items = stacks.map(([name, count, extra]) => ({ name, count, ...(extra ?? {}) }))
   mc.bot = {
     entity: {},
     // 真 mineflayer 的语义：`inventory.items()` 里**手上那一格也在内**
@@ -256,6 +257,104 @@ section('④ 静态接线（老写法不许回来）')
     ok(!/Array\.isArray\(inv\)\s*\?/.test(src), `${f} 不再写 Array.isArray(inv)（条件永远为假）`)
     ok(src.includes('背包：'), `${f} 还会打"背包：…"这一行`)
   }
+}
+
+/* ─────────── ⑥ 附魔要看得到（2026-10-27 用户："现在看不到附魔的属性"） ─────────── */
+section('⑥ 附魔：看得见、而且附魔不同的不合并')
+{
+  const invMod = await import(new URL('../src/inventory.mjs', import.meta.url))
+  const { enchantsOf, enchText, enchKey, itemText, equipmentOf } = invMod
+
+  /* ① 解析：两种 nbt 形状都认（`{name,lvl}` 老形状 / `{type,level}` 1.20.5+ 组件形状） */
+  const sharp = { name: 'diamond_sword', count: 1, enchants: [{ name: 'sharpness', lvl: 5 }, { name: 'unbreaking', lvl: 3 }] }
+  const modern = { name: 'diamond_sword', count: 1, enchants: [{ type: 'minecraft:mending', level: 1 }] }
+  const plain = { name: 'diamond_sword', count: 1, enchants: [] }
+  ok(enchText(sharp) === 'sharpness V、unbreaking III', '老形状 {name,lvl} 认得出', String(enchText(sharp)))
+  ok(enchText(modern) === 'mending I', '1.20.5+ 的 {type,level} 也认，且剥掉 minecraft:', String(enchText(modern)))
+  ok(enchText(plain) === null && enchKey(plain) === '', '没附魔 ⇒ null / 空签名（别输出空括号）')
+  ok(enchText(null) === null && enchantsOf(null).length === 0, 'null 不炸')
+  ok(enchText({ name: 'x', get enchants () { throw new Error('boom') } }) === null,
+    'get enchants 抛错 ⇒ 当没附魔（未知版本会 throw，不能让它带崩整个背包）')
+  ok(enchText({ name: 'x', enchants: { sharpness: 2 } }) === 'sharpness II', '映射形状 {name: lvl} 也认')
+
+  /* ①b 🔴 2026-10-27 实机（1.21.10，用户「还是看不到附魔」）：真机形状是 `[{ id: 32, level: 5 }]`
+   *     —— 只有**数字 id**，没有名字（1.20.5+ 走 `componentMap.get('enchantments').data`）。
+   *     上一版把 `e.id` 当名字用，界面显示成「附魔 32 5」，用户看到的就是"还是没有附魔"。
+   *     数字 id 换名字只能查 registry 的 `enchantments[id].name`（字段名是 `enchantments`，
+   *     **不是** `enchants` —— `src/world-use.mjs` 那处以前就写错了）。 */
+  const fakeReg = { enchantments: [] }
+  fakeReg.enchantments[0] = { name: 'aqua_affinity' }
+  fakeReg.enchantments[32] = { name: 'sharpness' }
+  fakeReg.enchantments[34] = { name: 'unbreaking' }
+  const idSword = { name: 'diamond_sword', count: 1, enchants: [{ id: 32, level: 5 }, { id: 34, level: 3 }] }
+  ok(enchText(idSword, fakeReg) === 'sharpness V、unbreaking III', '1.21 数字 id 换成名字', String(enchText(idSword, fakeReg)))
+  ok(itemText(idSword, fakeReg) === 'diamond_swordx1（sharpness V、unbreaking III）', 'itemText 也认数字 id')
+  const noName = enchantsOf({ enchants: [{ id: 32, level: 5 }] })
+  ok(noName.length === 1 && !/^\d+$/.test(noName[0].name),
+    '认不出名字时**不许**把裸数字当名字（旧 bug 显示"附魔 32 5"）', JSON.stringify(noName))
+  /* ①c 🔴 2026-10-27 第二轮实机（用户原话：「只显示 diamond_sword×1（enchantments 1）」）：
+   *     1.21 的 `.data` **不是裸数组**，外面套着一层同名 key：
+   *     `{ enchantments: [{ id: 32, level: 5 }] }`
+   *     （依据 minecraft-data `pc/1.21.9/proto.yml` 的 `SlotComponent: data: type ?` —— 每个 case 是匿名 container）。
+   *     上一版看到对象就当 `{ sharpness: 5 }` 映射走 ⇒ key `enchantments` 被当附魔名、数组 `Number()` 成 NaN 再兜底 1
+   *     ⇒ 每件附魔装备都显示成「（enchantments 1）」。 */
+  const shelled = { name: 'diamond_sword', count: 1, enchants: { enchantments: [{ id: 32, level: 5 }, { id: 34, level: 3 }] } }
+  ok(enchText(shelled, fakeReg) === 'sharpness V、unbreaking III', '真形状：{ enchantments: [{id,level}] } 剥壳后换名字', String(enchText(shelled, fakeReg)))
+  ok(!/enchantments/.test(String(enchText(shelled, fakeReg))), '绝不把组件名 `enchantments` 当附魔名输出（旧 bug 的原文）')
+  /* 这一句必须排在 `setEnchantRegistry` **之前**：登记过全局兜底之后，没有 reg 参数也能换名字了。 */
+  ok(enchText(shelled) === '#32 V、#34 III', '没有 registry 就写 `#32`（明示没认出来，也不拿数字当名字）', String(enchText(shelled)))
+  ok(enchText({ enchants: { stored_enchantments: [{ id: 32, level: 5 }] } }, fakeReg) === 'sharpness V', '附魔书的 stored_enchantments 也认')
+  const nested = { enchants: { enchantments: { enchantments: [{ id: 32, level: 5 }] } } }
+  ok(enchText(nested, fakeReg) === null, '剥不干净的怪形状宁可不显示，也不编一个假附魔', String(enchText(nested, fakeReg)))
+  ok(invMod.enchantsOf(shelled, fakeReg).length === 2, '剥壳在 `src/item-ench.mjs`，inventory 只是调用方', JSON.stringify(invMod.enchantsOf(shelled, fakeReg)))
+  invMod.setEnchantRegistry(fakeReg)
+  ok(enchText(idSword) === 'sharpness V、unbreaking III', 'setEnchantRegistry 之后纯函数（没有 bot 参数的）也能换名字')
+  ok(invMod.setEnchantRegistry({ enchants: {} }) === fakeReg,
+    '字段名不对的 registry 不覆盖已有登记（registry 里是 enchantments，不是 enchants）')
+  const dsMod = await import(new URL('../src/dig-speed.mjs', import.meta.url))
+  ok(JSON.stringify(dsMod.enchantsOfItem({ enchants: [{ id: 32, level: 5 }] }, fakeReg)) === '[{"name":"sharpness","lvl":5}]',
+    'dig-speed 也认数字 id（不然效率附魔被当"没附魔"，挖掘时间估偏大）')
+  ok(dsMod.enchantsOfItem({ enchants: [{ id: 999, level: 1 }] }, fakeReg).length === 0, '查不到的数字 id 直接跳过（不猜）')
+  try {   /* 真数据核对：读不到 registry 数据就跳过，不算失败 */
+    const mkReg = (await import('prismarine-registry')).default
+    const real = mkReg('1.21.10')
+    ok(real.enchantments?.[32]?.name === 'sharpness', '真 registry：id 32 就是 sharpness（对照表没记错）')
+    ok(real.enchants === undefined, '真 registry 里没有 `enchants` 字段')
+  } catch (e) { console.log(`  （跳过真 registry 核对：${e.message}）`) }
+
+  /* ② 展示：手上 / 单件 */
+  ok(itemText(sharp) === 'diamond_swordx1（sharpness V、unbreaking III）', 'itemText 带上附魔', itemText(sharp))
+  ok(itemText(plain) === 'diamond_swordx1', '没附魔就只写名字（不多一对括号）', itemText(plain))
+
+  /* ③ 合计：附魔不同的同名物品**不能**合并（以前会被算成"2 把"） */
+  const mc = mkMc([
+    ['diamond_sword', 1, { enchants: [{ name: 'sharpness', lvl: 5 }] }],
+    ['diamond_sword', 1, { enchants: [] }],
+    ['diamond_sword', 1, { enchants: [{ name: 'sharpness', lvl: 5 }] }],
+    ['cobblestone', 16],
+  ], 0)
+  const inv = mc.inventory()
+  const swords = inv.items.filter((i) => i.name === 'diamond_sword')
+  ok(swords.length === 2, '锋利 V ×2 合成一条、白板单独一条', JSON.stringify(swords))
+  ok(swords.some((s) => s.count === 2 && s.enchants?.[0]?.name === 'sharpness'), '锋利那把是 2 把', JSON.stringify(swords))
+  ok(swords.some((s) => s.count === 1 && !s.enchants), '白板那把是 1 把、且不带 enchants 字段', JSON.stringify(swords))
+  ok(inv.text.includes('sharpness V'), '文本里看得见附魔', inv.text.replace(/\n/g, ' | '))
+  ok(inv.held === 'diamond_swordx1（sharpness V）', '手上那行也带附魔', String(inv.held))
+  ok(inv.text.includes('cobblestonex16'), '没附魔的东西照旧合计', inv.text.replace(/\n/g, ' | '))
+
+  /* ④ 装备栏：穿在身上的附魔也要看得见（用户就是先看装备栏） */
+  const eqBot = {
+    inventory: {
+      slots: (() => {
+        const s = []
+        s[5] = { name: 'diamond_helmet', count: 1, enchants: [{ name: 'protection', lvl: 4 }], durabilityUsed: 40, maxDurability: 363 }
+        return s
+      })(),
+    },
+  }
+  const eq = equipmentOf(eqBot)
+  ok(String(eq.head).includes('附魔 protection IV'), '装备栏显示附魔', String(eq.head))
+  ok(String(eq.head).includes('耐久 323/363'), '附魔和耐久能同时显示', String(eq.head))
 }
 
 for (const d of TMP_DIRS) { try { rmSync(d, { recursive: true, force: true }) } catch {} }

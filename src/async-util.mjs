@@ -30,6 +30,14 @@ export function withTimeout (promise, ms, label) {
     //    "只有它在跑"时进程直接退出、超时永不触发（selfcheck 里实测踩到）。
     timer = setTimeout(() => reject(new Error(`__MC_TIMEOUT__${label}`)), ms)
   })
+  /* 🔴 2026-10-27 GitHub issue #3（用户 ysjmrx 报「寻路 超时 (200ms) 直接升级成
+   *    dsh: fatal load failure，把宿主带崩」）：
+   *    `Promise.race` 只保证**赢的那一个**有人接 —— 输的那一个如果后来才 reject，
+   *    在 Node 眼里就是"未处理拒绝"，而宿主的 fail-loud 把任何未处理拒绝当致命 ⇒ exit(1)。
+   *    这里给被包的 promise 挂一条空 catch：不影响返回值，只是提前把"输家"的
+   *    rejection 认领掉。（`raceAbort` 里那条派生 promise 同理，见下。）
+   */
+  if (promise && typeof promise.catch === 'function') promise.catch(() => {})
   return Promise.race([promise, guard])
     .catch((e) => {
       if (String(e?.message ?? '').startsWith('__MC_TIMEOUT__')) {
@@ -63,13 +71,19 @@ export function withTimeout (promise, ms, label) {
  * 由 `executeToolCalls(..., signal)` 传入，就是本轮 turn 的 abort signal。
  */
 export function raceAbort (promise, signal, label) {
-  if (!signal) return promise
+  /* 同上：先认领这条 promise 的 rejection。
+   * 中止先赢（用户按停止 / 会话取消）时，原 promise 后来才 reject ⇒ 谁都没接 ⇒ 未处理拒绝。
+   * 这是 2026-10-27 issue #3 那次崩溃最可能的泄出口：外层 `Promise.race([寻路, 卡住监控])`
+   * 里"卡住监控"先赢，被抛弃的寻路链再抛 mcTimeout。 */
+  const p = Promise.resolve(promise)
+  p.catch(() => {})
+  if (!signal) return p
   if (signal.aborted) return Promise.reject(abortError(label, signal))
   return new Promise((resolve, reject) => {
     const onAbort = () => reject(abortError(label, signal))
     signal.addEventListener('abort', onAbort, { once: true })
     const settle = (fn) => (v) => { signal.removeEventListener('abort', onAbort); fn(v) }
-    promise.then(settle(resolve), settle(reject))
+    p.then(settle(resolve), settle(reject))
   })
 }
 

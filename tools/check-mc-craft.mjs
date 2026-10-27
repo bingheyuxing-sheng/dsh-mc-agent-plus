@@ -896,7 +896,9 @@ console.log('— ⑫ 背包满了 ⇒ 产物掉地上，必须点名 —')
 {
   /* 用户原话：「合成的时候背包满了，造出来的东西会掉地上，机器人不知道」。
    * 实机现场：第二把钻石镐就是这么掉在地上的（AI 看到的是「✅ 合成完成」）。 */
-  const f = mkBot({ oak_log: 3 }, { craftToGround: true, emptySlots: 0 })
+  /* 🔴 2026-10-27：这里必须给 `oak_log: 1`（不是 3）—— 现在动手前会先算"放得下吗"，
+   *    空位 0 时只有"这叠料会被吃光、腾出一个槽位"才会放行；要测的正是"放行之后仍然掉地"这条兜底路径。 */
+  const f = mkBot({ oak_log: 1 }, { craftToGround: true, emptySlots: 0 })
   const mc = mkMc(f)
   const r = await run({ name: 'oak_planks', count: 4 }, { mc })
   ok(!f.counts.get(idOf('oak_planks')), '产物没进背包（模拟的就是这个）', String(f.counts.get(idOf('oak_planks'))))
@@ -926,12 +928,63 @@ console.log('— ⑫ 背包满了 ⇒ 产物掉地上，必须点名 —')
 }
 {
   // 扫不到脚边（假 bot 没有 distanceTo）⇒ 也得把"料被扣走了、产物没进背包"说出来
-  const f = mkBot({ oak_log: 3 }, { craftToGround: true, emptySlots: 0 })
+  const f = mkBot({ oak_log: 1 }, { craftToGround: true, emptySlots: 0 })
   delete f.bot.entity.position.distanceTo
   const mc = mkMc(f)
   const r = await run({ name: 'oak_planks', count: 4 }, { mc })
   ok(/产物没进背包/.test(r.text), '扫不了脚边也照样把"产物没进背包"说出来', r.text.split('\n').slice(0, 3).join(' '))
   ok(/脚边没扫到/.test(r.text) && /合成格里/.test(r.text), '扫不到就如实说扫不到（不编坐标），并提"可能卡在合成格里"', r.text)
+}
+
+/* ─────── ⑬ 背包放不下 ⇒ 动手前就拒绝，一粒料都不扣（用户 2026-10-27：「造东西背包满了就会，一直造」） ─────── */
+console.log('— ⑬ 背包放不下 ⇒ 动手前拒绝 —')
+{
+  /* 实机现场（02:15–02:17）：`mc_craft {name:"diamond_chestplate", count:1}` 连着跑，
+   * 每次都「产物没进背包（脚边 3 个掉落物）」—— 料一直被扣，模型看到"还差 1 个"就再来一次。 */
+  const f = mkBot({ oak_log: 3 }, { emptySlots: 0 })
+  const mc = mkMc(f)
+  const r = await run({ name: 'oak_planks', count: 4 }, { mc })
+  ok(/背包放不下，没开工/.test(r.text), '空位 0 且产物无处可放 ⇒ 动手前就拒绝', r.text.split('\n').slice(0, 3).join(' '))
+  ok(/一粒料都没扣/.test(r.text), '明说"一粒料都没扣"（不然模型以为料已经没了）', r.text)
+  ok(f.counts.get(idOf('oak_log')) === 3, '拒绝时**料一个都没动**', String(f.counts.get(idOf('oak_log'))))
+  ok(/还要再做 4 个/.test(r.text) && /现在有 0 个/.test(r.text), '说清"还要再做几个 / 现在有几个"', r.text)
+  ok(/mc_chest/.test(r.text) && /toss|丢掉/.test(r.text), '给出可执行对策（存箱子 / 丢掉 / 捡掉落物）', r.text)
+  ok(r.value?.refused === true && r.value?.why === 'inventory-full', '返回里带机器可读的 refused / why', JSON.stringify({ refused: r.value?.refused, why: r.value?.why }))
+  ok(!/✅/.test(r.text), '拒绝时不许出现 ✅（不然模型以为做成了）', r.text)
+}
+{
+  // 同一样东西刚掉过地 ⇒ 再叫也拒绝，并点名"别再试"
+  const f = mkBot({ oak_log: 3 }, { emptySlots: 0 })
+  f.bot._craftDrop = { key: idOf('oak_planks'), n: 1 }
+  const mc = mkMc(f)
+  const r = await run({ name: 'oak_planks', count: 4 }, { mc })
+  ok(/已经掉过 \*\*1 次\*\*地/.test(r.text), '点名"刚才已经掉过 1 次地"', r.text)
+  ok(/别再叫同样的 mc_craft/.test(r.text), '明确叫停：别再叫同样的 mc_craft', r.text)
+  ok(r.value?.droppedBefore === 1, '返回里带 droppedBefore', JSON.stringify({ droppedBefore: r.value?.droppedBefore }))
+}
+{
+  // 腾出空位之后 ⇒ 旧账自动失效（否则会永久卡死）
+  const f = mkBot({ oak_log: 3 }, { emptySlots: 20 })
+  f.bot._craftDrop = { key: idOf('oak_planks'), n: 2 }
+  const mc = mkMc(f)
+  const r = await run({ name: 'oak_planks', count: 4 }, { mc })
+  ok(f.counts.get(idOf('oak_planks')) === 4, '空位够了 ⇒ 旧账不再拦，照常合出来', String(f.counts.get(idOf('oak_planks'))))
+  ok(f.bot._craftDrop == null, '成功就清账（不然腾出空位也永远拒）', JSON.stringify(f.bot._craftDrop))
+}
+{
+  // 背包"满了"但产物能叠进手里那叠 ⇒ 绝不能拦（最容易误伤的一种）
+  const f = mkBot({ oak_log: 3, oak_planks: 60 }, { emptySlots: 0 })
+  const mc = mkMc(f)
+  const r = await run({ name: 'oak_planks', count: 64 }, { mc })
+  ok(!/背包放不下/.test(r.text), '产物能叠进已有那叠 ⇒ 不拦', r.text.split('\n').slice(0, 3).join(' '))
+  ok(f.counts.get(idOf('oak_planks')) === 64, '该叠的照常叠到 64', String(f.counts.get(idOf('oak_planks'))))
+}
+{
+  // 料会被吃光（那叠消失 = 腾出槽位）⇒ 空位 0 也要放行，别一上来就拒
+  const f = mkBot({ oak_log: 1 }, { emptySlots: 0 })
+  const mc = mkMc(f)
+  const r = await run({ name: 'oak_planks', count: 4 }, { mc })
+  ok(!/背包放不下/.test(r.text), '料被吃光能腾出槽位 ⇒ 放行（不许一刀切拒绝）', r.text.split('\n').slice(0, 3).join(' '))
 }
 
 {

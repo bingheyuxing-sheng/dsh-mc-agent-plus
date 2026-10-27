@@ -580,7 +580,8 @@ section('⑧ 静态接线（谁把这几条改回去谁红）')
   ok(/vertBad && horiz <= arriveUsed \+ 1\.0/.test(src), '🔴 "站错层"要单独报（不然会被 `mine === false` 那条吞掉）')
   ok(src.indexOf('vertBad && horiz <= arrive + 1.0') < src.indexOf('emptyNoPath || mine === false'),
     '🔴 顺序：先报"站错层"，再报"别人的锅"（插件的 GoalNear 是三维球，人在上层它必然不满足）')
-  ok(/Math\.max\(200, budget - \(Date\.now\(\) - t0\)\)/.test(src), '重试时用**剩余**预算（总时间仍以 budget 为界）')
+  ok(/const leftMs = budget - \(Date\.now\(\) - t0\)/.test(src) && /Math\.max\(200, leftMs\)/.test(src),
+    '重试时用**剩余**预算（总时间仍以 budget 为界）；预算已用尽就别再发起一次注定超时的寻路（issue #3）')
   ok(!/require\(|import .*mineflayer|prismarine/.test(strip(read('../src/movement.mjs')).replace(/from 'vec3'/g, '')),
     'movement.mjs 不 import 游戏运行时（vec3 除外）')
   const all = read('./check-all.mjs')
@@ -727,7 +728,11 @@ function mkCarveBot (cells = {}, at = [0, 64, 0]) {
       return n ? { name: n, position: v } : { name: 'air', position: v }
     },
     async equip (item, dest) { b.equipped.push([item?.name ?? item, dest]) },
-    async dig (blk) { b.dug.push(`${blk.position.x},${blk.position.y},${blk.position.z}`) },
+    async dig (blk) {
+      const k = `${blk.position.x},${blk.position.y},${blk.position.z}`
+      b.dug.push(k)
+      map.delete(k)          // 挖掉就是空气 —— 下面"2 格高复核"要用真实地图
+    },
     pathfinder: { bestHarvestTool: () => ({ name: 'iron_pickaxe' }) },
   }
   return b
@@ -762,6 +767,42 @@ const carve = mod.carveStepAhead
 }
 {
   /* 挡路的本身就是岩浆/基岩 ⇒ 不碰 */
+/* 🔴 2026-10-27（用户：「现在 move 要挖方块的话，不会挖头上方块导致卡住」）
+ *   真实调用点从来不是裸调：`walkPathfinder` 卡住时先用 `obstacleAheadOf` 挑出**那一格**，
+ *   再 `carveStepAhead(..., { only: 那一格 })`。"只挖那一格"也必须凑出 2 格高 ——
+ *   挖开脚位、头还堵着就是 1 格高的洞，人进不去，下一轮还是卡在同一个门口。 */
+{
+  /* ① 脚位空、头顶石头 ⇒ only 指到头位格，同样要挖。
+   *    （以前整条被"底下得有支撑"拒掉：它拿头位格的 y-1（= 脚位，正好是空气）
+   *      去要求实心 ⇒ 头顶那块永远挖不掉。） */
+  const b = mkCarveBot({ '1,65,0': 'stone', '1,63,0': 'stone' })
+  const n = await carve(b, { x: 1, y: 64, z: 0 }, { ignoreRange: true, only: { x: 1, y: 65, z: 0, cell: 'head' } })
+  ok(n === 1 && b.dug.includes('1,65,0'), '🔴 only 指向头顶那格 ⇒ 照挖（别拿"脚位是空气"当理由拒掉）',
+    JSON.stringify({ n, dug: b.dug }))
+  ok(!b.__carveHalfOpen, '头顶挖掉了 ⇒ 没有"通道只有 1 格高"的残留记账', JSON.stringify(b.__carveHalfOpen))
+}
+{
+  /* ② only 指向脚位、头顶也实心 ⇒ 两格一起挖，凑出一条 2 格高的通道 */
+  const b = mkCarveBot({ '1,64,0': 'stone', '1,65,0': 'stone', '1,63,0': 'stone' })
+  const n = await carve(b, { x: 1, y: 64, z: 0 }, { ignoreRange: true, only: { x: 1, y: 64, z: 0, cell: 'feet' } })
+  ok(n === 2 && b.dug.includes('1,64,0') && b.dug.includes('1,65,0'),
+    '🔴 挖脚位时把头顶那格一起挖（玩家过得去要 2 格高）', JSON.stringify({ n, dug: b.dug }))
+  ok(!b.__carveHalfOpen, '两格都通了 ⇒ 不留"只挖一半"的记录', JSON.stringify(b.__carveHalfOpen))
+}
+{
+  /* ③ 头顶是基岩 ⇒ 只挖脚位，并如实记账"差的是哪一块"，让上层把话说全 */
+  const b = mkCarveBot({ '1,64,0': 'stone', '1,65,0': 'bedrock', '1,63,0': 'stone' })
+  const n = await carve(b, { x: 1, y: 64, z: 0 }, { ignoreRange: true, only: { x: 1, y: 64, z: 0, cell: 'feet' } })
+  ok(n === 1 && !b.dug.includes('1,65,0'), '头顶挖不动（基岩）⇒ 只挖脚位，不硬啃', JSON.stringify({ n, dug: b.dug }))
+  ok(b.__carveHalfOpen && b.__carveHalfOpen.name === 'bedrock' && b.__carveHalfOpen.y === 65,
+    '🔴 记账「还差头顶那一块」—— 上层据此告诉 AI 通道只有 1 格高', JSON.stringify(b.__carveHalfOpen))
+}
+{
+  /* ④ only 指向脚位、底下是坑 ⇒ 老语义不变：不挖 */
+  const b = mkCarveBot({ '1,64,0': 'stone', '1,65,0': 'stone' })
+  const n = await carve(b, { x: 1, y: 64, z: 0 }, { ignoreRange: true, only: { x: 1, y: 64, z: 0, cell: 'feet' } })
+  ok(n === 0 && b.dug.length === 0, 'only 指向脚位但底下是坑 ⇒ 不挖（挖了就是往坑里走）', JSON.stringify({ n, dug: b.dug }))
+}
   const lava = mkCarveBot({ '1,64,0': 'lava', '1,63,0': 'stone' })
   ok(await carve(lava, { x: 1, y: 64, z: 0 }) === 0 && lava.dug.length === 0, '挡路的是岩浆 ⇒ 不挖')
   const bed = mkCarveBot({ '1,64,0': 'bedrock', '1,63,0': 'stone' })
@@ -1784,7 +1825,7 @@ section('⑰ preferDoors：挖墙要多付一笔，走门/绕路不付（2026-10
   ok(DEFAULTS.doorDigPenalty === 8, '默认惩罚 8')
   const plug = readFileSync(new URL('../src/plugins.mjs', import.meta.url), 'utf8')
   ok(/self\.cfg\.preferDoors !== false/.test(plug), 'movements() 真的读了 preferDoors 开关')
-  ok(/digPenalty: preferDoors \? Number\(self\.cfg\.doorDigPenalty \?\? 8\) : 0/.test(plug), '惩罚值可配置（doorDigPenalty，关掉就是 0）')
+  ok(/digPenalty: \(digFirstOn \|\| !preferDoors\) \? 0 : Number\(self\.cfg\.doorDigPenalty \?\? 8\)/.test(plug), '惩罚值可配置（doorDigPenalty，关掉就是 0；挖路优先时也归零）')
 }
 
 /* ═══════════════ ⑱ 实机反馈（2026-10-19）：门没开透要补按、斜向挡路、上方目标允许垫一次 ═══════════════ */
@@ -2411,5 +2452,86 @@ section('㉖ 2026-10-24 导航世界模型：实体 / 未加载 / 岩浆 都不�
     ok(ij > 0 && iw > ij, 'jump 在 forward 之前（不再同时按下）')
   }
 }
+/* ── （2026-10-27）结果字段不许说谎：`stuck` / `moved` 的语义 ── */
+{
+  const src = readFileSync(new URL('../src/movement.mjs', import.meta.url), 'utf8')
+  /* 现场（session-514c21b6，用户 m02756「这个会话的 dig 和 move 根本不准确」）：
+   * 324 次 mc_move 里 199 次返回都带 `stuck:true`，包括"这一轮时间到、但已经挪了 11 格"的 ——
+   * 这个字段原来是**无条件写死 true**，模型一看就以为卡死了、别再试。 */
+  ok(/stuck: Boolean\(preempted \|\| exhausted \|\| \(noProgress && !timeUp\)\)/.test(src),
+    'stuck 只在"真没进展/被抢占/脱困用尽"时为 true（不是无条件写死）')
+  const pathFailAt = src.indexOf("via: 'pathfinder',")
+  ok(pathFailAt > 0 && !/^\s*stuck: true,\s*$/m.test(src.slice(pathFailAt, pathFailAt + 400)),
+    'pathfinder 失败分支里不再有裸的 `stuck: true`（那种写法让 199/324 次结果都误标卡死）')
+  /* `moved` 是**水平**位移（deltaOf 里 hypot(dx,dz)），文案以前只写"挪了 N 格" ⇒
+   * 结果里 `moved:5.87` 配 `movedVertical:-7` 看着像自相矛盾。 */
+  ok(/水平挪了 \$\{moved\} 格/.test(src), 'hint 说清"水平挪了 N 格"（垂直由 vertNote 单独说）')
+  ok(/const horizontal = Number\(Math\.hypot\(dx, dz\)\.toFixed\(2\)\)/.test(src),
+    'deltaOf 的 moved 就是水平位移（hypot(dx,dz)）—— 语义与文案一致')
+}
+/* ── （2026-10-27）移动老是卡：悬空坠落 + 原地杵着不动 ── */
+{
+  const src = readFileSync(new URL('../src/movement.mjs', import.meta.url), 'utf8')
+  /* 现场（session-514c21b6）：97 次坠落、累计 696 格、最深 28 格（74→46）；
+   * 726 次 mc_move 里 187 次只剩 timeout、107 次 path-reset、33 次 PathStopped 且
+   * "moved=0 但人没到"。病根两层：
+   *   ① vendor 把"路径作废、下个 tick 重算"（chunk_loaded / block_updated）也当成
+   *      "这次 goto 废了" ⇒ stop() ⇒ 人立刻站住 —— 就是「脚踩实地杵着不动」；
+   *   ② 垫方块先按住 jump 升到摆放高度，再 equip（一次网络往返），等回包时人已经在掉，
+   *      placeBlock 时脚下那格已不可放置 ⇒ place_error ⇒ 摔下去 —— 就是「卡在半空 1~2 秒」。 */
+  ok(/export const MOVE_AUTOREPATH_MAX = \d+/.test(src), '中途被重置后可自动重发（有上限，不无限转）')
+  ok(/export const MOVE_AUTOREPATH_STALL = \d+/.test(src), '连续重发都没靠近就收手（防原地空转）')
+  ok(/const BENIGN_RESET = new Set\(\[[^\]]*'chunk_loaded'/.test(src), '"路径作废、马上重算"那几类不算被打断')
+  ok(/if \(BENIGN_RESET\.has\(k\)\) return/.test(src), '正常重算不进 resetReasons（别把正常当故障说给模型）')
+  ok(/lastReset = k/.test(src), '记下最近一次重置原因，供失败归因')
+  ok(/autoRepathStall <= MOVE_AUTOREPATH_STALL/.test(src), '只有"重发后确实靠近了"才继续重发')
+  ok(/dLeftNow <= autoRepathDLeft - 0\.5/.test(src), '靠近的判据是距离减少 >0.5 格（不是自我安慰）')
+  ok(/if \(r\.pathResetReasons\)/.test(src) && /\.slice\(0, 4\)/.test(src),
+    '结果里保留 top-4 重置原因（2026-10-24 那次"简化输出"把它删了，模型只看到"卡住"不知道为什么）')
+  ok(/place_error: 'place-error/.test(src) && /no_scaffolding_blocks: 'no-scaffolding/.test(src),
+    '重置原因翻成人话（place-error / no-scaffolding…）')
+  /* vendor 侧补丁：这里只查 `tools/patch-mc-deps.mjs` 覆盖到没有（重装依赖要靠它重打） */
+  const patchSrc = read('../tools/patch-mc-deps.mjs')
+  ok(/RESUMABLE_RESETS/.test(patchSrc), 'vendor 补丁：可恢复的重置不再 stop()')
+  ok(/placingEquipped/.test(patchSrc), 'vendor 补丁：垫方块改成起跳前预装备')
+  ok(/lastResetReason/.test(patchSrc), 'vendor 补丁：goto 的 PathStopped 带上真实原因')
+}
+
+/* ── （2026-10-27）noDig:false ⇒ 直接按最短路线挖（不再"能绕就绕"） ── */
+{
+  /* 现场：用户「nodig false 还是优先走现有路线，false 应该直接按最短路线挖」。
+   * 病根：`noDig:false` 只松开 `canDig`，A* 里挖一格的代价仍是 terrain 表给的 3~8，
+   *       "绕两格"永远比"挖一格"便宜 ⇒ 明明允许挖，它还是绕。
+   * 修法：显式 `noDig:false` ⇒ `digFirst`，挖按"多走一步"计价（movements.digCost 0.4）。 */
+  const { DEFAULTS: D2 } = await import(new URL('../src/core.mjs', import.meta.url))
+  ok(D2.walkDigFirst === true, '默认挖路优先（walkDigFirst:true）')
+  ok(typeof D2.walkDigFirstCost === 'number' && D2.walkDigFirstCost > 0 && D2.walkDigFirstCost < 1,
+    '挖一格的系数 < 1（默认 ' + D2.walkDigFirstCost + '）')
+  /* 手挖石头 1.5 秒：laborCost = (1 + 3×1.5) × 0.4 ≈ 2.2 步 ⇒ 比"多绕三格"便宜。 */
+  ok((1 + 3 * 1.5) * D2.walkDigFirstCost < 3, '手挖一格石头 ≲ 走三格（绕路不再稳赢）')
+  const plug2 = readFileSync(new URL('../src/plugins.mjs', import.meta.url), 'utf8')
+  ok(/export function movements \(self, \{ terrain = null, digFirst = false \} = \{\}\)/.test(plug2),
+    'movements() 收 digFirst')
+  ok(/const digFirstOn = Boolean\(digFirst\) && self\.cfg\?\.walkDigFirst !== false/.test(plug2),
+    'digFirst 可被 cfg.walkDigFirst 关掉')
+  ok(/if \(digFirstOn\) mv\.digCost = Number\(self\.cfg\?\.walkDigFirstCost \?\? 0\.4\)/.test(plug2),
+    'digFirst 时把 digCost 压到 walkDigFirstCost')
+  ok(!/digFirstOn[^\n]*canDig/.test(plug2), 'digFirst 不动 canDig（安全边界不松）')
+  const mv2 = readFileSync(new URL('../src/movement.mjs', import.meta.url), 'utf8')
+  ok(/const digFirst = !noDig && ctx\.cfg\?\.walkCanDig !== false/.test(mv2),
+    'mc_move 的 noDig:false ⇒ digFirst（配置关掉挖时不算）')
+  ok((mv2.match(/ctx\.movements\(terrain, \{ digFirst \}\)/g) || []).length === 3,
+    '三处建 Movements（主 / 垫柱兜底 / 地形重估）都带上 digFirst')
+  const core2 = readFileSync(new URL('../src/core.mjs', import.meta.url), 'utf8')
+  ok(/movements: \(terrain, opts\) => this\.#movements\(terrain, opts\)/.test(core2),
+    '#pathCtx 把 opts 透传给 movements()')
+  /* 复盘实机会话那批"你掉下去了"：97 次里只有 13 次真垫过柱子，其余是正常下坡。 */
+  ok(/const descendsOnPurpose = Number\.isFinite\(Number\(target\?\.y\)\)/.test(mv2),
+    '区分"真摔"与"目标本来就在下面"')
+  ok(/descended: f, descendedFrom/.test(mv2), '正常下坡只报 descended（不再说"垫柱子被拒"）')
+  ok(/if \(f == null \|\| !fellIsReal\(f\)\) return ''/.test(mv2), '下坡不吓唬模型（fellNote 为空）')
+  ok(/这次 \$\{gotSec\} 秒/.test(mv2), '预算到点的文案写清"这次分到多少秒"（不再是硬梆梆的 10 秒）')
+}
+
 console.log(`check-move-progress：pass=${pass} fail=${fail}`)
 process.exit(fail ? 1 : 0)

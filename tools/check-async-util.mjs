@@ -116,6 +116,34 @@ section('③ sleep / withTimeout / raceAbort / abortError 照旧')
   try { await raceAbort(new Promise(() => {}), ac.signal, '测试') } catch (e) { ab = e }
   ok(ab?.mcAborted === true, 'raceAbort 已中止时抛 mcAborted 错误', String(ab?.mcAborted))
   ok(abortError('x', ac.signal).mcAborted === true, 'abortError 带 mcAborted')
+
+  /* 🔴 2026-10-27 GitHub issue #3：**超时/中止先赢之后，被抛弃的那条 promise 后来才 reject** ——
+   *    以前没人接，Node 就报 unhandledRejection，宿主的 fail-loud 把它当致命 ⇒
+   *    `dsh: fatal load failure: Error: 寻路 超时 (200ms)` ⇒ 整个应用退出（用户报的崩溃）。
+   *    这两条断言钉住"输家也有人接"。 */
+  const leaks = []
+  const onLeak = (e) => leaks.push(String(e?.message ?? e))
+  process.on('unhandledRejection', onLeak)
+  try {
+    let later = null
+    const p = new Promise((_, rej) => { later = rej })
+    try { await withTimeout(p, 20, '测试') } catch {}
+    later(new Error('超时之后它才失败'))
+    await sleep(80)
+    ok(leaks.length === 0, 'withTimeout 超时后，被抛弃那条的拒绝不算未处理拒绝', JSON.stringify(leaks))
+
+    let later2 = null
+    const p2 = new Promise((_, rej) => { later2 = rej })
+    const ac2 = new AbortController()
+    const rp = raceAbort(p2, ac2.signal, '测试')
+    ac2.abort()
+    try { await rp } catch {}
+    later2(new Error('中止之后它才失败'))
+    await sleep(80)
+    ok(leaks.length === 0, 'raceAbort 中止后，被抛弃那条的拒绝也不算未处理拒绝', JSON.stringify(leaks))
+  } finally {
+    process.removeListener('unhandledRejection', onLeak)
+  }
 }
 
 /* ─────────── ④ 接线：六处手写轮询真的都收口了 ─────────── */

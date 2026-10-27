@@ -485,13 +485,24 @@ export async function digStair (self, {
 
   const now = b.entity.position.floored()
   const left = up ? ty - now.y : now.y - ty
-  const body = `挖了 ${steps} 步、${dug} 块方块，从 y=${start.y} 到 y=${now.y}`
+  /* 🔴 2026-10-27（用户 m02756「这个会话的 dig 和 move 根本不准确」；实测 session-514c21b6）：
+   *    以前不管挖没挖都写「挖了 N 步、M 块方块」⇒ 出现过「**挖了 23 步、0 块方块**」这种
+   *    自相矛盾的话（真实情况是一路沿着早先挖好的阶梯**走**上去的，一块没挖）。
+   *    挖了 0 块就别提"挖"，如实说走了几步。 */
+  const body = dug > 0
+    ? `挖了 ${steps} 步、${dug} 块方块，从 y=${start.y} 到 y=${now.y}`
+    : `走了 ${steps} 步（没挖方块，沿已有通道），从 y=${start.y} 到 y=${now.y}`
+  const climbed = now.y - start.y
   const tail = {
     done: '✅ 到目标高度了。',
     budget: '⏱ 这一轮 10 秒用完了 —— 再叫一次 `mc_dig {mode:"stair", y:' + ty + '}` 接着挖（已经挖好的不会白挖）。',
     liquid: '🌊 前面是水/岩浆，不往那边挖了 —— 换个方向（`dir:"x-"` 之类）或者先绕开。',
     'no-floor': '🕳 前面脚下是空的（深洞/矿洞），不敢再挖 —— 换个方向，或者先看看那边是什么。',
-    stuck: '⛔ 挖开了但没走过去（卡住）—— 多半是自己头顶还堵着（跳不起来），先 `mc_observe` 看一眼，别原地重叫。',
+    /* 🔴 2026-10-27：`stuck` 原来写死成"挖开了但没走过去（卡住）"——每轮明明已经推进了
+     *    5 格（y 75→70、70→65）也照样这么报，模型以为整轮白干。按"到底有没有推进"分开说。 */
+    stuck: climbed !== 0
+      ? `⛔ 最后一步没走成，但这一轮已经从 y=${start.y} 走到 y=${now.y}（推进 ${Math.abs(climbed)} 格）—— 再叫一次 \`mc_dig {mode:"stair", y:${ty}}\` 接着挖，挖好的不会白挖。`
+      : `⛔ 一步都没走动（还停在 y=${now.y}）—— 多半是自己头顶还堵着（跳不起来），先 \`mc_observe\` 看一眼，别原地重叫。`,
     unloaded: '⏳ 前面的区块还没加载完 —— 等一下再叫。',
   }[reason] ?? ''
   const hint = reason === 'done' ? '' : `
@@ -929,6 +940,8 @@ export async function dig (self, {
  *   ② 其余看**前后左右四格**：只要有一格是空的（空气 / 可通行），就能挖 ——
  *      那一面就是"能看见/能伸进去"的那一面。用户原话：
  *      「改成方块前后左右有一格方块是空的就可以挖」。
+ *   ②′ 四面有空之后**还要过视线**（2026-10-27 GitHub issue #3）：四面有空只说明"那一面通着"，
+ *      不代表"你和它之间没夹着别的方块"。以前漏了这一条，于是会绕开正前方的金矿去挖后面的钻石。
  *   ③ 四面全被实心包住 ⇒ 才是真正的"隔着方块挖"，拦下并说清是哪面挡着。
  *   ④ 读不到方块 / 够不着（眼→方块中心 > reachMax+1）⇒ `null`，**不拦**（判不了就别拒绝干活）。
  *
@@ -939,6 +952,62 @@ export async function dig (self, {
  *
  * 只把**实心方块**当遮挡（水 / 草 / 藤蔓 / 火把都算"空的"），和 `mc_shoot` 的 `blockedAlong` 同口径。
  */
+/** 视线采样线的终点（方块内相对坐标）：中心 + 六个面心各往里 0.03。 */
+const LOS_ENDS = Object.freeze([
+  [0.5, 0.5, 0.5],
+  [0.5, 0.97, 0.5], [0.5, 0.03, 0.5],
+  [0.97, 0.5, 0.5], [0.03, 0.5, 0.5],
+  [0.5, 0.5, 0.97], [0.5, 0.5, 0.03],
+])
+
+/**
+ * 「眼睛 → 这一格」这条线上有没有别的实心方块挡着（2026-10-27 GitHub issue #3）。
+ *
+ * 为什么要单独做：`canSeeBlockOf` 的 ② 只看目标**紧贴的四面** ——
+ *   目标旁边只要有矿洞开口就放行，于是"正前方挡着金矿、后面藏着钻石"时，
+ *   它会绕开金矿直接挖后面的钻石（用户给了日志：先报"四面都被包着挖不了"，
+ *   两分钟后**原地没动**就把那块钻石挖掉了，而当时前方明明还夹着金矿）。
+ *
+ * 判据：终点取**中心 + 六个面心**共 7 个点 —— Minecraft 挖方块只要求视线够到碰撞箱的
+ *   **任意一点**；只取中心会把"站在平地上挖斜下方 2~3 格的矿"误拦
+ *   （中心那条线被地板边缘擦到，可上表面明明看得见）。
+ *   任意一条采样线**没有**撞到实心方块 ⇒ 看得见，返回 `null`；
+ *   7 条全被挡 ⇒ 返回第一条撞到的 `{ blocker, at }`。
+ *
+ * 跳过：目标自己那格、贴身 ≤1 格的方块（射线第一块常常是自己踩的地板，与 ① 同口径）。
+ * 读不到方块（区块没加载）⇒ 这一条不算被挡（判不了就别拒绝干活，与 ④ 同口径）。
+ */
+function losBlockerAlong (b, from, gx, gy, gz, near) {
+  const at = (x, y, z) => { try { return b.blockAt(new Vec3(x, y, z)) } catch { return null } }
+  let first = null
+  for (const [ex, ey, ez] of LOS_ENDS) {
+    const dx = gx + ex - from.x
+    const dy = gy + ey - from.y
+    const dz = gz + ez - from.z
+    const len = Math.sqrt(dx * dx + dy * dy + dz * dz)
+    if (!(len > 0.6)) return null                     // 贴着脸，肯定看得见
+    const steps = Math.min(96, Math.max(8, Math.ceil(len / 0.25)))
+    let hit = null
+    for (let i = 1; i < steps; i++) {
+      const t = i / steps
+      const bx = Math.floor(from.x + dx * t)
+      const by = Math.floor(from.y + dy * t)
+      const bz = Math.floor(from.z + dz * t)
+      if (bx === gx && by === gy && bz === gz) continue
+      if (Math.max(Math.abs(bx - near.fx0), Math.abs(by - near.fy0), Math.abs(bz - near.fz0)) <= 1) continue
+      const blk = at(bx, by, bz)
+      if (!blk) continue                              // 读不到 ⇒ 这一条判不了，不算被挡
+      if (blk.boundingBox !== 'block') continue
+      if (isAir(blk.name) || isPassable(blk.name)) continue
+      hit = { blocker: blk.name ?? '方块', at: { x: bx, y: by, z: bz } }
+      break
+    }
+    if (!hit) return null                             // 有一条通 ⇒ 看得见
+    if (!first) first = hit
+  }
+  return first
+}
+
 export async function canSeeBlockOf (b, p, { reachMax = 4.5 } = {}) {
   const eye = b?.entity?.position
   if (!eye || !p) return null
@@ -964,7 +1033,12 @@ export async function canSeeBlockOf (b, p, { reachMax = 4.5 } = {}) {
     if (!nb) return null                       // 有一面读不到 ⇒ 判不了，不拦
     around.push({ dx, dz, nb })
   }
-  if (around.some((s) => isAir(s.nb.name) || isPassable(s.nb.name))) return { ok: true }
+  if (around.some((s) => isAir(s.nb.name) || isPassable(s.nb.name))) {
+    /* ②′ 四面有空 **不等于** 看得见 —— 再量一遍"眼睛 → 这一格"的视线（issue #3）。 */
+    const los = losBlockerAlong(b, from, gx, gy, gz, { fx0, fy0, fz0 })
+    if (los) return { ok: false, blocker: los.blocker, at: los.at, los: true }
+    return { ok: true, los: true }
+  }
   /* ③ 四面全实心：拦下，报第一面（北）那块的坐标 */
   const s0 = around[0]
   return {

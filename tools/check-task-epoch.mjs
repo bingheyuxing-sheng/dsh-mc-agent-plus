@@ -341,6 +341,11 @@ section('⑤ 静态接线')
   ok(/if \(!Number\.isFinite\(Number\(t\.epoch\)\) \|\| Number\(t\.epoch\) < TASK_EPOCH_START\) t\.epoch = TASK_EPOCH_START/.test(rn), 'migrateTask 给老任务补 epoch')
   ok(/stepLine\(t\), epoch: Number\(t\.epoch\) \|\| TASK_EPOCH_START/.test(rn), 'stepBegin 把代次回给调用方')
   ok(/if \(r\.stale === true\) return 'stale'/.test(rn), 'outcomeOf 认 stale')
+  /* 🔴 2026-10-27：`mc_craft` 在"背包放不下"时没开工（`refused:true, why:'inventory-full'`）。
+   *    outcomeOf 必须判 failed —— 判 unknown 会让模型"再看一眼"然后拿同样的料再叫一次。 */
+  ok(outcomeOf({ refused: true, why: 'inventory-full', text: '⛔ 背包放不下，没开工（一粒料都没扣）' }) === 'failed',
+    'outcomeOf：工具自己 refused（没开工）⇒ failed，不是 unknown',
+    outcomeOf({ refused: true, why: 'inventory-full' }))
   ok(/OUTCOME_LABEL = \{[^}]*stale:/.test(rn), 'OUTCOME_LABEL 里有 stale')
 
   /* 换代只发生在六处 —— 多一处就要有人解释为什么。

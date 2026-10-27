@@ -317,6 +317,9 @@ export function outcomeOf (res, { expect = null } = {}) {
   if (r.restored === true) return 'failed'
   if (r.broken === false && r.refused === true) return 'failed'
   if (r.placed === 0 && r.refused === true) return 'failed'
+  /* 🔴 2026-10-27：`mc_craft` 在"背包放不下"时压根**没开工**（`refused:true, why:'inventory-full'`）——
+   *    这是明确没做成。判成 unknown 会诱导模型"再看一眼"然后拿同样的料再叫一次，正是要掐掉的死循环。 */
+  if (r.refused === true) return 'failed'
   /* 🔴 报告 H4（2026-10-13）：`placeBlock` 只在"放完复核没过"时回 `placed:false`（`place.mjs:189`），
    *    那是明确失败 —— 以前它落到最后变成"结果未知"，模型会以为还有机会。 */
   if (r.placed === false) return 'failed'
@@ -336,6 +339,16 @@ export function outcomeOf (res, { expect = null } = {}) {
     return 'failed'
   }
   if (/复原|够不着|没有能挖|不在线|NoPath|unreachable|refused|拒绝|缺少|先 mc_craft|没挖成|没挖掉/i.test(blob)) return 'failed'
+  /* 🔴 2026-10-27（用户：「这个会话的 dig 和 move 根本不准确」；实测 session-514c21b6：
+   *    324 次 `mc_move` 里 **30 次**判成「✅ 已确认成功」而结果里明明写着 `arrived:false`）。
+   *    根因：走路走不到时返回里照样有 `dug:3`（路上顺手挖了几块）—— 下面
+   *    `pos(r.dug) > 0 ⇒ confirmed` 那条把"挖了 3 块"当成"到了"。**走路/开船的成败只看 `arrived`**，
+   *    `dug`/`placed` 是副产品，不能当"到了"的证据。这里单独分流：
+   *    路不通 / 目标站不住 = failed；时间到 / 被打断 / 卡住 = unknown（服务器可能已经挪了）。 */
+  if (r.arrived === false) {
+    if (/NoPath|unreachable|refused|拒绝|够不着|goal-not-standable/i.test(blob)) return 'failed'
+    return 'unknown'
+  }
 
   // ② 明确成功：有证据
   /* 🔴 报告 H4：`placed` / `broken` 成功时是**方块名字符串**（`place.mjs:189` / `mining.mjs:145`），

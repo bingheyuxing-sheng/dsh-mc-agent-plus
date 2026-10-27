@@ -14,6 +14,7 @@
  *   · 判定不了就返回 null，不抛。
  */
 import { inWaterNow, fallingNow } from './world-observer.mjs'
+import { enchantListOf, enchRawName, enchRawId, enchRawLevel } from './item-ench.mjs'
 
 /** 方块名/工具名 → 工具种类（`stone_pickaxe` → `pickaxe`）。认不出返回 null。 */
 export function digToolKindOf (name) {
@@ -24,11 +25,31 @@ export function digToolKindOf (name) {
   return null
 }
 
-/** 一件物品上的附魔列表（认不出就返回空数组）。mineflayer 里可能是数组也可能是对象。 */
-export function enchantsOfItem (it) {
+/** 一件物品上的附魔列表（认不出就返回空数组）。mineflayer 里可能是数组也可能是对象。
+ *
+ *  🔴 2026-10-27（用户「还是看不到附魔」连带查出来的）：1.20.5+ / 1.21 的 `Item.enchants` 走
+ *  `componentMap.get('enchantments').data`，形状是 `[{ id: 32, level: 5 }]` —— **只有数字 id，
+ *  没有名字**。这里原来只认 `x.name`，于是效率附魔一律被过滤掉 ⇒ 效率 V 的镐按"没附魔"估时间，
+ *  估出来的 ms 偏大（2026-10-17 修过的那个"挖钻石矿要多花 6.75 秒"会以另一种原因复发）。
+ *  数字 id 换名字查 registry 的 `enchantments[id].name`（0=aqua_affinity、32=sharpness）。
+ */
+export function enchantsOfItem (it, reg = null) {
+  const out = []
   try {
-    const arr = Array.isArray(it?.enchants) ? it.enchants : (it?.enchants ? Object.values(it.enchants) : [])
-    return arr.filter((x) => x && typeof x.name === 'string').map((x) => ({ name: x.name, lvl: x.lvl ?? x.level ?? 1 }))
+    /* 剥壳统一在 `item-ench.mjs`：1.21 是 `{ enchantments: [{ id, level }] }`，
+     * 只认"裸数组"的话效率 V 的镐会被当成没附魔（估时偏大，见上面那段说明）。 */
+    for (const x of enchantListOf(it)) {
+      let nm = enchRawName(x)
+      const id = enchRawId(x)
+      if (!nm && id != null) {
+        const e = reg?.enchantments?.[id]
+        if (typeof e?.name === 'string') nm = e.name
+      }
+      /* 认不出名字就跳过（按"没这个附魔"算）—— 不猜、不崩。 */
+      if (!nm) continue
+      out.push({ name: String(nm).replace(/^minecraft:/, ''), lvl: enchRawLevel(x) })
+    }
+    return out
   } catch { return [] }
 }
 
@@ -54,7 +75,7 @@ function itemOf (b, itemType) {
 function efficiencyBonusOf (b, itemType) {
   const it = itemOf(b, itemType)
   if (!it) return 0
-  for (const e of enchantsOfItem(it)) {
+  for (const e of enchantsOfItem(it, b?.registry)) {
     if (e.name === 'efficiency') {
       const lvl = Number(e.lvl) || 0
       return lvl > 0 ? lvl * lvl + 1 : 0
@@ -131,7 +152,7 @@ export function fixDigMs (b, blk, itemType) {
      *  `enchants` 只传头盔（海之眷顾 Aqua Affinity）：手持物的效率已经被
      *  `efficiencyBonusOf` 折进 speed 了，再传一遍会重复计算（上游在数据坏的方块上本来也不认效率）。 */
     const helmet = (() => { try { return b?.inventory?.slots?.[5] ?? null } catch { return null } })()
-    const hand = Number(blk.digTime(itemType, false, inWaterNow(b), fallingNow(b), enchantsOfItem(helmet), b?.entity?.effects ?? {}))
+    const hand = Number(blk.digTime(itemType, false, inWaterNow(b), fallingNow(b), enchantsOfItem(helmet, b?.registry), b?.entity?.effects ?? {}))
     if (!(Number.isFinite(hand) && hand > 0)) return null
     // 上游那个值是按 50ms 一档取整过的，直接 ceil 会把它那点取整误差也放大一档；
     // 这里 round 回最近一档（`patchDigTime` 还有 8% + 60ms 余量兜底，不会挖早）
@@ -159,13 +180,13 @@ const ENCH_FIXED = new WeakSet()
  * 这里在调上游之前把形状**规整成数组**（认不出的附魔按"没有"算），
  * 上游那句 `.concat` 就永远有得拼。改的是物品实例自身的属性，不动原型。
  */
-export function normalizeEnchants (it) {
+export function normalizeEnchants (it, reg = null) {
   if (!it || typeof it !== 'object') return it
   if (ENCH_FIXED.has(it)) return it
   try {
     if (!Array.isArray(it.enchants)) {
       Object.defineProperty(it, 'enchants', {
-        value: enchantsOfItem(it), configurable: true, writable: true, enumerable: false,
+        value: enchantsOfItem(it, reg), configurable: true, writable: true, enumerable: false,
       })
     }
     ENCH_FIXED.add(it)
@@ -175,9 +196,9 @@ export function normalizeEnchants (it) {
 
 /** 把参与 `digTime` 的物品（手上那件 + 背包/装备槽里所有物品，含头盔）都规整一遍 */
 function normalizeEnchantsAll (b) {
-  try { normalizeEnchants(b?.heldItem) } catch {}
+  try { normalizeEnchants(b?.heldItem, b?.registry) } catch {}
   try {
-    for (const it of (b?.inventory?.slots ?? [])) if (it) normalizeEnchants(it)
+    for (const it of (b?.inventory?.slots ?? [])) if (it) normalizeEnchants(it, b?.registry)
   } catch {}
 }
 
@@ -224,7 +245,7 @@ export function digMsFor (b, blk, itemType = null) {
      *    会把**手持物品的附魔**和**头盔的附魔**（水下速掘 Aqua Affinity）都算进去。
      *    漏掉附魔 ⇒ 拿效率镐时我们估的 ms 偏大 ⇒ `breakBlock`/`dig` 会**白拒**一次本来挖得完的挖掘
      *    （"我没开始挖"）。这里补上：手上那件（只在问"手上这件"时）+ 头盔槽 5。 */
-    const enchantsOf = enchantsOfItem
+    const enchantsOf = (x) => enchantsOfItem(x, b?.registry)
     const held = b?.heldItem ?? null
     const sameAsHeld = Boolean(held && (itemType == null || itemType === held.type))
     const helmet = (() => { try { return b?.inventory?.slots?.[5] ?? null } catch { return null } })()

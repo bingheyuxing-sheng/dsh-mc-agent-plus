@@ -29,6 +29,7 @@
  */
 import { blockIdOf, itemIdOf, itemNameOf, findPlaceSpot, blockAtXYZ, clamp, countOf } from './mc_util.mjs'
 import { withTimeout, CALL_MS, callBudget } from '../src/core.mjs'
+import { enchText, enchKey } from '../src/inventory.mjs'
 
 export const name = 'mc_chest'
 
@@ -65,17 +66,27 @@ export function bagText (bot, limit = 20) {
 }
 
 /** 箱子内容一行概览 */
-export function chestText (win) {
+export function chestText (win, reg = null) {
   let items = []
   try { items = win.containerItems() } catch { items = [] }
   const free = typeof win.inventoryStart === 'number' ? win.inventoryStart : '?'
   if (!items.length) return `（空　共 ${free} 个位置）`
-  const byName = new Map()
-  for (const it of items) byName.set(it.name, (byName.get(it.name) ?? 0) + it.count)
-  const all = [...byName.entries()].sort((a, b) => b[1] - a[1])
+  /* 🔴 2026-10-27（用户："现在看不到附魔的属性"）：以前只按名字合计，箱子里一把锋利 V 的剑
+   *    和一把白板剑会被合并成 `diamond_sword×2`，挑装备时看不出哪把是好的。
+   *    现在按「名字 + 附魔」合计，并把附魔写在名字后面。 */
+  /* 🔴 2026-10-27 第二轮：`reg` 必须传进来 —— 1.21 的附魔只有数字 id，
+   *    不查 registry 就只剩 `#32`（或者干脆没名字）。 */
+  const byKey = new Map()
+  for (const it of items) {
+    const key = `${it.name}\u0001${enchKey(it, reg)}`
+    const cur = byKey.get(key)
+    if (cur) cur.count += it.count
+    else byKey.set(key, { name: it.name, count: it.count, ench: enchText(it, reg) })
+  }
+  const all = [...byKey.values()].sort((a, b) => b.count - a.count)
   /* 🔴 2026-10-08 第五份审计旁注：`items.length` 是**叠数**（一叠一条），写"N/free 格"会让模型
    *    以为"箱子里只剩 free-N 个空位"。改成"叠 / 个位置"。 */
-  return `${all.map(([n, c]) => `${n}×${c}`).join(' ')}　（${items.length} 叠，共 ${free} 个位置）`
+  return `${all.map((i) => `${i.name}×${i.count}${i.ench ? `（${i.ench}）` : ''}`).join(' ')}　（${items.length} 叠，共 ${free} 个位置）`
 }
 
 /* 🔴 2026-10-08 审计：`win.deposit()` / `win.withdraw()` **resolve 了不等于服务端真搬了**
@@ -239,7 +250,7 @@ export async function apply (api) {
           const p = bot.entity.position
           if (p && p.distanceTo?.(at) > 4) await mc.walkTo({ x: at.x, y: at.y, z: at.z }, { arrive: 2.2, budget: callBudget(20_000) })
           win = await withTimeout(bot.openContainer(one), callBudget(10_000), '开箱子')
-          lines.push(`　里面：${chestText(win)}`)
+          lines.push(`　里面：${chestText(win, bot.registry)}`)
         } catch (e) {
           lines.push(`　❌ 打不开：${e?.message ?? e}`)
           lines.push('　→ 可能被别人占着、或者被方块挡住了；换个箱子或清一下周围。')
@@ -359,7 +370,7 @@ export async function apply (api) {
         return { text: lines.join('\n') }
       }
 
-      const before = chestText(win)
+      const before = chestText(win, bot.registry)
       const snapBefore = chestSnap(win)
       let snapAfter = null
       const moved = []
@@ -437,7 +448,7 @@ export async function apply (api) {
       let after = null
       try {
         const w2 = await withTimeout(bot.openContainer(box), callBudget(10_000), '开箱子复核')
-        try { after = chestText(w2) } finally { try { w2?.close?.() } catch {} }
+        try { after = chestText(w2, bot.registry) } finally { try { w2?.close?.() } catch {} }
       } catch {}
       if (after) lines.push(`　现在里面：${after}`)
       lines.push(`　背包现在：${bagText(bot)}`)

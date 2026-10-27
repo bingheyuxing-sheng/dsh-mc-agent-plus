@@ -33,6 +33,16 @@
 /** pathfinder 的"这次走不了"四种结局 —— 都是可控语义，不是 bug。 */
 export const PATH_REJECTION_NAMES = Object.freeze(['PathStopped', 'NoPath', 'GoalChanged', 'Timeout'])
 
+/**
+ * 🔴 2026-10-27 GitHub issue #3：**只按 `error.name` 认是认不全的** ——
+ *   我们自己抛的那些"这一趟没做完"的错误，`name` 全都叫 `Error`（`withTimeout` 的超时、
+ *   `raceAbort` 的中止、预算到点），名字对不上白名单 ⇒ 原样转交宿主 ⇒
+ *   `dsh: fatal load failure: Error: 寻路 超时 (200ms)` ⇒ 整个应用退出。
+ *   这些错误**语义明确**（这一趟没做完，不是插件坏了），所以在名字之外再加一条判据：
+ *   错误对象上带下面任一标记，一律当良性吞掉并记日志。
+ */
+export const SOFT_ERROR_FLAGS = Object.freeze(['mcTimeout', 'mcAborted', 'mcBudgetOut', 'mcCallOver', 'mcStuck', 'preempted'])
+
 const OFF_RE = /^(0|off|false|no|disable|disabled)$/i
 
 /** 已装的话把状态放这儿（幂等标记 + 给自检/诊断看） */
@@ -65,14 +75,22 @@ export function installRejectionGuard ({ log = null, names = PATH_REJECTION_NAME
   const say = typeof log === 'function' ? log : () => {}
   const st = { swallowed: 0, forwarded: 0, lastFew: [] }
 
+  /* 带 `mcTimeout` / `mcAborted` 这类标记的软错误（见 `SOFT_ERROR_FLAGS` 的注释）。 */
+  const softFlagOf = (reason) => {
+    if (!reason || typeof reason !== 'object') return ''
+    for (const k of SOFT_ERROR_FLAGS) { if (reason[k] === true) return String(k) }
+    return ''
+  }
+
   const handler = (reason, promise) => {
     const nm = nameOf(reason)
-    if (allow.has(nm)) {
+    const soft = softFlagOf(reason)
+    if (allow.has(nm) || soft) {
       st.swallowed++
-      st.lastFew.push(nm)
+      st.lastFew.push(soft || nm)
       if (st.lastFew.length > 5) st.lastFew.shift()
       /* 每次只记一行、最多 20 行：这东西可能一晚上几十次，别把日志刷爆 */
-      if (st.swallowed <= 20) say(`寻路拒绝已拦下（不会让宿主 exit）：${nm} — ${String(reason?.message ?? '').slice(0, 120)}`)
+      if (st.swallowed <= 20) say(`寻路/超时拒绝已拦下（不会让宿主 exit）：${soft || nm} — ${String(reason?.message ?? '').slice(0, 120)}`)
       return
     }
     st.forwarded++

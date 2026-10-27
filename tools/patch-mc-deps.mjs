@@ -111,9 +111,10 @@ rep(
         placingStartedAt = performance.now()
         placingBestY = bot.entity.position.y
         placingBlock = nextPoint.toPlace.shift()
+        placingEquipped = false
         fullStop()
       }`,
-  '垫柱计时：记录开始时间'
+  '垫柱计时：记录开始时间（+2026-10-27 复位预装备标记）'
 )
 
 rep(
@@ -280,6 +281,133 @@ function repIn (file, oldText, newText, label) {
   changed++
   console.log(`  + ${label}`)
 }
+
+/* ── 2026-10-27：移动老是卡（用户：「卡在半空 1~2 秒才掉下来」「脚踩实地杵着不动」） ──
+ * ① 暴露"最后一次为什么重置路径"（goto 被 stop 时只剩 PathStopped，真实原因全丢）；
+ * ② 正常重算（block_updated / chunk_loaded / movements_updated / goal_moved）不再把整次
+ *    goto 掐死 —— 以前它们走 stop()，人立刻站住，表现就是"杵着不动"；
+ * ③ 垫方块改成**起跳前**预装备（equip 是一次网络往返，等回包时人已经在往下掉了）。 */
+rep(
+  '  let returningPos = null\n  let stopPathing = false',
+  `  let returningPos = null
+  let stopPathing = false
+  /* 🔴 2026-10-27 DSH 补丁：最近一次 resetPath 的理由。goto 被 stop 时只剩一句
+   * 'PathStopped'，真实原因（place_error / dig_error / no_scaffolding_blocks / stuck …）
+   * 全丢了 —— 外层因此永远说不清"为什么卡住"。 */
+  let lastResetReason = null
+  /* 起跳垫方块前是否已经预装备过（见放方块段）。随每次 placing 复位。 */
+  let placingEquipped = false`,
+  '记录 lastResetReason / placingEquipped'
+)
+
+rep(
+  `  function resetPath (reason, clearStates = true) {
+    if (!stopPathing && path.length > 0) bot.emit('path_reset', reason)
+    path = []`,
+  `  /* 这几类 reset 只是"路径作废、下个 tick 重算"，不代表该放弃这次 goto。
+   * 长路上每跨一个区块就会来一次 chunk_loaded、脚下方块一变就 block_updated ——
+   * 以前它们统统走 stop()（stateGoal 清空 + path_stop）⇒ goto 以 PathStopped 拒绝、
+   * 人立刻站住，实机表现就是「脚踩实地杵着不动」。 */
+  const RESUMABLE_RESETS = new Set(['block_updated', 'chunk_loaded', 'movements_updated', 'goal_moved'])
+
+  function resetPath (reason, clearStates = true) {
+    lastResetReason = reason
+    /* 🔴 2026-10-27 DSH 补丁：原来是
+     *   if (!stopPathing && path.length > 0) bot.emit('path_reset', reason)
+     * —— goto 期间 stopPathing 恒为 true，因此**一次都不外发**，外层只看到
+     * goto reject 出的 PathStopped，拿不到真实原因。现在无条件外发，
+     * 由外层自己过滤"正常重算"那几类（见 DSH 侧 BENIGN_RESET）。 */
+    bot.emit('path_reset', reason)
+    path = []`,
+  'resetPath：无条件外发原因 + 正常重算不算中止'
+)
+
+rep(
+  `    if (clearStates) bot.clearControlStates()
+    if (stopPathing) return stop()
+  }`,
+  `    if (clearStates) bot.clearControlStates()
+    if (stopPathing && !RESUMABLE_RESETS.has(reason)) return stop()
+  }`,
+  'resetPath：可恢复的重置不再 stop()'
+)
+
+rep(
+  '  bot.pathfinder.isBuilding = () => placing',
+  `  bot.pathfinder.isBuilding = () => placing
+  /* 🔴 2026-10-27 DSH 补丁：把"最后一次为什么重置"暴露出去 —— goto 因 stop 而 reject 时，
+   * 外层只能拿到 'PathStopped'，靠它才能知道真实原因（供 DSH 的 reason 归因 / 日志）。 */
+  bot.pathfinder.lastResetReason = () => lastResetReason`,
+  '暴露 lastResetReason'
+)
+
+rep(
+  `      const block = stateMovements.getScaffoldingItem()
+      if (!block) {
+        resetPath('no_scaffolding_blocks')
+        return
+      }`,
+  `      const block = stateMovements.getScaffoldingItem()
+      if (!block) {
+        resetPath('no_scaffolding_blocks')
+        return
+      }
+      /* 🔴 2026-10-27 DSH 补丁（用户：「移动老是卡在半空 1~2 秒才掉下来」）：
+       *  原来的顺序是「先按住 jump 升到摆放高度 → 再 bot.equip() 装备 → 装备回包后才
+       *  placeBlock」。equip 是一次网络往返（几十到两百毫秒），等它回来人已经在往下掉了，
+       *  placeBlock 时脚下那格往往已经不可放置 ⇒ place_error，人直接摔下去。
+       *  实机统计（session-514c21b6）：**97 次坠落、累计 696 格、最深 28 格**，多发生在垫方块时。
+       *  现在在**起跳之前**就把垫块拿到手上；下面那次 equip 因此多数情况是空操作。 */
+      if (!placingEquipped) {
+        placingEquipped = true
+        if (!lockEquipItem.tryAcquire()) return
+        bot.equip(block, 'hand')
+          .then(function () { lockEquipItem.release() })
+          .catch(function () {
+            lockEquipItem.release()
+            resetPath('equip_error')
+          })
+        return          // 这个 tick 只做预装备，下一个 tick 再决定跳不跳
+      }`,
+  '垫方块：起跳前先预装备（治悬空坠落）'
+)
+
+rep(
+  `      if (canPlace) {
+        if (!lockEquipItem.tryAcquire()) return
+        bot.equip(block, 'hand')
+          .then(function () {`,
+  `      if (canPlace) {
+        if (!lockEquipItem.tryAcquire()) return
+        /* 2026-10-27：起跳前已预装备过（见上面 placingEquipped），这里若是同一件就直接跳过，
+         * 把"跳起来到落地"这段窗口全留给 placeBlock。 */
+        const equipP = (bot.heldItem && block && bot.heldItem.type === block.type)
+          ? Promise.resolve()
+          : bot.equip(block, 'hand')
+        equipP
+          .then(function () {`,
+  '垫方块：已预装备就不再重复 equip'
+)
+
+repIn(
+  join(PF_DIR, 'lib', 'goto.js'),
+  `    function pathStopped () {
+      cleanup(error('PathStopped', 'Path was stopped before it could be completed! Thus, the desired goal was not reached.'))
+    }`,
+  `    function pathStopped () {
+      /* 🔴 2026-10-27 DSH 补丁：原来只抛一句 'Path was stopped...'，把"到底哪一步失败"
+       * 抹平成同一类错误（外层只能报「寻路被打断」）。这里带上 vendor 记下的真实理由：
+       * place_error / dig_error / no_scaffolding_blocks / stuck … 都能直达日志与模型。 */
+      let why = 'unknown'
+      try {
+        if (typeof bot.pathfinder.lastResetReason === 'function') why = bot.pathfinder.lastResetReason() ?? 'unknown'
+      } catch (e) {}
+      const err = error('PathStopped', \`Path was stopped before it could be completed (\${why}). Thus, the desired goal was not reached.\`)
+      err.resetReason = why
+      cleanup(err)
+    }`,
+  'goto.js：PathStopped 带上真实原因'
+)
 
 console.log('\nmineflayer-pathfinder/lib/goto.js:')
 repIn(

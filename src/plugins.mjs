@@ -695,7 +695,7 @@ export function patchPlantPassable (mv, b) {
   return added
 }
 
-export function movements (self, { terrain = null } = {}) {
+export function movements (self, { terrain = null, digFirst = false } = {}) {
   const b = self.bot
   const { Movements } = self._pf ?? {}
   if (typeof Movements !== 'function') return null
@@ -800,13 +800,22 @@ export function movements (self, { terrain = null } = {}) {
   // ⚠️ 不能靠清空 `scafoldingBlocks` 来治 —— `remainingBlocks === 0` 会把
   // `getMoveUp`（1×1 柱子）那条路一起剪掉，机器人就爬不出坑了。
   applyProfile(mv, profile)
+  /* 🔴 2026-10-27 用户：「noDig:false 还是优先走现有路线，false 应该直接按最短路线挖」——
+   *   `applyProfile` 按地形给的 `digCost` 是 3~8（挖一格石头 ≈ 走 16~44 步，见 `src\terrain.mjs`），
+   *   A* 因此宁可绕远路也不挖。**显式 `noDig:false`（"允许挖"）时就该反过来**：把挖按
+   *   "多走一步"计价，让它走最短的那条（该挖就挖），而不是"能不挖就绕"。
+   *   ⚠️ 只改成本，不碰 `canDig` / `blocksCantBreak` / `blocksToAvoid` / 岩浆黑名单 ——
+   *   安全边界照旧。`cfg.walkDigFirst:false` 可退回"能绕就绕"，`cfg.walkDigFirstCost` 微调。 */
+  const digFirstOn = Boolean(digFirst) && self.cfg?.walkDigFirst !== false
+  if (digFirstOn) mv.digCost = Number(self.cfg?.walkDigFirstCost ?? 0.4)
   mv.scafoldingBlocks = scaffoldingItemIds(b)      // 背包里能垫的方块（**item id**，见该函数注释）
   /* 2026-10-18：门只许"按开"，不许挖；已经开着就别再按（否则等于关回去）。见 `patchDoorMoves`。 */
   /* `preferDoors`（默认开）：给"还要挖方块"的移动加 8 点惩罚 —— 平地挖一格石头本来
    * 就要 ~18 点（`digCost` 4 × (1 + 3×挖掘秒数)），再 +8 基本等于"多绕二十几步"，
    * 有门就走门。用户要挖墙可以显式 `preferDoors:false`，或直接叫 `mc_dig`。 */
   const preferDoors = self.cfg.preferDoors !== false
-  patchDoorMoves(mv, { digPenalty: preferDoors ? Number(self.cfg.doorDigPenalty ?? 8) : 0 })
+  /* 门那 8 点惩罚是"有门就走门"用的；挖路优先（digFirst）时它会把"挖一格捷径"又顶回绕路去。 */
+  patchDoorMoves(mv, { digPenalty: (digFirstOn || !preferDoors) ? 0 : Number(self.cfg.doorDigPenalty ?? 8) })
   /* 2026-10-22 用户实机：「现在寻路会踩在岩浆块上掉血」—— 站上去会掉血的地板加点重罚，让它绕开。
    * 为什么光有 `blocksToAvoid` 不够，见 `patchHarmfulFloorMoves` 的注释（那名单管"能不能站"，
    * 而岩浆块是实心的、人站在它上面，脚那格永远是空气 ⇒ 那条路从来就没生效过）。 */
