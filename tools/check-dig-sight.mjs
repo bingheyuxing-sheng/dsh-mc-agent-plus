@@ -210,6 +210,26 @@ section('⑦ 隔着别的方块挖（前面挡着金矿、后面是钻石）')
   ok(r2?.ok === true, '只挡住下半格、上方看得见 ⇒ 放行（不误拦）', JSON.stringify(r2))
 }
 
+/* ─────────── ⑧ 视线被挡的文案要跟「四面被包」分开（issue #3 追问） ─────────── */
+section('⑧ 视线被挡：说"视线被 X 挡住"，不能再说"四面都被实心方块包着"')
+{
+  const fake = mkBot({ open: 'north', walls: [{ x: 0, y: 64, z: 2 }, { x: 0, y: 65, z: 2 }] })
+  const mc = mkMc(fake)
+  const r = await mc.breakBlock({ x: 0, y: 64, z: 3 })
+  ok(r?.broken === false, 'broken=false（没开始挖）', JSON.stringify({ broken: r?.broken }))
+  ok(r?.blockedBy === 'gold_ore', 'blockedBy=gold_ore', String(r?.blockedBy))
+  ok(r?.los === true, '结果里标了 los:true', String(r?.los))
+  ok(/视线/.test(r?.note ?? ''), 'note 说"视线被挡住"', String(r?.note).slice(0, 100))
+  ok(!/四面都被实心方块包着/.test(r?.note ?? ''), '不再误说"四面都被实心方块包着"', String(r?.note).slice(0, 100))
+  ok(/x:0, y:64, z:2/.test(r?.note ?? ''), '报出挡路块坐标（可以直接去挖它）', String(r?.note).slice(0, 100))
+
+  const fake2 = mkBot({ open: 'north', walls: [{ x: 0, y: 64, z: 2 }, { x: 0, y: 65, z: 2 }] })
+  const mc2 = mkMc(fake2)
+  const out = await mc2.dig({ pos: { x: 0, y: 64, z: 3 } })
+  ok(fake2.calls.dig === 0, 'mc_dig 那边也没挖', `dig=${fake2.calls.dig}`)
+  ok(out.some((l) => /视线被 \*\*gold_ore\*\*/.test(l)), 'mc_dig 的文案同样说"视线被 gold_ore 挡住"', String(out[0]).slice(0, 110))
+}
+
 for (const d of TMP) { try { rmSync(d, { recursive: true, force: true }) } catch {} }
 console.log(`\ncheck-dig-sight：pass=${pass} fail=${fail}`)
 process.exit(fail === 0 ? 0 : 1)

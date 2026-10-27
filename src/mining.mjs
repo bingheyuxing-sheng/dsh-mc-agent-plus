@@ -183,8 +183,16 @@ export async function breakBlock (self, { x, y, z, allowDangerous = false } = {}
       return {
         broken: false, at: { x: pos.x, y: pos.y, z: pos.z }, now: name, held: heldText(b),
         blockedBy: see.blocker, blockedAt: see.at,
-        note: `前后左右四面都被实心方块包着（**${see.blocker}** 那一面最靠外）—— **隔着方块挖不了**，我没开始挖。`
-          + `要么先挖开挡路那块（${see.at.x}, ${see.at.y}, ${see.at.z}），要么换个角度站过去。`,
+        los: see.los === true,
+        /* 🔴 2026-10-27 issue #3 追问「是不是没看到就挖不了」：**两种拦法必须分开说** ——
+         * 一种是"四面全被包死"；另一种是"四面有开口、可你和它之间夹着别的方块"（视线被挡）。
+         * 文案混用会让 AI 跑去找"哪一面被包着"，其实它该做的是**先挖中间那块**或换个站位。 */
+        note: see.los
+          ? `眼睛到它的视线被 **${see.blocker}**（${see.at.x}, ${see.at.y}, ${see.at.z}）挡住了 —— 中间还夹着方块，`
+            + `**隔着方块挖不了**，我没开始挖。先挖开挡路那块 \`mc_act {mode:"break", x:${see.at.x}, y:${see.at.y}, z:${see.at.z}}\`，`
+            + '或者挪到能正对着它的地方再叫一次。'
+          : `前后左右四面都被实心方块包着（**${see.blocker}** 那一面最靠外）—— **隔着方块挖不了**，我没开始挖。`
+            + `要么先挖开挡路那块（${see.at.x}, ${see.at.y}, ${see.at.z}），要么换个角度站过去。`,
       }
     }
   }
@@ -788,9 +796,13 @@ export async function dig (self, {
       {
         const see = await canSeeBlockOf(b, p, { reachMax })
         if (see && see.ok === false) {
-          out.push(`${nm} @ ${p} 前后左右四面都被实心方块包着（**${see.blocker}** 那一面最靠外）—— **隔着方块挖不了**，这一格没挖。`
-            + `要么先挖开挡路那块 \`mc_act {mode:"break", x:${see.at.x}, y:${see.at.y}, z:${see.at.z}}\`，`
-            + '要么 `mc_move` 换个角度站过去再叫我')
+          const digIt = `\`mc_act {mode:"break", x:${see.at.x}, y:${see.at.y}, z:${see.at.z}}\``
+          out.push(see.los
+            ? `${nm} @ ${p} 的视线被 **${see.blocker}** @ (${see.at.x}, ${see.at.y}, ${see.at.z}) 挡住`
+              + `（中间夹着方块）—— **隔着方块挖不了**，这一格没挖。`
+              + `要么先挖开挡路那块 ${digIt}，要么 \`mc_move\` 换个能正对着它的地方再叫我`
+            : `${nm} @ ${p} 前后左右四面都被实心方块包着（**${see.blocker}** 那一面最靠外）—— **隔着方块挖不了**，这一格没挖。`
+              + `要么先挖开挡路那块 ${digIt}，要么 \`mc_move\` 换个角度站过去再叫我`)
           continue
         }
       }
