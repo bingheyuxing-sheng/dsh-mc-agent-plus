@@ -137,7 +137,7 @@ function underfootRiskOf (b, pos) {
   }
 }
 
-export async function breakBlock (self, { x, y, z, allowDangerous = false } = {}, ctx = {}) {
+export async function breakBlock (self, { x, y, z, allowDangerous = false, noClear = false } = {}, ctx = {}) {
   const b = self.requireBot()
   const pos = new Vec3(Math.floor(x), Math.floor(y), Math.floor(z))
   const blk = b.blockAt(pos)
@@ -176,23 +176,26 @@ export async function breakBlock (self, { x, y, z, allowDangerous = false } = {}
         + ' —— **我没开始挖**（服务端会静默忽略，然后报个假的"挖掉了"）。先 `mc_move` 走到它旁边再挖。',
     }
   }
-  /* 2026-10-25 用户：「不能隔着方块挖」—— 同上：够得着 ≠ 看得见。 */
+  /* 2026-10-25 用户：「不能隔着方块挖」—— 同上：够得着 ≠ 看得见。
+   * 2026-10-27 用户：「dig 矿石满足条件就会不让挖，然后 AI 是一点一点把周围挖掉。改成不满足
+   *   条件直接挖到满足条件」⇒ 被挡时**自己先把挡路的挖开**，别把这活退回给 AI（它只能一块
+   *   一块试，每次都要一次往返）。清不通才拒，并说清是哪一块、为什么清不了。 */
+  let clearedSight = []
   {
     const see = await canSeeBlockOf(b, pos, { reachMax })
     if (see && see.ok === false) {
-      return {
-        broken: false, at: { x: pos.x, y: pos.y, z: pos.z }, now: name, held: heldText(b),
-        blockedBy: see.blocker, blockedAt: see.at,
-        los: see.los === true,
-        /* 🔴 2026-10-27 issue #3 追问「是不是没看到就挖不了」：**两种拦法必须分开说** ——
-         * 一种是"四面全被包死"；另一种是"四面有开口、可你和它之间夹着别的方块"（视线被挡）。
-         * 文案混用会让 AI 跑去找"哪一面被包着"，其实它该做的是**先挖中间那块**或换个站位。 */
-        note: see.los
-          ? `眼睛到它的视线被 **${see.blocker}**（${see.at.x}, ${see.at.y}, ${see.at.z}）挡住了 —— 中间还夹着方块，`
-            + `**隔着方块挖不了**，我没开始挖。先挖开挡路那块 \`mc_act {mode:"break", x:${see.at.x}, y:${see.at.y}, z:${see.at.z}}\`，`
-            + '或者挪到能正对着它的地方再叫一次。'
-          : `前后左右四面都被实心方块包着（**${see.blocker}** 那一面最靠外）—— **隔着方块挖不了**，我没开始挖。`
-            + `要么先挖开挡路那块（${see.at.x}, ${see.at.y}, ${see.at.z}），要么换个角度站过去。`,
+      const r = await clearSightTo(self, b, pos, { reachMax, ctx, noClear })
+      clearedSight = r.cleared ?? []
+      const after = r.ok ? await canSeeBlockOf(b, pos, { reachMax }) : see
+      const last = after ?? see
+      if (!r.ok || (after && after.ok === false)) {
+        return {
+          broken: false, at: { x: pos.x, y: pos.y, z: pos.z }, now: name, held: heldText(b),
+          ...(clearedSight.length ? { cleared: clearedSight } : {}),
+          blockedBy: last.blocker, blockedAt: last.at,
+          los: last.los === true,
+          note: clearFailText({ ...r, blocker: last.blocker, at: last.at }, last, name) + '。',
+        }
       }
     }
   }
@@ -303,6 +306,7 @@ export async function breakBlock (self, { x, y, z, allowDangerous = false } = {}
   return {
     broken: rolledBack ? false : (localGone ? name : false),
     ...(rolledBack ? { localRestored: true } : {}),
+    ...(clearedSight.length ? { cleared: clearedSight } : {}),
     confirmed,
     at: { x: pos.x, y: pos.y, z: pos.z },
     now,
@@ -519,7 +523,7 @@ export async function digStair (self, {
 }
 
 export async function dig (self, {
-  name = null, pos = null, maxDistance = 6, count = 1, allowDangerous = false,
+  name = null, pos = null, maxDistance = 6, count = 1, allowDangerous = false, noClear = false,
   /* 2026-10-23 用户实机（「挖矿老是乱挖 / 够得到还搭方块」）：
    *   noDig：走过去这一路允不允许挖穿挡路的方块。默认 true（只绕路、不挖墙）——
    *     以前是 false，为了够到墙后的矿，pathfinder 会顺手把一路石头泥土全挖了，
@@ -792,18 +796,22 @@ export async function dig (self, {
           continue
         }
       }
-      /* 2026-10-25 用户：「不能隔着方块挖」—— 够得着（眼睛→中心 ≤ 4.5）不等于**看得见**。 */
+      /* 2026-10-25 用户：「不能隔着方块挖」—— 够得着（眼睛→中心 ≤ 4.5）不等于**看得见**。
+       * 2026-10-27：被挡就先自己把挡路的挖开（`clearSightTo`），清不通才报。 */
       {
         const see = await canSeeBlockOf(b, p, { reachMax })
         if (see && see.ok === false) {
-          const digIt = `\`mc_act {mode:"break", x:${see.at.x}, y:${see.at.y}, z:${see.at.z}}\``
-          out.push(see.los
-            ? `${nm} @ ${p} 的视线被 **${see.blocker}** @ (${see.at.x}, ${see.at.y}, ${see.at.z}) 挡住`
-              + `（中间夹着方块）—— **隔着方块挖不了**，这一格没挖。`
-              + `要么先挖开挡路那块 ${digIt}，要么 \`mc_move\` 换个能正对着它的地方再叫我`
-            : `${nm} @ ${p} 前后左右四面都被实心方块包着（**${see.blocker}** 那一面最靠外）—— **隔着方块挖不了**，这一格没挖。`
-              + `要么先挖开挡路那块 ${digIt}，要么 \`mc_move\` 换个角度站过去再叫我`)
-          continue
+          const r = await clearSightTo(self, b, p, { reachMax, ctx, noClear })
+          const after = r.ok ? await canSeeBlockOf(b, p, { reachMax }) : see
+          const last = after ?? see
+          if (!r.ok || (after && after.ok === false)) {
+            out.push(`${nm} @ ${p}：`
+              + clearFailText({ ...r, blocker: last.blocker, at: last.at }, last, nm))
+            continue
+          }
+          if (r.cleared.length) {
+            out.push(`🧹 先把挡路的 ${r.cleared.map((c) => `${c.name}（${c.x}, ${c.y}, ${c.z}）`).join('、')} 挖开了`)
+          }
         }
       }
       /* 挖自己脚下（2026-10-18 审计 P1-5）：跟 `breakBlock` 同一条判据。 */
@@ -1057,6 +1065,99 @@ export async function canSeeBlockOf (b, p, { reachMax = 4.5 } = {}) {
     ok: false,
     blocker: s0.nb.name ?? '方块',
     at: { x: gx + s0.dx, y: gy, z: gz + s0.dz },
+  }
+}
+
+/* ----------------------------------------------------------------------------
+ * 「先把挡路的挖开」（2026-10-27 用户：「dig 矿石满足条件就会不让挖，然后 AI 是一点一点
+ * 把周围挖掉。改一下改成不满足条件直接挖到满足条件」）。
+ *
+ * 为什么一定清得动：挡路的方块坐在「眼睛 -> 目标」这条连线上，比目标更近
+ *   => 它必然在 reach 之内；而且它前面（眼睛这一侧）没有别的实心方块挡着它自己
+ *   => 它本身就是那一块"能直接看见、能直接挖"的方块。所以不用先走位。
+ *
+ * 为什么不设"最多清几块"：目标在 4.5 格以内 => 这条线上最多夹 4 块，天然有界。
+ *   `cleared` 里按坐标去重 —— 服务端要是静默拒了某次破坏（方块复原），下一轮会
+ *   再报同一块，这时直接停手，不会死循环。
+ *
+ * 哪些挡路的不碰（碰了更糟）：液体（一挖就灌进来）、基岩类的不可挖、容器（连里面的
+ *   东西一起砸）。
+ * -------------------------------------------------------------------------- */
+const NO_CLEAR_BLOCK = /chest|barrel|furnace|smoker|hopper|dispenser|dropper|shulker_box|brewing_stand|beacon|enchanting_table|anvil|lectern|crafter|decorated_pot|jukebox/
+const UNBREAKABLE_BLOCK = /bedrock|barrier|command_block|structure_block|jigsaw|end_portal|light$|moving_piston|reinforced_deepslate/
+
+export async function clearSightTo (self, b, p, { reachMax = 4.5, ctx = {}, noClear = false } = {}) {
+  const cleared = []
+  if (noClear) return { ok: false, why: 'noClear', cleared }
+  const at = (x, y, z) => { try { return b.blockAt(new Vec3(x, y, z)) } catch { return null } }
+  for (let guard = 0; guard < 12; guard++) {
+    const see = await canSeeBlockOf(b, p, { reachMax })
+    if (!see || see.ok !== false) return { ok: true, cleared }
+    /* 四面全被实心包着：那不是"夹着方块"，是把目标埋死了 —— 硬清等于把周围全拆开，停手。 */
+    if (see.los !== true) return { ok: false, why: 'surrounded', cleared, blocker: see.blocker, at: see.at }
+    const key = `${see.at.x},${see.at.y},${see.at.z}`
+    if (cleared.some((c) => c.key === key)) {
+      return { ok: false, why: 'stuck', cleared, blocker: see.blocker, at: see.at }
+    }
+    const blk = at(see.at.x, see.at.y, see.at.z)
+    if (!blk) return { ok: false, why: 'unloaded', cleared, blocker: see.blocker, at: see.at }
+    if (isLiquid(blk.name)) return { ok: false, why: 'liquid', cleared, blocker: blk.name, at: see.at }
+    if (UNBREAKABLE_BLOCK.test(blk.name) || blk.hardness === -1 || blk.hardness === Infinity) {
+      return { ok: false, why: 'hard', cleared, blocker: blk.name, at: see.at }
+    }
+    if (NO_CLEAR_BLOCK.test(blk.name)) return { ok: false, why: 'container', cleared, blocker: blk.name, at: see.at }
+    if (blockReachOf(b, blk) > reachMax) return { ok: false, why: 'far', cleared, blocker: blk.name, at: see.at }
+    try {
+      if (typeof ctx.waitGrounded === 'function') {
+        await ctx.waitGrounded(b, Math.min(1_200, Math.max(0, self.callLeft() - 800)))
+      }
+      if (typeof ctx.equipFor === 'function') await ctx.equipFor(b, blk, `换工具挖开挡路的 ${blk.name}`)
+      const job = b.dig(blk, true)
+      if (typeof ctx.t === 'function') await ctx.t(job, 'digClear', `挖开挡路的 ${blk.name}`)
+      else await job
+    } catch {
+      return { ok: false, why: 'fail', cleared, blocker: blk.name, at: see.at }
+    }
+    cleared.push({ key, name: blk.name, x: see.at.x, y: see.at.y, z: see.at.z })
+    /* 等世界更新两 tick 再量：`dig` 回来时客户端往往还是"预测态"。 */
+    try { if (typeof b.waitForTicks === 'function') await b.waitForTicks(2) } catch { /* 假 bot 没有 */ }
+    if (typeof self.log === 'function') self.log(`🧹 挖开挡路的 ${blk.name}（${see.at.x},${see.at.y},${see.at.z}）`)
+  }
+  return { ok: false, why: 'loop', cleared }
+}
+
+/** 清障没成功时给模型的那句话（按 `why` 分岔，别让 AI 猜）。`see` 是最后一次量到的视线结果。 */
+export function clearFailText (r, see, target = '目标') {
+  const at = r?.at
+  const who = r?.blocker ?? '方块'
+  const where = at ? `（${at.x}, ${at.y}, ${at.z}）` : ''
+  const done = r?.cleared?.length
+    ? `（我已经先挖开了 ${r.cleared.map((c) => `${c.name}（${c.x}, ${c.y}, ${c.z}）`).join('、')}）`
+    : ''
+  switch (r?.why) {
+    case 'noClear':
+      return `视线被挡着，这一趟带了 noClear —— 按你说的不动手，${target} 没挖`
+    case 'surrounded':
+      return `前后左右四面都被实心方块包着（**${who}**${where} 那一面最靠外）—— 这是把 ${target} 埋死了，`
+        + '硬挖等于把周围全拆开，我停手了。换个站位（`mc_move`）再叫我'
+    case 'liquid':
+      return `挡路的是液体 **${who}**${where} —— 挖开它立刻灌进来会把通道淹了，我没挖${done}`
+    case 'hard':
+      return `挡路的是 **${who}**${where}，挖不动 —— 换个站位（\`mc_move\`）或从别的角度过去${done}`
+    case 'container':
+      return `挡路的是容器 **${who}**${where} —— 挖掉会连里面的东西一起砸了，我没动它${done}`
+        + '。要么先 `mc_chest` 把它清空，要么换个角度'
+    case 'far':
+      return `挡路的是 **${who}**${where}，够不着挖 —— 先 \`mc_move\` 挪近一点${done}`
+    case 'stuck':
+      return `挡路的 **${who}**${where} 我挖了，可量过去它还挡着（服务端大概没认这次破坏）`
+        + `—— 先 \`mc_scan\` 看看那儿现在是什么${done}`
+    case 'unloaded':
+      return `挡路那一格读不到（区块没加载）—— 先 \`mc_move\` 靠近让区块加载${done}`
+    case 'loop':
+      return `挡路的方块一层接一层，清到第 12 块还没通${done} —— 换个站位再来`
+    default:
+      return `试着挖开挡路的 ${who}${where}，没成功${done} —— 换个站位再来`
   }
 }
 /**

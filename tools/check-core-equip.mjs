@@ -307,7 +307,8 @@ const buildSrc = stripComments(await (await import('node:fs/promises')).readFile
     'core 里没有残留的旧私有方法体（只剩薄包装）')
   /* 路线图第 ④ 条第三十八刀：`breakBlock` 搬进 `src\mining.mjs`（core 只剩薄包装 + `#mineCtx()`）。 */
   const mineSrc = stripComments(await (await import('node:fs/promises')).readFile(new URL('../src/mining.mjs', import.meta.url), 'utf8'))
-  ok(/export async function breakBlock \(self, \{ x, y, z, allowDangerous = false \} = \{\}, ctx = \{\}\) \{/.test(mineSrc), 'mining 有 breakBlock（带脚下安全检查开关）')
+  /* 别把参数表钉死：`noClear` 之类的新开关加进来时，这条断言不该跟着挂。 */
+  ok(/export async function breakBlock \(self, \{ [^}]*allowDangerous[^}]*\}/.test(mineSrc), 'mining 有 breakBlock（带脚下安全检查开关）')
   ok(/await ctx\.equipFor\(b, blk, `换工具挖 \$\{name\}`\)/.test(mineSrc), 'breakBlock 动手前调 equipFor（实现在 src\\mining.mjs）')
   ok(/const noDrop = !canHarvestNow\(b, blk\)/.test(mineSrc) && /if \(noDrop && !canBreakNow\(b, blk\)\) \{/.test(mineSrc),
     'breakBlock 换不上就拒绝（不硬挖）')

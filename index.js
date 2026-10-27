@@ -4171,17 +4171,17 @@ export function apply(ctx, rawConfig) {
       + '· toward 看向并走近某个玩家(who)\n'
       + '· place 放方块 (x,y,z)；悬空先垫脚（=搭高）\n'
       + '· bridge 搭路：朝 (x,y,z) 铺脚下一层；加 slope:±1 就每格升降 1（搭楼梯）；脚下悬空/区块没加载/血量<8 就停，岩浆与深空只警告\n'
-      + '· break 破坏 (x,y,z)：自动换对的工具\n'
+      + '· break 破坏 (x,y,z)：自动换对的工具；视线被挡会先把挡路的挖开\n'
       + '· use 用方块/实体(who)：门/按钮/拉杆/喂动物；都不给=用手上的\n'
       + '· useitem 用手上的东西：扔眼睛/雪球；**带 x/y/z 会先瞄准、停 450ms 再用**（舀水/骨粉/补种都带坐标）\n'
       + '· equip 装备(name)：护甲自动穿、盾进副手\n'
       + '· toss 丢弃(name,count)\n'
-      + '· jump 原地跳一下（爬台阶/脱困，不需要坐标）\n'
+      + '· jump 原地跳（爬台阶/脱困）\n'
       + '· sleep 睡最近的床（夜里或雷雨才行；白天会直接告诉你别白跑）\n'
       + '· wake 起床（躺着时才有用）\n'
       + '· farm 耕地+播种（给 x/y/z 就那一格，不给就在周围找土；上面熟了的先收）\n'
-      + '· boat 放船并坐上去：自动找周围 2–4 格内**能放船的水面**（水 + 上方空气），视线对准水面再放，\n'
-      + '  放下后复核船底下是不是水，默认接着上船（board:false 只放不上）。给 x/y/z 就在那附近找水面\n'
+      + '· boat 放船并坐上去：自动找周围 2–4 格内**能放船的水面**（水 + 上方空气），对准水面放、\n'
+      + '  放下后复核船底是水，默认上船（board:false 只放），给 x/y/z 就在那附近找\n'
       + '· dismount 从船/矿车/坐骑上下来（开船用 mc_move boat）',
     parameters: {
       mode: { type: 'string', description: '见上面各 mode（默认 look）' },
@@ -4190,6 +4190,7 @@ export function apply(ctx, rawConfig) {
       y: { type: 'number', description: '要动的那一块的方块坐标 y（整数格）' },
       z: { type: 'number', description: '要动的那一块的方块坐标 z（整数格）' },
       allowDangerous: { type: 'boolean', description: 'break：允许挖自己脚下的支撑（默认拦）' },
+      noClear: { type: 'boolean', description: 'break：视线被挡时不自动挖开挡路的方块（默认会自动挖）' },
       name: { type: 'string', description: '方块或物品名（place/equip/toss 用）' },
       to: { type: 'string', description: 'equip 装哪格：head/torso/legs/feet/off-hand；只给=脱掉' },
       count: { type: 'number', description: 'toss 丢几个（默认 1）/ farm 最多处理几格（默认 6，上限 16）' },
@@ -4205,7 +4206,7 @@ export function apply(ctx, rawConfig) {
       board: { type: 'boolean', description: 'boat：放下后要不要直接坐上去（默认 true）' },
       newEntity: { type: 'number', description: 'look：从现在起多少毫秒内**新出现**的实体（扔眼睛/珍珠才生成；默认 0=不等）' },
       track: { type: 'number', description: 'look：跟踪多少毫秒（边跟边采样；默认 0=只转一次头）' },
-      samples: { type: 'string', description: 'look+track：summary（默认，只报方向/速度/位移）/ raw（另附原始点序列）' },
+      samples: { type: 'string', description: 'look+track：summary（默认）/ raw（附原始点序列）' },
       useItem: { type: 'boolean', description: 'look：等新实体前先用手上的东西（扔眼睛）—— 比先 useitem 再 look 更准，中间不漏' },
     },
     output: text(undefined, (a, v) => String(v?.text ?? compactJson(v))),
@@ -4561,7 +4562,8 @@ export function apply(ctx, rawConfig) {
       + '**再叫一次 mc_dig 接着挖**就行（挖到的方块留在背包里，不会白挖）。\n'
       + '🪜 **要挖阶梯就用 `mode:"stair"`**（给 y 目标高度、x/z 朝哪挖）：1 格宽 3 格高，每步升/降 1 格（不留平台），'
       + '挖完永久能上下、不会摔伤。**目标 y 比现在低就是往下挖、高就是往上挖**（上升阶梯也行）。'
-      + '**别指望 mc_move 挖竖井 —— 已经禁掉了**（挖脚下直下不再允许）。',
+      + '**别指望 mc_move 挖竖井 —— 已经禁掉了**（挖脚下直下不再允许）。\n'
+      + '🧹 视线被挡着（中间夹着别的方块）会**先把挡路的挖开再挖目标**；挡路的是容器/基岩/液体会停手并说明。',
     parameters: {
       mode: { type: 'string', description: 'block（默认，挖方块）/ stair（挖阶梯：给 y 目标高度，x/z 指定朝哪挖；目标比现在低就是往下、高就是往上）' },
       dir: { type: 'string', description: 'stair 专用：朝哪挖 "x+"/"x-"/"z+"/"z-"（不给就按 x/z 或当前朝向）' },
@@ -4573,6 +4575,7 @@ export function apply(ctx, rawConfig) {
       maxDistance: { type: 'number', description: '搜索半径（**默认 8**；树/矿脉远的话给大一点，上限看场景）' },
       count: { type: 'number', description: '挖几个（默认 1，上限 16；一次挖不完就再叫一次）' },
       allowDangerous: { type: 'boolean', description: '允许挖自己脚下的支撑（默认拦，下面没落脚点就掉下去）' },
+      noClear: { type: 'boolean', description: '视线被挡时不自动挖开挡路的方块（默认会自动挖）' },
       digThrough: {
         type: 'boolean',
         description: '允不允许**挖穿挡路的方块**走过去（默认 false = 先只绕路；**绕不过去我会自动改成挖穿再走一遍**）。'
@@ -4597,6 +4600,7 @@ export function apply(ctx, rawConfig) {
          *   乱挖/垫柱的来源；8 格内的矿基本都在身边，挖起来干脆。远处的先 mc_move 靠近。 */
         maxDistance: args.maxDistance ?? 8, count: args.count,
         noDig: args.digThrough !== true,
+        noClear: args.noClear === true,
         /* 🔴 2026-10-20 审计：`allowDangerous` 在上面声明了、`dig()` 也认这个参数，
          *    但这里**从来没传过** —— 于是"带 allowDangerous:true 就能挖脚下"这句
          *    写进报错文案的逃生阀**永远是 false**，AI 照着做也没用。 */

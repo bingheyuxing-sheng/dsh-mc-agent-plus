@@ -53,7 +53,7 @@ const TMP = []
  */
 const mkBot = ({ open = 'north', walls = [] } = {}) => {
   const calls = { dig: 0 }
-  const state = { dug: false }
+  const state = { dug: false, gone: new Set() }
   const mk = (name, bb, x, y, z) => ({ name, type: 0, boundingBox: bb, position: new Vec3(x, y, z) })
   const target = mk('iron_ore', 'block', 0, 64, 3)
   const isTarget = (p) => Boolean(p) && p.x === 0 && p.y === 64 && p.z === 3
@@ -65,6 +65,8 @@ const mkBot = ({ open = 'north', walls = [] } = {}) => {
     heldItem: null,
     blockAt: (p) => {
       if (!p) return null
+      /* 被 `dig` 挖掉的格子（清障用）：真实世界里 `dig` 回来它就成空气了。 */
+      if (state.gone.has(`${p.x},${p.y},${p.z}`)) return mk('air', 'empty', p.x, p.y, p.z)
       if (isTarget(p)) return state.dug ? mk('air', 'empty', 0, 64, 3) : target
       if (open === null) return null
       /* ⑦ 用：挡在视线中间的金矿（可以给两块，模拟"两格高的矿墙"）。 */
@@ -84,7 +86,12 @@ const mkBot = ({ open = 'north', walls = [] } = {}) => {
     setControlState: () => {},
     on: () => bot,
     removeListener: () => {},
-    dig: async () => { calls.dig++; state.dug = true },
+    dig: async (blk) => {
+      calls.dig++
+      const q = blk?.position ?? null
+      if (q) state.gone.add(`${q.x},${q.y},${q.z}`)
+      if (isTarget(q)) state.dug = true
+    },
     pathfinder: { goto: async () => {}, stop: () => {}, setMovements: () => {} },
   }
   return { bot, calls, state, target }
@@ -112,9 +119,9 @@ section('① 前后左右四面全被实心包住 ⇒ 不挖，并说清挡着�
   const mc = mkMc(fake)
   const out = await mc.dig({ pos: { x: 0, y: 64, z: 3 } })
   ok(fake.calls.dig === 0, '没调用 bot.dig（一格都没挖）', `dig=${fake.calls.dig}`)
-  ok(out.some((l) => /隔着方块挖不了/.test(l)), '明说"隔着方块挖不了"', String(out[0]).slice(0, 90))
+  ok(out.some((l) => /四面都被实心方块包着/.test(l)), '明说"四面都被实心方块包着"', String(out[0]).slice(0, 90))
   ok(out.some((l) => /\*\*stone\*\*/.test(l)), '报出挡着的方块名', String(out[0]).slice(0, 90))
-  ok(out.some((l) => /x:0, y:64, z:2/.test(l)), '给出其中一面的坐标（可以去挖它）')
+  ok(out.some((l) => /0, 64, 2/.test(l)), '给出其中一面的坐标（可以去挖它）')
 }
 
 /* ─────────── ② 有一面是空的 ⇒ 照常挖 ─────────── */
@@ -146,7 +153,7 @@ section('④ breakBlock 也走同一条判据')
   const r = await mc.breakBlock({ x: 0, y: 64, z: 3 })
   ok(r?.broken === false, 'broken=false', JSON.stringify({ broken: r?.broken }))
   ok(r?.blockedBy === 'stone', 'blockedBy=stone', String(r?.blockedBy))
-  ok(/隔着方块挖不了/.test(r?.note ?? ''), 'note 里说清隔着方块', String(r?.note).slice(0, 80))
+  ok(/四面都被实心方块包着/.test(r?.note ?? ''), 'note 里说清四面都被包着', String(r?.note).slice(0, 80))
   ok(fake.calls.dig === 0, '没调用 bot.dig', `dig=${fake.calls.dig}`)
 
   const fake2 = mkBot({ open: 'north' })
@@ -210,24 +217,57 @@ section('⑦ 隔着别的方块挖（前面挡着金矿、后面是钻石）')
   ok(r2?.ok === true, '只挡住下半格、上方看得见 ⇒ 放行（不误拦）', JSON.stringify(r2))
 }
 
-/* ─────────── ⑧ 视线被挡的文案要跟「四面被包」分开（issue #3 追问） ─────────── */
-section('⑧ 视线被挡：说"视线被 X 挡住"，不能再说"四面都被实心方块包着"')
+/* ─────────── ⑧ 视线被挡 ⇒ 自己先把挡路的挖开（2026-10-27 用户要求） ─────────── */
+/* 用户原话：「现在 dig 矿石，满足上面条件就会不让挖，然后 AI 是一点一点把周围挖掉。
+ *   改一下改成不满足条件直接挖到满足条件。」⇒ 工具自己清障，别把活退回给模型。 */
+section('⑧ 视线被挡 ⇒ 自己把挡路的挖开，再挖目标')
 {
   const fake = mkBot({ open: 'north', walls: [{ x: 0, y: 64, z: 2 }, { x: 0, y: 65, z: 2 }] })
   const mc = mkMc(fake)
   const r = await mc.breakBlock({ x: 0, y: 64, z: 3 })
-  ok(r?.broken === false, 'broken=false（没开始挖）', JSON.stringify({ broken: r?.broken }))
-  ok(r?.blockedBy === 'gold_ore', 'blockedBy=gold_ore', String(r?.blockedBy))
-  ok(r?.los === true, '结果里标了 los:true', String(r?.los))
-  ok(/视线/.test(r?.note ?? ''), 'note 说"视线被挡住"', String(r?.note).slice(0, 100))
-  ok(!/四面都被实心方块包着/.test(r?.note ?? ''), '不再误说"四面都被实心方块包着"', String(r?.note).slice(0, 100))
-  ok(/x:0, y:64, z:2/.test(r?.note ?? ''), '报出挡路块坐标（可以直接去挖它）', String(r?.note).slice(0, 100))
+  ok(fake.calls.dig >= 2, '挡路的方块真被挖了（至少 2 次 dig）', `dig=${fake.calls.dig}`)
+  ok(Array.isArray(r?.cleared) && r.cleared.some((c) => c.name === 'gold_ore'),
+    '结果里列出清掉了 gold_ore', JSON.stringify(r?.cleared))
+  ok(r?.broken === 'iron_ore', '通路打通后目标也挖到了', String(r?.broken))
+  ok(!/隔着方块挖不了/.test(r?.note ?? ''), '不再报"隔着方块挖不了"', String(r?.note ?? '').slice(0, 80))
 
   const fake2 = mkBot({ open: 'north', walls: [{ x: 0, y: 64, z: 2 }, { x: 0, y: 65, z: 2 }] })
   const mc2 = mkMc(fake2)
   const out = await mc2.dig({ pos: { x: 0, y: 64, z: 3 } })
-  ok(fake2.calls.dig === 0, 'mc_dig 那边也没挖', `dig=${fake2.calls.dig}`)
-  ok(out.some((l) => /视线被 \*\*gold_ore\*\*/.test(l)), 'mc_dig 的文案同样说"视线被 gold_ore 挡住"', String(out[0]).slice(0, 110))
+  ok(fake2.calls.dig >= 2, 'mc_dig 也先挖挡路的', `dig=${fake2.calls.dig}`)
+  ok(out.some((l) => /先把挡路的/.test(l)), 'mc_dig 报出"先把挡路的挖开了"', String(out[0]).slice(0, 110))
+  ok(fake2.state.dug, 'mc_dig 清完通路后目标真挖掉了', String(fake2.state.dug))
+
+  /* noClear:true 退回老行为 —— 只报告、不动手（给"就是不许挖"的场合留个口子）。 */
+  const fake3 = mkBot({ open: 'north', walls: [{ x: 0, y: 64, z: 2 }, { x: 0, y: 65, z: 2 }] })
+  const mc3 = mkMc(fake3)
+  const r3 = await mc3.breakBlock({ x: 0, y: 64, z: 3, noClear: true })
+  ok(fake3.calls.dig === 0, 'noClear:true ⇒ 一格都不挖', `dig=${fake3.calls.dig}`)
+  ok(r3?.broken === false, 'noClear:true ⇒ broken=false', String(r3?.broken))
+}
+
+/* ─────────── ⑨ 挡路的是容器 / 基岩 ⇒ 不碰，说清为什么 ─────────── */
+section('⑨ 挡路的是容器 / 基岩 ⇒ 不动它，把原因说清')
+{
+  const fake = mkBot({
+    open: 'north',
+    walls: [{ x: 0, y: 64, z: 2, name: 'chest' }, { x: 0, y: 65, z: 2, name: 'chest' }],
+  })
+  const mc = mkMc(fake)
+  const r = await mc.breakBlock({ x: 0, y: 64, z: 3 })
+  ok(fake.calls.dig === 0, '容器挡路 ⇒ 一格都不挖', `dig=${fake.calls.dig}`)
+  ok(r?.broken === false, '容器挡路 ⇒ broken=false', String(r?.broken))
+  ok(/容器/.test(r?.note ?? ''), '文案说"挡路的是容器"', String(r?.note ?? '').slice(0, 110))
+}
+{
+  const fake = mkBot({
+    open: 'north',
+    walls: [{ x: 0, y: 64, z: 2, name: 'bedrock' }, { x: 0, y: 65, z: 2, name: 'bedrock' }],
+  })
+  const mc = mkMc(fake)
+  const r = await mc.breakBlock({ x: 0, y: 64, z: 3 })
+  ok(fake.calls.dig === 0, '基岩挡路 ⇒ 一格都不挖', `dig=${fake.calls.dig}`)
+  ok(/挖不动/.test(r?.note ?? ''), '文案说"挖不动"', String(r?.note ?? '').slice(0, 110))
 }
 
 for (const d of TMP) { try { rmSync(d, { recursive: true, force: true }) } catch {} }
