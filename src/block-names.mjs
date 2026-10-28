@@ -15,6 +15,11 @@
 
 export const isAir = (n) => n === 'air' || n === 'cave_air' || n === 'void_air'
 export const isLiquid = (n) => n === 'water' || n === 'lava' || /_water$|_lava$/.test(String(n ?? ''))
+/** 岩浆本体（源头 / 流动）。
+ *  🔴 不要把 `magma_block`（岩浆块，固体）放进来：站上去掉血但**能站**，
+ *  那条路由 `patchHarmfulFloorMoves` 的重罚绕开，和"泡在岩浆里"不是一回事。 */
+export const LAVA_LIKE_RE = /^(lava|flowing_lava)$/
+export const isLavaLike = (n) => LAVA_LIKE_RE.test(String(n ?? ''))
 
 /**
  * 「水，以及泡在水里的植物」。

@@ -24,6 +24,7 @@ import { isAir, isLiquid, canPlaceInto, isEntityItem } from './block-names.mjs'
 import { pickPlaceItem, isFullBlockItem } from './place-items.mjs'
 import { heldText } from './inventory.mjs'
 import { standableY, portalAt } from './movement.mjs'
+import { CALL_BUDGET_MS } from './budget.mjs'
 
 /* 🔴 2026-10-23 实机（同一段时间里一条 `mc_move` 挂了 208 秒）：`b.placeBlock` 要等服务端
  *    把方块放进去才 settle，服务端不理（拒绝/失步/延迟）就**永不 settle** ——
@@ -220,7 +221,12 @@ export async function placeBlock (self, { x, y, z, name = null } = {}, ctx = {})
             + '我不会朝半空一路垫方块爬过去。想搭桥 / 搭路请用 `mc_build`（它按范围一块块放），'
             + '想放这一块就先 `mc_move` 走到它旁边能站的地方。')
         }
-        await self.walkTo({ x: spot.x, y: spot.y, z: spot.z }, { arrive: 2.5, budget: 25_000 })
+        /* 🔴 2026-10-28 参数审计：这里写死 25 秒 —— 比单次调用上限（11 秒）还长，走到一半
+         *    就被外层掐断，而 `walkTo` 自己以为还剩 14 秒，不会收尾。压到预算以内。 */
+        await self.walkTo({ x: spot.x, y: spot.y, z: spot.z }, {
+          arrive: 2.5,
+          budget: Math.max(1_500, Math.min(CALL_BUDGET_MS, self.msLeft() - 500)),
+        })
       }
     } catch (e) { approachError = e.message }
     self._selfMovingAt = Date.now()

@@ -11,7 +11,7 @@
 import { readFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { stairDirOf, STAIR_MAX_STEPS, STAIR_STEP_MS } from '../src/mining.mjs'
+import { stairDirOf, stairDropOf, STAIR_MAX_STEPS, STAIR_STEP_MS, STAIR_WALK_MS, STAIR_MIN_STEP_MS, STAIR_DROP_OK } from '../src/mining.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = join(HERE, '..')
@@ -37,7 +37,8 @@ ok(/const cells = \[fy, fy \+ 1, fy \+ 2\]\.map\(/.test(mvSrc),
 ok(!/const cells = up/.test(mvSrc), '不再按方向分两套格数')
 ok(/const fy = up \? cur\.y \+ 1 : cur\.y - 1/.test(mvSrc), '每步升/降 1 格（没有平台步）')
 ok(/const up = start\.y < ty/.test(mvSrc) && /if \(up \? cur\.y >= ty : cur\.y <= ty\)/.test(mvSrc), '目标更高就是上升阶梯（循环按方向判完成）')
-ok(/if \(isAir\(floor\.name\)\) \{ reason = 'no-floor'; break \}/.test(mvSrc), '脚下是空就停（不往深洞挖）')
+ok(/const hollowAhead = !up && isAir\(floor\.name\)/.test(mvSrc) && /STAIR_DROP_OK/.test(mvSrc),
+  '脚下是空：往下挖先量落差、≤3 格就下去（2026-10-27 实机 31/115=27% 因此白跑一整趟）')
 ok(/names\.some\(\(n\) => isLiquid\(n\)\)/.test(mvSrc), '三格里任何一格是液体就停')
 
 section('3. 平台逻辑')
@@ -114,7 +115,7 @@ ok(/move 不挖脚下：getMoveDropDown/.test(patchSrc), 'patch 脚本有 getMov
 ok(/if \(toBreak\.length > 0\) return/.test(patchSrc), '两处都是「要挖就不许掉下去」')
 
 section('9. 结果文案')
-ok(/再叫一次 `mc_dig \{mode:"stair", y:/.test(mvSrc), '预算用完时告诉它怎么接着挖')
+ok(/再叫一次 [^ ]{0,3}mc_dig \{mode:"stair", y:/.test(mvSrc), '预算用完时告诉它怎么接着挖')
 ok(/前面是水\/岩浆/.test(mvSrc), '遇到水/岩浆有明确说明')
 ok(/climbed !== 0/.test(mvSrc), '卡住时区分"推进了"和"一步没动"（2026-10-27 用户 m02756「dig 和 move 根本不准确」）');
 
@@ -128,7 +129,8 @@ section('10. 往上挖：自己头顶也要清（跳跃空间）+ 走失败要�
   ok(headAt > 0 && cellsAt > headAt, '先清头顶、再挖前方（顺序不能反：头顶不清跳不上去）')
   ok(/头顶是液体时不挖/.test(mvSrc) === false && /isLiquid\(head\.name\)/.test(mvSrc), '头顶是液体时不挖（只记一条 notes）')
   ok(/const w2 = await self\.walkTo/.test(mvSrc), '第一次没走过去会再走一次（不是一步就 stuck）')
-  ok(/if \(!ok && Date\.now\(\) - t0 < budgetMs\)/.test(mvSrc), '重试也看预算（不硬吃满时间）')
+  ok(/if \(!ok && budgetMs - \(Date\.now\(\) - t0\) >= STAIR_MIN_STEP_MS\)/.test(mvSrc),
+    '重试也看剩余时间（不硬吃满预算，2026-10-27）')
   ok(/头顶还堵着（跳不起来）/.test(mvSrc), 'stuck 的提示点明"头顶还堵着"')
 }
 
@@ -150,5 +152,56 @@ section('11. 结果文案不能说反话：y 75→70 别报"卡住"、别出现"
 }
 
 console.log(`\n${'─'.repeat(60)}`)
+
+section('12. 每步预算跟着剩余时间走（时间到 ≠ 卡住）+ 前方矿洞量落差')
+{
+  /* 🔴 2026-10-27 实机（两个会话 115 次 stair 调用，57 次报"卡住"= 50%，用户：「一半是失败的」）：
+   *   其中 41 次耗时 ≥9.5 秒 —— 每步平均 1.72 秒，10 秒只够 6 步，最后那一步必然越过预算边界
+   *   （走 walkTo 固定给 3 秒，而循环顶部只在开始前看预算）⇒ "时间到"被写成"卡住"。 */
+  ok(STAIR_WALK_MS === 1500, '每步走路预算 1.5 秒（实测每步 1.72 秒，以前固定 3 秒必然越界）')
+  ok(STAIR_MIN_STEP_MS === 1200, '剩余不足 1.2 秒就收工成 budget')
+  ok(STAIR_DROP_OK === 3, '前方矿洞最多往下 3 格（不摔伤）')
+  ok(/if \(budgetMs - \(Date\.now\(\) - t0\) < STAIR_MIN_STEP_MS\) \{ reason = 'budget'; break \}/.test(mvSrc),
+    '循环开头：剩余不够一步 ⇒ budget（不再只看"开始前已超"）')
+  ok(/const stepBudget = Math\.max\(600, Math\.min\(STAIR_WALK_MS, budgetMs - \(Date\.now\(\) - t0\)\)\)/.test(mvSrc),
+    '每步走路预算 = min(1.5 秒, 剩余)')
+  ok((mvSrc.match(/budget: stepBudget/g) ?? []).length === 2, '两处 walkTo（首走 + 重试）都用 stepBudget（键名必须是 budget —— 写 budgetMs 会被静默丢掉）')
+  ok(/budgetMs: STAIR_STEP_MS/.test(mvSrc) === false, '不再有固定 3 秒的 walkTo')
+  ok(/时间到被砍断 ≠ 卡住/.test(mvSrc), '注释写清了为什么：时间到不许报卡住')
+  ok(/< STAIR_MIN_STEP_MS\) \{ reason = 'budget'; break \}\s*\r?\n\s*reason = 'stuck'/.test(mvSrc),
+    'stuck 之前先判一次预算（顺序不能反）')
+  ok(/卡在 \$\{cur\.x\},\$\{cur\.y\},\$\{cur\.z\}：要去的/.test(mvSrc),
+    '真卡住时把坐标/脚位/头顶写出来（省一趟 mc_observe）')
+  ok(/const hollowAhead = !up && isAir\(floor\.name\)/.test(mvSrc), '前方脚下空：只有往下挖才量落差')
+  ok(/if \(up && isAir\(floor\.name\)\) \{ reason = 'no-floor'; break \}/.test(mvSrc),
+    '往上挖时前方没台阶面照旧停（不把上升挖成坠落）')
+  ok(/这次 \$\{Math\.round\(budgetMs \/ 1000\)\} 秒/.test(mvSrc), '预算文案写实际分到几秒，不再写死 10 秒')
+
+  /* 纯函数：量落差（`stairDropOf` 只认 blkAt，注假世界即可测） */
+  const mkWorld = (holes, lava = new Set()) => (x, y, z) => {
+    const k = `${x},${y},${z}`
+    if (lava.has(k)) return { name: 'lava' }
+    return { name: holes.has(k) ? 'air' : 'stone' }
+  }
+  {
+    /* cur.y=64 往下挖 ⇒ fy=63；前方 62/63 空、61 实心 ⇒ 站到 62（掉 2 格） */
+    const w = mkWorld(new Set(['7,62,7', '7,63,7']))
+    const dr = stairDropOf(w, 7, 63, 7)
+    ok(dr && dr.stand === 62 && dr.below === 'stone', '落差 2 格 ⇒ 站到 y=62（不摔伤，继续挖）')
+  }
+  {
+    const w = mkWorld(new Set(['7,62,7', '7,61,7', '7,60,7', '7,59,7']))
+    ok(stairDropOf(w, 7, 63, 7) === null, '落差超过 3 格 ⇒ null（不往深洞跳）')
+  }
+  {
+    const w = mkWorld(new Set(['7,62,7', '7,63,7']), new Set(['7,61,7']))
+    ok(stairDropOf(w, 7, 63, 7)?.liquid === true, '底下是岩浆 ⇒ liquid（不跳）')
+  }
+  {
+    /* 61 实心、62 是石头 ⇒ 落点被堵，掉不进一格缝 */
+    const w = mkWorld(new Set(['7,63,7']))
+    ok(stairDropOf(w, 7, 63, 7) === null, '落点那格被堵 ⇒ null（不硬塞）')
+  }
+}
 console.log(`check-mc-stair：pass=${pass} fail=${fail}`)
 process.exit(fail ? 1 : 0)

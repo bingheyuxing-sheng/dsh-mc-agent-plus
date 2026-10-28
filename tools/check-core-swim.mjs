@@ -182,7 +182,7 @@ section('⑥ mc_dig 水/岩浆 —— 直接拒绝，并告诉它怎么出水')
   try { await mc.dig({ name: 'water', count: 1 }) } catch (e) { err = e }
   ok(Boolean(err), 'dig water 抛错（不白跑一趟）')
   ok(/流体，挖不掉/.test(String(err?.message ?? '')), '错误里写清"流体，挖不掉"')
-  ok(/mode":"swim"/.test(String(err?.message ?? '')), '错误里给出 mc_move {"mode":"swim"}')
+  ok(/朝岸边/.test(String(err?.message ?? '')), '错误里指向"朝岸边 mc_move"（不再让人去叫已删除的 swim 模式）')
 
   let err2 = null
   try { await mc.dig({ name: 'lava', count: 1 }) } catch (e) { err2 = e }
@@ -367,7 +367,9 @@ section('⑧ 静态接线：core / index 都在')
   /* 🔴 2026-10-08 第十刀：`#inWaterNow` 搬进 `src/world-observer.mjs`（改名 `inWaterNow`）
    *    ⇒ 调用点变成 `inWaterNow(b)`，判据要跟着改，并确认 movement.mjs 真的导入了。 */
   ok(/if \(!inWaterNow\(b\)\) break/.test(movSrc), '出水就 break（走 inWaterNow）')
-  ok(/if \(!inWaterNow\(b\)\) \{\r?\n    return \{ inWater: false/.test(movSrc),
+  /* 2026-10-27 放宽：岩浆里也允许上浮 ⇒ 判据变成 `!inWaterNow(b) && !inLava`。
+   * 断言的本意是"先看自己在不在水里"，别把参数表钉死。 */
+  ok(/if \(!inWaterNow\(b\)(?: && !inLava)?\) \{\r?\n[\s\S]{0,200}?return \{ inWater: false/.test(movSrc),
     'swimUp 开头就用 inWaterNow 判断"我在不在水里"（以前只看 isInWater ⇒ 泡水柱里回"我本来就没在水里"）')
   ok(/from '\.\/world-observer\.mjs'/.test(movSrc), 'movement.mjs：观察层从 world-observer.mjs 导入')
   ok(/export function inWaterNow \(b\)/.test(strip(readFileSync(new URL('../src/world-observer.mjs', import.meta.url), 'utf8'))),
@@ -395,8 +397,8 @@ section('⑧ 静态接线：core / index 都在')
   ok(/async swimUp \(opts = \{\}\) \{ return await swimUpImpl\(this, opts, \{ bumpGen: \(\) => this\.#beginMove\(\) \}\) \}/.test(core), 'core 的 swimUp 是薄包装')
   /* 🔴 第二十二刀：步骤分发（`#runStep`）搬进 `src\sequence.mjs` ⇒ 改成查新模块（那边是 `self.`）。 */
   const seqSrc = strip(readFileSync(new URL('../src/sequence.mjs', import.meta.url), 'utf8'))
-  ok(/case 'swim':    return \(s\.x != null && s\.y != null && s\.z != null\) \? self\.walkTo\(s\) : self\.swimUp\(s\)/.test(seqSrc),
-    'sequence.mjs 的 op 里有 swim（给坐标=游过去，不给=上浮）')
+  ok(/case 'swim':/.test(seqSrc) && /self\.walkTo\(s, \{ budget: callBudget\(s\.budgetMs\) \}\)/.test(seqSrc) && /self\.swimUp\(s\)/.test(seqSrc),
+    'sequence.mjs 的 op 里有 swim（给坐标=游过去并带上步骤的 budgetMs，不给=上浮）')
   // 🔴 水里不能用 pathfinder（它的 A* 明确拒绝水节点，见 #walkSwim 的注释）
   // 路线图第 ④ 条第三十六刀：`walkTo` / `#walkSwim` 的函数体已搬进 `src\movement.mjs`（core 只剩薄包装）。
   ok(/export async function walkSwim \(self, target, \{ arrive = 1\.6, budget = self\.cfg\.moveBudgetMs, intent = 'near' \} = \{\}, ctx = \{\}\)/.test(movSrc), 'movement.mjs 有 walkSwim（直接游）')
@@ -421,15 +423,17 @@ section('⑧ 静态接线：core / index 都在')
   ok(/return isLiquid\(b\.blockAt\(eye\)\?\.name\)/.test(stSrc), 'submerged = 眼睛那格是液体')
   ok(!/if \(!b\.entity\.isInWater\) return false/.test(stSrc), 'status().submerged 不再先要求 entity.isInWater（泡水柱时它会漏报）')
 
-  ok(/mode === 'swim'/.test(index), 'index.js 的 mc_move 认 swim')
-  ok(/sess\.bot\.swimUp\(\{ hold: callBudget\(args\.budgetMs \?\? 9_000\) \}\)/.test(index), 'swim 不给坐标时把 budgetMs 当上浮时间（默认 9 秒）')
+  /* 🔴 2026-10-27（用户 m05868：「把 mode swim 去掉」）：mc_move 不再有 swim 分支 ——
+   *   给坐标本来就等于 walkTo（水里自动游），不给坐标的上浮换气由游泳循环自己保。 */
+  ok(!/mode === 'swim'/.test(index), 'index.js 的 mc_move 已经没有 swim 分支了')
+  ok(!/sess\.bot\.swimUp\(\{ hold: callBudget/.test(index), 'index.js 里不再有"只上浮"的分支（上浮由 walkSwim 自己按 jump）')
   /* 2026-10-15：walkTo 的返回值现在过 `withOutcome(..., { expect: 'moved' })`（结果台账要判得动）。 */
-  ok(/sess\.bot\.walkTo\(coordOf\(args\), \{ budget: callBudget\(args\.budgetMs\), noTower: args\.allowTower !== true, noDig, intent: intentArgOf\(args\.intent\), waterRecover: typeof args\.waterRecover === 'boolean' \? args\.waterRecover : undefined \}\)/.test(index), 'swim 给了坐标就游过去（walkTo 会自动走"直接游"；默认不许垫柱；自救开关透传）')
+  ok(/walkWithAutoDig\(sess, target, \{ noDig, noTower: args\.allowTower !== true, intent: intentArgOf\(args\.intent\), waterRecover: typeof args\.waterRecover === 'boolean' \? args\.waterRecover : undefined, xz: wantsXZ \}/.test(index), 'walk 仍走 walkWithAutoDig（走不通改成挖；自救开关透传）')
   ok(/在水里会自动改成"直接游"/.test(index), 'mc_move 描述里写明"在水里自动直接游"')
   ok(/在水里（氧气/.test(index), 'mc_status 瘦身视图里带氧气')
   ok(/头在水下/.test(index), 'mc_status 读不到氧气时也说清"头在水下"')
-  ok(/mode="swim"/.test(index), 'mc_move 描述里写了 swim')
-  ok(/walk \/ fly \/ jump \/ swim/.test(index), 'mode 说明里有 swim')
+  ok(!/mode="swim"/.test(index), 'mc_move 描述里不再出现 swim')
+  ok(/walk \/ fly \/ jump \/ boat/.test(index) && !/walk \/ fly \/ jump \/ swim/.test(index), 'mode 说明改成 walk / fly / jump / boat')
   ok(!/walk \/ walk-nodig \/ fly/.test(index) && !/mode === 'walk-nodig'/.test(index),
     '`mode:"walk-nodig"` 已删除（2026-10-25 用户要求，和 noDig:true 重复）')
 
@@ -466,7 +470,8 @@ section('⑧ 游泳：按目标高度决定上浮 + 连续没靠近就收手')
   const me = { y: 60 }
   ok(swimJumpWanted({}, { y: 62 }, me, 20) === true, '目标在上面 ⇒ 上浮')
   ok(swimJumpWanted({}, { y: 60 }, me, 20) === true, '同一层 ⇒ 还是按着（水里不按每秒沉约 2 格）')
-  ok(swimJumpWanted({}, { y: 55 }, me, 20) === false, '🔴 目标在下面 ⇒ 松开 jump 让它沉下去')
+  ok(swimJumpWanted({}, { y: 55 }, me, 20) === true,
+    '🔴 目标在下面也照样上浮（用户 m05864：「让它一直浮在水面」—— 不再按目标高度自动下沉）')
   ok(swimJumpWanted({}, { y: 55 }, me, 4) === true, '🔴 快没气了 ⇒ 不管目标在哪都先上去')
   ok(swimJumpWanted({}, { y: 60 }, null, 20) === true, '读不到自己的位置 ⇒ 保守上浮（别乱沉）')
 
@@ -503,21 +508,19 @@ section('⑧ 游泳：按目标高度决定上浮 + 连续没靠近就收手')
   }
   const mkCtx = (mc) => ({ beginMove: () => ++mc._moveGen, releaseControls: () => {} })
 
-  // ① 目标在水下 4 格 ⇒ 一开始绝不按 jump（不然永远沉不下去）
+  // ① 目标在水下 4 格 ⇒ 也照样按 jump 浮着（2026-10-27 用户：「一直浮在水面」）
   {
     const { bot, calls, stop } = mkSwimBot({ pos: [0, 60, 0] })
     const mc = mkMc(bot)
     const t0 = Date.now()
     const r = await walkSwim(mc, { x: 0, y: 56, z: 3 }, { arrive: 1.6, budget: 6000 }, mkCtx(mc))
     stop()
-    /* 注意：卡住之后的**纠偏**会故意反着试一轮（"以为该沉"时按一次上浮），
-     * 所以这里钉的是**第一个决定** —— 一上来就该是"不上浮"，而不是死按。
-     * 另外现在只在"该不该按"变了的时候才写控制位（默认就是没按），
-     * 所以"一次都不写"也算对 —— 只要**没有先按下去**。 */
+    /* 注意：现在每轮无条件写 `jump`（控制位会被寻路器/反射层清掉，只在变化时写就会漏），
+     * 所以第一次上浮一定发生在很靠前 —— 这里钉的就是"一上来就浮着"。 */
     const ups = calls.control.filter(([k, v]) => k === 'jump' && v === true)
     const firstUpAt = ups.length ? ups[0][2] - t0 : null
-    ok(firstUpAt === null || firstUpAt >= 1000,
-      '🔴 目标在水下 ⇒ 前 1 秒一次都没上浮（只有卡住之后的纠偏才反着试一轮）',
+    ok(firstUpAt !== null && firstUpAt < 500,
+      '🔴 目标在水下也一上来就按 jump（默认一直浮在水面，不再为了下沉而放弃上浮）',
       `第一次上浮在 ${firstUpAt}ms`)
     ok(r.via === 'swim' && r.arrived === false, '没游到就如实报没游到', JSON.stringify({ via: r.via, arrived: r.arrived }))
   }
@@ -606,6 +609,29 @@ section('⑪ 静态接线：ceiling 早退在 bumpGen 之前')
   ok(iCeil > 0, 'movement.mjs 有 reason: ceiling 分支')
   ok(iBump > iCeil, '天花板检查在领移动号之前（不推代次、不打断别人）')
   ok(/const ceilingOf = \(\) =>/.test(src), '有 ceilingOf() 读头顶两格')
+}
+
+/* ─────────── ⑬ 岩浆里也能按 jump 上浮（🔴 2026-10-27 实机：掉在岩浆里动不了） ─────────── */
+section('⑬ 岩浆里也允许上浮')
+{
+  /* 以前这里只认水：泡在岩浆里叫 `mc_move {mode:"swim"}` 会被回一句"我本来就没在水里"，
+   * 于是一个真能救命的动作（岩浆里按 jump = 往上浮）被语义挡在门外，人只能沉底挨烧。 */
+  const { bot, calls } = mkBot({ inWater: false, air: 20 })
+  bot.entity.isInLava = true
+  bot.blockAt = () => ({ name: 'lava' })
+  const mc = mkMc(bot)
+  const r = await mc.swimUp({ hold: 120 })
+  ok(!/本来就没在水里/.test(String(r.note)),
+    '🔴 岩浆里不再回"我本来就没在水里"', String(r.note))
+  ok(jumpOn(calls) && jumpOff(calls),
+    '🔴 岩浆里真的按住 jump（上浮）又松开', JSON.stringify(calls.control))
+
+  /* 负例：既不在水里也不在岩浆里 ⇒ 仍然立刻返回（别为了岩浆把"不在水里"也放行） */
+  const b2 = mkBot({ inWater: false, air: 20 })
+  const mc2 = mkMc(b2.bot)
+  const r2 = await mc2.swimUp()
+  ok(r2.inWater === false && /本来就没在水里/.test(String(r2.note)),
+    '陆地/空气里仍然立刻返回（不误按 jump）', String(r2.note))
 }
 
 /* ─────────── 收尾 ─────────── */

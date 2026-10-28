@@ -480,7 +480,7 @@ export class Watchdog {
         if (p) {
           const eye = b.blockAt(p.offset(0, 1.6, 0))
           if (/water|lava|bubble_column|kelp/.test(String(eye?.name ?? ''))) {
-            wet = '（我头在水下：是憋气，不是被打 —— 用 mc_move {"mode":"swim"} 上浮换气）'
+            wet = '（我头在水下：是憋气，不是被打 —— 朝岸边 mc_move，路上会自己上浮）'
           }
         }
       } catch { /* 忽略 */ }

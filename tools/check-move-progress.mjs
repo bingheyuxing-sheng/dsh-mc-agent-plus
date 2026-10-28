@@ -29,7 +29,8 @@ import vec3pkg from 'vec3'
 const Vec3 = vec3pkg.Vec3 ?? vec3pkg
 const mod = await import(new URL('../src/movement.mjs', import.meta.url))
 const {
-  MOVE_SAMPLE_MS, MOVE_STUCK_MS, MOVE_BUSY_MAX_MS, MOVE_ESCAPES,
+  MOVE_SAMPLE_MS, MOVE_STUCK_MS, MOVE_BUSY_MAX_MS, MOVE_BUSY_AIR_MS, MOVE_ESCAPES,
+  moveBusyKind, clearHeadCell,
   escapeStepOf, escapeTextOf, moveBusyNow, moveProgressWatcher, escapeMove, walkPathfinder, routeTrack, aboveOf,
   walkTo, carveStepAhead, MOVE_HARD_SLACK_MS, MOVE_CARVE_DIG_MS,
   MOVE_PLAN, MOVE_PLAN_TEXT, planStepTextOf, detourStep, MOVE_DETOUR_R, MOVE_DETOUR_MS, MOVE_PLAN_TTL_MS, MOVE_PLAN_SAME_R,
@@ -87,9 +88,9 @@ function autoClock () {
 }
 
 /* ── 只够采样器 / escapeMove 用的假机器人 ─────────────────────────────────── */
-function mkProbe (pos = { x: 0, y: 64, z: 0 }, { mining = false, building = false, onGround = true } = {}) {
+function mkProbe (pos = { x: 0, y: 64, z: 0 }, { mining = false, building = false, onGround = true, velocity = { x: 0, y: 0, z: 0 } } = {}) {
   const b = {
-    entity: { position: new Vec3(pos.x, pos.y, pos.z), onGround },
+    entity: { position: new Vec3(pos.x, pos.y, pos.z), onGround, velocity },
     controls: [],
     pathfinder: { isMining: () => mining, isBuilding: () => building },
     setControlState (k, v) { b.controls.push([k, v]) },
@@ -103,14 +104,18 @@ section('① 脱困阶梯的顺序与命名（纯函数）')
 {
   ok(Array.isArray(MOVE_ESCAPES_DIG) && MOVE_ESCAPES_DIG.length === 5 && MOVE_ESCAPES_DIG.includes('breakAhead'),
     '允许挖时阶梯五级，含"挖开挡路那格"', JSON.stringify(MOVE_ESCAPES_DIG))
-  ok(JSON.stringify(MOVE_ESCAPES_NODIG) === JSON.stringify(['repath', 'jump', 'backoff', 'detour']),
-    '🔴 不挖时阶梯里**没有** breakAhead（以前空转一轮 2.4 秒，还写进 planTried 误导模型）', JSON.stringify(MOVE_ESCAPES_NODIG))
+  ok(JSON.stringify(MOVE_ESCAPES_NODIG) === JSON.stringify(['repath', 'jump', 'clearHead', 'backoff', 'detour']),
+    '🔴 不挖时阶梯里**没有** breakAhead（以前空转一轮 2.4 秒，还写进 planTried 误导模型）；'
+      + '2026-10-28 补了 clearHead（只清自己头顶那格 —— 挂在柱子顶上时唯一能脱困的动作）',
+    JSON.stringify(MOVE_ESCAPES_NODIG))
   ok(escapeStepsFor(true) === MOVE_ESCAPES_NODIG && escapeStepsFor(false) === MOVE_ESCAPES_DIG && escapeStepsFor() === MOVE_ESCAPES_DIG,
     'escapeStepsFor(noDig) 按开关选阶梯')
   ok(MOVE_ESCAPES_DIG[0] === 'repath' && MOVE_ESCAPES_DIG[1] === 'jump' && MOVE_ESCAPES_DIG[2] === 'breakAhead',
     '🔴 允许挖时 breakAhead 提到 jump 之后（能挖就别绕远路）', MOVE_ESCAPES_DIG.join(' → '))
-  ok(MOVE_ESCAPES_NODIG[0] === 'repath' && MOVE_ESCAPES_NODIG[1] === 'jump' && MOVE_ESCAPES_NODIG[2] === 'backoff',
-    '🔴 不挖时顺序 = 用户要求的「重算路径 → 跳跃脱困 → 后退再寻路」', MOVE_ESCAPES_NODIG.join(' → '))
+  ok(MOVE_ESCAPES_NODIG[0] === 'repath' && MOVE_ESCAPES_NODIG[1] === 'jump' && MOVE_ESCAPES_NODIG[2] === 'clearHead'
+    && MOVE_ESCAPES_NODIG[3] === 'backoff',
+    '🔴 不挖时顺序 = 用户要求的「重算路径 → 跳跃脱困 → 清头顶 → 后退再寻路」'
+      + '（清头顶插在 jump 之后：先确认"跳也白跳"再动镐）', MOVE_ESCAPES_NODIG.join(' → '))
   ok(escapeStepOf(0, MOVE_ESCAPES_DIG) === 'repath' && escapeStepOf(1, MOVE_ESCAPES_DIG) === 'jump' && escapeStepOf(2, MOVE_ESCAPES_DIG) === 'breakAhead',
     'escapeStepOf(n, steps) 按序给动作')
   ok(escapeTextOf('repath') === '重算路径' && escapeTextOf('jump') === '跳跃脱困' && escapeTextOf('backoff') === '后退再寻路',
@@ -121,11 +126,23 @@ section('① 脱困阶梯的顺序与命名（纯函数）')
 }
 
 /* ═══════════════ ② moveBusyNow：什么算"正常等待" ═══════════════ */
-section('② moveBusyNow —— 挖着 / 放着 / 悬空都算正常等待（用户点名的坑）')
+section('② moveBusyKind/Now —— 挖着 / 放着 / **真在空中**才叫正常等待（用户点名的坑）')
 {
   ok(moveBusyNow(mkProbe({}, { mining: true })) === true, '正在挖（pathfinder.isMining）⇒ 忙')
   ok(moveBusyNow(mkProbe({}, { building: true })) === true, '正在放（pathfinder.isBuilding）⇒ 忙')
-  ok(moveBusyNow(mkProbe({}, { onGround: false })) === true, '悬空（跳跃 / 落地中）⇒ 忙')
+  ok(moveBusyKind(mkProbe({}, { mining: true })) === 'dig', '挖着 ⇒ kind=dig（用 6 秒宽限）')
+  /* 🔴 2026-10-28（用户：「卡在半空有没有可能是内部参数的问题」→ 实机确认就是）：
+   *   以前 `onGround:false` 一律算忙、一律给 6 秒宽限。一次跳跃才 ~0.6 秒，
+   *   人真挂在自己垫的柱子顶上（速度 0）时白拿 6 秒 ⇒ 整轮预算耗尽、阶梯一次没轮到。 */
+  ok(moveBusyKind(mkProbe({}, { onGround: false, velocity: { x: 0, y: 0.42, z: 0 } })) === 'air',
+    '离地且**在上升**（vy=0.42，真跳起来）⇒ kind=air')
+  ok(moveBusyKind(mkProbe({}, { onGround: false, velocity: { x: 0, y: -0.9, z: 0 } })) === 'air',
+    '离地且**在下坠**（vy=-0.9）⇒ kind=air')
+  ok(moveBusyKind(mkProbe({}, { onGround: false, velocity: { x: 0.3, y: 0, z: 0 } })) === 'air',
+    '离地且被水平推着走（vx=0.3）⇒ kind=air')
+  ok(moveBusyKind(mkProbe({}, { onGround: false })) === false,
+    '🔴 离地但**一动不动**（速度 0）⇒ 不算忙 —— 这就是"挂在半空"，必须照常判卡')
+  ok(moveBusyNow(mkProbe({}, { onGround: false })) === false, '同上（兼容包装也返回不忙）')
   ok(moveBusyNow(mkProbe()) === false, '站着不动、没在挖没在放、踩着地 ⇒ 不忙（照常判卡）')
   ok(moveBusyNow({}) === false, '没有 pathfinder / entity 的假 bot ⇒ 不忙（不当成"永远正常"）')
   ok(moveBusyNow(null) === false, 'null ⇒ 不忙，不抛错')
@@ -219,14 +236,31 @@ section('④ 正常等待豁免有上限（一直挖个不停不会变成"永远
   ok(err?.mcStuck === true, '🔴 一直挖超过 busyMax 之后就不再当"正常等待"，照判卡住')
   w.stop()
 }
+/* 🔴 2026-10-28：空中单独一档宽限。一次跳跃 ~600ms ⇒ 0.6 秒内不判卡，1.2 秒还挂着就是真挂住了。 */
 {
   const clock = fakeClock()
-  const b = mkProbe({}, { onGround: false })
+  const b = mkProbe({}, { onGround: false, velocity: { x: 0, y: 0.42, z: 0 } })
   const w = moveProgressWatcher(b, { x: 10, y: 64, z: 0 }, watchOpts(clock))
   let err = null
   w.promise.catch((e) => { err = e })
-  await clock.advance(MOVE_STUCK_MS)
-  ok(err === null, '悬空（跳跃落地中）不判卡住')
+  await clock.advance(MOVE_STUCK_MS - MOVE_SAMPLE_MS)
+  ok(err === null, `真在空中的时候照常宽限（不到 ${MOVE_STUCK_MS}ms 不判卡）`)
+  w.stop()
+}
+{
+  /* 空中宽限比挖掘短得多：`MOVE_BUSY_AIR_MS`(0.9s) + `MOVE_STUCK_MS`(2.4s) 之后必判卡，
+   * 而挖掘那档要 6s + 2.4s。 */
+  ok(MOVE_BUSY_AIR_MS < MOVE_BUSY_MAX_MS && MOVE_BUSY_AIR_MS <= 1000,
+    '🔴 空中宽限（0.9s）明显短于挖掘宽限（6s）—— 一次跳跃只有 ~0.6 秒', `${MOVE_BUSY_AIR_MS}ms < ${MOVE_BUSY_MAX_MS}ms`)
+  const clock = fakeClock()
+  const b = mkProbe({}, { onGround: false })   // 离地但一动不动
+  const w = moveProgressWatcher(b, { x: 10, y: 64, z: 0 }, watchOpts(clock))
+  let err = null
+  w.promise.catch((e) => { err = e })
+  await clock.advance(MOVE_STUCK_MS - MOVE_SAMPLE_MS)
+  ok(err === null, '刚离地的那几拍先不判卡（怕误伤正常起跳）')
+  await clock.advance(MOVE_SAMPLE_MS * 3)
+  ok(err?.mcStuck === true, '🔴 一直悬着不动超过 stuckMs ⇒ 判卡住（以前这里会白等到预算耗尽）')
   w.stop()
 }
 
@@ -540,7 +574,10 @@ section('⑧ 静态接线（谁把这几条改回去谁红）')
   ok(/export const CARVE_PROTECTED = new RegExp/.test(src), '容器/矿石/装置有保护名单（不替 AI 挖掉）')
   ok(/export function obstacleAheadOf/.test(src) && /obstacleAheadOf\(b, target\)/.test(src),
     '🔴 该不该挖看"眼前障碍"，不是离终点还有几格')
-  ok(/\.\.\.\(blockedAhead \? \{ blockedAhead \} : \{\}\)/.test(src), '失败结果带"眼前挡路的是什么"')
+  /* 2026-10-27：只是"时间到、但确实在推进"时不再给 blockedAhead（模型会把它当线索去挖无关的方块）；
+   * 真走不动（noProgress）时照旧给 —— 所以断言钉的是"条件化后的写法"，不是"永远给"。 */
+  ok(/\.\.\.\(\(blockedAhead && !timeIsBlame\) \? \{ blockedAhead \} : \{\}\)/.test(src),
+    '失败结果带"眼前挡路的是什么"（只在它可能就是原因时）')
   ok(/const exhausted = Boolean\(e\?\.mcStuck\)/.test(src), 'catch 里认出 mcStuck')
   ok(/: exhausted \? 'unreachable'/.test(src), '🔴 reason 里有 unreachable 这一档')
   ok(/const moveInfo = \(opts = \{\}\) => \(\{/.test(src), 'moveInfo 是个多字段的汇总（地形 + 脱困 + 路径失效）')
@@ -1186,9 +1223,10 @@ section('⑧‴ 失败结果"可操作"：眼前挡路的那格 + 泳也算三�
   const idx = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
   /* 2026-10-23 审计：入口现在走 `intentArgOf(args.intent)` 做枚举校验（未知值直接抛错），
    * 断言的判据跟着改。 */
-  ok((idx.match(/intent: intentArgOf\(args\.intent\)/g) ?? []).length >= 2
+  /* 2026-10-27：swim 分支删了 ⇒ 只剩 walk 一条出口。 */
+  ok((idx.match(/intent: intentArgOf\(args\.intent\)/g) ?? []).length >= 1
     && /function intentArgOf/.test(idx) && /intent: \{ type: 'string'/.test(idx),
-    'mc_move 的 intent 参数接到两条 walkTo 出口上，且未知值会被拒')
+    'mc_move 的 intent 参数接在 walkTo 出口上，且未知值会被拒')
 }
 /* ── ⑫ 门：规划允许穿门 + 执行层自己按开 + 卡住补救不砸门（2026-10-18 实机） ── */
 {
@@ -1968,7 +2006,7 @@ section('⑨ P0-a xz 目标 / P0-b pathLen·estCalls')
   ok(g0 && g0.y === undefined && g0.range === undefined, '🔴 GoalXZ 上**没有 y、没有半径**（高度交给寻路器自己定）', JSON.stringify(Object.keys(g0 ?? {})))
   ok(r.xz === true, '结果里带 xz:true（模型知道自己这次是"到那一列"）')
   ok(r.pathLenPlanned === 200, '🔴 pathLenPlanned = 首次规划出来的路径长度（200 节点）', String(r.pathLenPlanned))
-  ok(r.estCalls === 5, '🔴 estCalls = ceil(200 / 43) = 5（一次 10 秒约 43 格）', String(r.estCalls))
+  ok(r.estCalls === 9, '🔴 estCalls = ceil(200 / 24) = 9（2.4 格/秒 × 10 秒 ≈ 24 格；预算 20000 也按 10 秒上限算）', String(r.estCalls))
   ok(r.arrived === true && r.remaining < 2.2, '到达判定按水平距离（GoalXZ 没半径，不能拿 isEnd 卡）', JSON.stringify({ a: r.arrived, rem: r.remaining }))
 }
 {
@@ -2001,7 +2039,9 @@ section('⑨ P0-a xz 目标 / P0-b pathLen·estCalls')
   ok(/const wantsXZ = !yGiven/.test(idx), '🔴 只给 x/z 就自动按列算（不逼模型加参数）')
   ok(/const yGiven = args\.y !== undefined && args\.y !== null/.test(idx), '🔴 给了 y 就以 y 为准（2026-10-23 修：xz:true 曾把同时给的 y 静默吃掉）')
   ok(/给了 y 就按 y 走/.test(idx), '描述里写明 y 优先，免得模型以为 y 不能用了')
-  ok(/MOVE_BLOCKS_PER_CALL = 43/.test(read('../src/movement.mjs')), '一起算"还有几次调用"的换算常量在 movement.mjs 里')
+  ok(/MOVE_GRID_PER_SEC = 2\.4/.test(read('../src/movement.mjs')),
+  '一起算"还有几次调用"的换算常量在 movement.mjs 里（2.4 格/秒 —— 实测均值，不是疾跑理论值）')
+
 }
 
 {
@@ -2195,10 +2235,14 @@ section('㉒ 补挖的方向只认主轴 / 对角受限 / 有总预算')
  */
 section('㉓ 执行顺序：先便宜的、能绕就别挖；跨调用接着升级')
 {
-  ok(JSON.stringify(MOVE_PLAN) === JSON.stringify(['door', 'repath', 'jump', 'breakAhead', 'backoff', 'detour', 'tower']),
-    '允许挖时的执行顺序 = 开门 → 重算 → 跳 → 挖 → 后退 → 绕行 → 垫柱', JSON.stringify(MOVE_PLAN))
-  ok(JSON.stringify(MOVE_PLAN_NODIG) === JSON.stringify(['door', 'repath', 'jump', 'backoff', 'detour', 'tower']),
-    '不挖时的执行顺序 = 开门 → 重算 → 跳 → 后退 → 绕行 → 垫柱（没有"挖"这一级）', JSON.stringify(MOVE_PLAN_NODIG))
+  ok(JSON.stringify(MOVE_PLAN) === JSON.stringify(['door', 'repath', 'jump', 'breakAhead', 'clearHead', 'backoff', 'detour', 'tower']),
+    '允许挖时的执行顺序 = 开门 → 重算 → 跳 → 挖 → 清头顶 → 后退 → 绕行 → 垫柱'
+      + '（`clearHead` 是 2026-10-28 补的：被自己垫的柱子顶进 1×1 竖井时，挡路的在正上方）',
+    JSON.stringify(MOVE_PLAN))
+  ok(JSON.stringify(MOVE_PLAN_NODIG) === JSON.stringify(['door', 'repath', 'jump', 'clearHead', 'backoff', 'detour', 'tower']),
+    '不挖时的执行顺序 = 开门 → 重算 → 跳 → 清头顶 → 后退 → 绕行 → 垫柱'
+      + '（没有"挖开挡路那格"这一级；`clearHead` 是 2026-10-28 用户批准的例外：只清自己头顶一格）',
+    JSON.stringify(MOVE_PLAN_NODIG))
   ok(movePlanFor(true) === MOVE_PLAN_NODIG && movePlanFor(false) === MOVE_PLAN,
     'movePlanFor(noDig) 与 escapeStepsFor 同源')
   ok(MOVE_ESCAPES_DIG.indexOf('breakAhead') < MOVE_ESCAPES_DIG.indexOf('detour'),
@@ -2531,6 +2575,348 @@ section('㉖ 2026-10-24 导航世界模型：实体 / 未加载 / 岩浆 都不�
   ok(/descended: f, descendedFrom/.test(mv2), '正常下坡只报 descended（不再说"垫柱子被拒"）')
   ok(/if \(f == null \|\| !fellIsReal\(f\)\) return ''/.test(mv2), '下坡不吓唬模型（fellNote 为空）')
   ok(/这次 \$\{gotSec\} 秒/.test(mv2), '预算到点的文案写清"这次分到多少秒"（不再是硬梆梆的 10 秒）')
+}
+
+/* ═══════════════ ㉗ 实机 session-aa82：A* 说"没路"也要先挖一下 ═══════════════ */
+section('㉗ A* 直接报 NoPath 时，自己挖开眼前那格（别把活退回给模型）')
+{
+  /* 2026-10-27 用户实机（新旧两个会话都栽在这）：9 次"没路可走"里 5 次 `blockedAhead` 已经给了
+   * 具体方块坐标，模型只补挖了 2 次、每次多 1~2 次往返。A* 说没路 ≠ 真没路，往往就是眼前/头顶那一格。 */
+  const mv3 = readFileSync(new URL('../src/movement.mjs', import.meta.url), 'utf8')
+  ok(/const carveNoPathOk = !noDig/.test(mv3),
+    '🔴 NoPath 补挖有独立开关 carveNoPathOk（不吃 carveAllowed 的 TDZ）')
+  ok(mv3.indexOf('const carveNoPathOk = !noDig') < mv3.indexOf('if (emptyNoPath && carveNoPathOk'),
+    '开关声明在用到它的分支之前（别再造成 2026-10-25 那种 TDZ 崩）')
+  ok(/if \(emptyNoPath && carveNoPathOk && carveTries < MOVE_CARVE_TRIES && carved < MOVE_CARVE_TOTAL\)/.test(mv3),
+    'NoPath 分支复用同一套封顶（carveTries / MOVE_CARVE_TOTAL，不许无限挖）')
+  ok(/没路可走，眼前 \$\{obstacle\.name\}/.test(mv3), '日志说清"眼前是哪一格挡着"（模型不用再猜）')
+
+  /* ── 行为：脚前头顶那一格是石头 + A* 报 NoPath ⇒ 真的挖掉它 ── */
+  const clock = autoClock()
+  const bot = mkLoopBot()
+  const gone = new Set()
+  bot.blockAt = (p) => {
+    const x = Math.floor(p.x), y = Math.floor(p.y), z = Math.floor(p.z)
+    if (gone.has(`${x},${y},${z}`)) return { name: 'air' }
+    if (y <= 63) return { name: 'stone' }
+    if (x === 1 && y === 65 && z === 0) return { name: 'stone' }   /* 脚前那颗"头上的石头" */
+    return { name: 'air' }
+  }
+  const dug = []
+  bot.dig = () => { dug.push('1,65,0'); gone.add('1,65,0'); return Promise.resolve() }
+  const handlers = new Map()
+  bot.on = (ev, fn) => { handlers.set(ev, fn) }
+  bot.pathfinder.goto = () => {
+    handlers.get('path_update')?.({ status: 'noPath', path: [] })
+    return Promise.resolve()
+  }
+  const self = mkSelf(bot)
+  await walkPathfinder(self, { x: 5, y: 64, z: 0 }, { arrive: 1.6, budget: 20000 }, mkCtx(self, clock))
+  clock.stopPump()
+  ok(dug.length >= 1, 'A* 说没路，但脚前头顶那格石头被挖开了（不再空手退出）', JSON.stringify(dug))
+  ok(self.logs.some((m) => /没路可走，眼前 stone（1,65,0）挡着/.test(m)),
+    '日志报出挡路那格的确切坐标',
+    JSON.stringify(self.logs.filter((m) => /没路可走/.test(m)).slice(0, 2)))
+
+  /* ── 安全线：眼前根本没有任何方块挡着 ⇒ 一格都不许挖 ── */
+  const clock2 = autoClock()
+  const bot2 = mkLoopBot()
+  const dug2 = []
+  bot2.dig = () => { dug2.push(1); return Promise.resolve() }
+  const h2 = new Map()
+  bot2.on = (ev, fn) => { h2.set(ev, fn) }
+  bot2.pathfinder.goto = () => {
+    h2.get('path_update')?.({ status: 'noPath', path: [] })
+    return Promise.resolve()
+  }
+  const self2 = mkSelf(bot2)
+  await walkPathfinder(self2, { x: 5, y: 64, z: 0 }, { arrive: 1.6, budget: 20000 }, mkCtx(self2, clock2))
+  clock2.stopPump()
+  ok(dug2.length === 0 && !self2.logs.some((m) => /没路可走，眼前/.test(m)),
+    '🔴 眼前没明确方块就不挖（安全线：NoPath 不是"随便挖"的许可）', String(dug2.length))
+}
+
+/* ═══════════════ ㉒ 岩浆自救（🔴 2026-10-27 实机：用户「现在掉在岩浆里动不了」） ═══════════════ */
+section('㉒ 岩浆：泡在里面时自己上浮 + 找岸，不许交给 A*')
+{
+  /* 背景：以前岩浆里**什么都不做** —— `inWaterNow` 不认岩浆 ⇒ 落进 A* ⇒ 岩浆格 `safe:false` ⇒ NoPath，
+   * 然后每轮白烧 10 秒预算。岩浆 4 点/0.5 秒（不吃护甲），20 血约 2.5 秒烧光。
+   * 这一节钉住：① 判据在 ② 自救排在 A* 之前 ③ 找不到岸要如实报 + 给可行自救 ④ 水里不再"两遍试探"。 */
+  const lav = await import(new URL('../src/lava-recovery.mjs', import.meta.url))
+  const wo = await import(new URL('../src/world-observer.mjs', import.meta.url))
+  const bn = await import(new URL('../src/block-names.mjs', import.meta.url))
+
+  ok(bn.isLavaLike('lava') && bn.isLavaLike('flowing_lava') && !bn.isLavaLike('magma_block'),
+    'isLavaLike 只认岩浆本体（magma_block 是固体，不算"泡在里面"）')
+
+  /* 假 bot：脚下/头/四周全是岩浆；`shore:true` 时 x=2 那列是"空气 + 底下一格石头" */
+  function mkLavaBot ({ shore = false } = {}) {
+    const b = {
+      entity: { position: new Vec3(0, 64, 0), onGround: false, isInLava: true },
+      controls: [],
+      calls: { goto: 0 },
+    }
+    b.blockAt = (p) => {
+      const x = Math.floor(p.x); const y = Math.floor(p.y); const z = Math.floor(p.z)
+      if (shore && x === 2) {
+        if (y === 63) return { name: 'stone' }
+        if (y === 64 || y === 65) return { name: 'air' }
+      }
+      return { name: 'lava' }
+    }
+    b.setControlState = (k, v) => b.controls.push([k, v])
+    b.lookAt = () => {}
+    b.on = () => {}
+    b.removeListener = () => {}
+    b.pathfinder = {
+      isMining: () => false,
+      isBuilding: () => false,
+      setMovements: () => {},
+      setGoal: () => {},
+      goto () { b.calls.goto++; return Promise.resolve() },
+    }
+    return b
+  }
+
+  ok(wo.inLavaNow({ entity: { isInLava: true } }) === true,
+    '🔴 inLavaNow 认出 `entity.isInLava`（三层兜底的第一层）')
+  ok(wo.inLavaNow({ entity: { position: new Vec3(0, 64, 0) }, blockAt: () => ({ name: 'lava' }) }) === true,
+    '🔴 inLavaNow 第二层：`entity.isInLava` 读不到时按脚下那格判（照 inWaterNow 的兜底）')
+  ok(wo.inLavaNow({ entity: { position: new Vec3(0, 64, 0) }, blockAt: () => ({ name: 'stone' }) }) === false,
+    'inLavaNow 站在石头上不算泡在岩浆里')
+
+  /* ① 找岸：BFS 允许穿岩浆（A* 做不到这件事） */
+  const noShore = lav.lavaExitSearch(mkLavaBot())
+  ok(noShore.found === false && noShore.reason === 'no-shore',
+    '四周全岩浆 ⇒ found:false / reason:no-shore（不假装有路）', JSON.stringify(noShore.reason))
+  const hasShore = lav.lavaExitSearch(mkLavaBot({ shore: true }))
+  ok(hasShore.found === true && hasShore.target && Math.floor(hasShore.target.x) === 2,
+    '旁边有能站的岸 ⇒ 找到它并报出坐标', JSON.stringify(hasShore.target))
+  ok(lav.shoreAt(mkLavaBot({ shore: true }), 2, 64, 0) === true,
+    'shoreAt：空气两格 + 脚下石头 ⇒ 是岸')
+  ok(lav.shoreAt(mkLavaBot(), 0, 64, 0) === false,
+    'shoreAt：脚下是岩浆 ⇒ 不是岸')
+
+  /* ② walkTo 泡在岩浆里 ⇒ 走 lavaEscape，一次 A* 都不许叫 */
+  {
+    const clock = autoClock()
+    const bot = mkLavaBot()
+    const self = mkSelf(bot)
+    self.requireBot = () => bot
+    self.pfReady = true
+    self.callLeft = () => 900                 // 别真等满 600ms 上浮 + 3 秒游
+    let released = 0
+    const ctx = { ...mkCtx(self, clock), releaseControls: () => { released++ }, stopPathing: () => {} }
+    const r = await walkTo(self, { x: 20, y: 64, z: 0 }, { budget: 2000 }, ctx)
+    clock.stopPump()
+    ok(r.arrived === false && r.via === 'lava-escape' && r.reason === 'lava-escape',
+      '🔴 泡在岩浆里 ⇒ 走岩浆自救（via/reason 都是 lava-escape）', JSON.stringify({ v: r.via, re: r.reason }))
+    ok(bot.calls.goto === 0,
+      '🔴 岩浆里一次 A* 都不叫（以前就是在这儿 NoPath 空转到预算用光）', String(bot.calls.goto))
+    ok(r.stuck === true && /垫方块/.test(String(r.hint)),
+      '找不到岸时如实报 + 给出"垫方块"这条真能活命的建议', String(r.hint).slice(0, 60))
+    ok(r.lavaEscape && r.lavaEscape.findShore && r.lavaEscape.findShore.found === false,
+      '结果里带 lavaEscape 明细（模型能看出搜了多大范围、为什么没岸）')
+    ok(released >= 1, '自救结束一定松控制位（别把人按着 jump 卡在那）', String(released))
+  }
+
+  /* ③ 有岸 ⇒ 真的朝岸按 forward + jump，按完松开 */
+  {
+    const clock = autoClock()
+    const bot = mkLavaBot({ shore: true })
+    const self = mkSelf(bot)
+    self.requireBot = () => bot
+    self.pfReady = true
+    self.callLeft = () => 900                 // 游 400ms 就收
+    let released = 0
+    const ctx = { ...mkCtx(self, clock), releaseControls: () => { released++ }, stopPathing: () => {} }
+    const r = await walkTo(self, { x: 20, y: 64, z: 0 }, { budget: 2000 }, ctx)
+    clock.stopPump()
+    const pressedForward = bot.controls.some(([k, v]) => k === 'forward' && v === true)
+    const releasedAll = !bot.controls.slice(-2).some(([, v]) => v === true)
+    ok(r.lavaEscape && r.lavaEscape.findShore && r.lavaEscape.findShore.found === true,
+      '有岸时会朝岸游（findShore.found:true）', JSON.stringify(r.lavaEscape?.findShore?.reason))
+    ok(pressedForward, '🔴 真的按了 forward（岩浆里不按就沉底挨烧）')
+    ok(releasedAll, '游完把 forward/jump 都松开', JSON.stringify(bot.controls.slice(-3)))
+    ok(r.lavaEscape.tries >= 1, '报出试着游了几步', String(r.lavaEscape?.tries))
+  }
+
+  /* ④ 源码层面：接线顺序与"水里不做两遍试探" */
+  const mvSrc = strip(read('../src/movement.mjs'))
+  const iLava = mvSrc.indexOf('if (inLavaNow(b) && ctx.noLavaEscape !== true)')
+  const iWater = mvSrc.indexOf('if (inWaterNow(b) && b.entity?.onGround !== true)')
+  ok(iLava > 0 && iWater > 0 && iLava < iWater,
+    '🔴 岩浆自救排在"水"和 A* 之前（岩浆比水急：2.5 秒就能烧死）', JSON.stringify({ iLava, iWater }))
+  ok(/const lavaBlocking = inLavaNow\(b\) \? null : lavaAheadOf\(b, target/.test(mvSrc),
+    '🔴 自己泡在岩浆里时脱困阶梯不再被 lavaAheadOf 拦住（否则每轮 continue 空转到超时）')
+  ok(/if \(!inWaterNow\(b\) && !inLava\)/.test(mvSrc),
+    'swimUp 允许在岩浆里按 jump 上浮（以前回"我本来就没在水里"）')
+  const idxSrc = strip(read('../index.js'))
+  const iDeep = idxSrc.indexOf('if (deepWater) return await sess.bot.walkTo(target, { ...opts, noDig: true, budget: total })')
+  /* 🔴 2026-10-28：第一遍的预算抽成了 `firstMs` 常量（原来是内联的 `Math.max(1500, ...)`），
+   *   这条断言以前钉的是内联写法 ⇒ 一抽常量就假失败。改成钉"第一遍那句"本身。 */
+  const iFirst = idxSrc.indexOf('noDig: true, budget: total })\n')
+  ok(!/total \* 0\.4/.test(idxSrc), '🔴 第一遍不再切 40%（2026-10-28 用户实测「move 只给 4 秒」就是它切出来的）')
+  ok(iDeep > 0 && iFirst > 0 && iDeep < iFirst,
+    '🔴 深水里不做"先按一格不挖试 40%"（实测 5 次 swim-budget 全是 budgetMs×0.4：一条 20 格的河被切成两段）',
+    JSON.stringify({ iDeep, iFirst }))
+}
+
+/* 🔴 2026-10-27 实机（session-514c21b6）：AI 自己记的账「**床没了**：我在家附近用
+ *   noDig:false 走动时把 black_bed (-10,79,38) 挖掉，掉落的床 5 分钟后消失」。
+ *   `CARVE_PROTECTED` 只拦 DSH 自己的 `carveStepAhead` / `stepUp`（`diggableBlock`），
+ *   **拦不住上游 A* 的 dig** —— 上游只看 `movements.blocksCantBreak`
+ *   （vendor `movements.js:41` 默认只有 chest + 所有不可挖方块）。
+ *   所以同一张名单必须再灌进 blocksCantBreak，否则"走路"就能把家里的床砸了。 */
+{
+  const plugSrc = read('../src/plugins.mjs')
+  ok(/import \{[^}]*CARVE_PROTECTED[^}]*\} from '\.\/movement\.mjs'/.test(plugSrc),
+    'plugins.mjs 从 movement 引了 CARVE_PROTECTED')
+  ok(/for \(const blk of b\??\.registry\?\.blocksArray \?\? \[\]\) \{[\s\S]{0,200}?CARVE_PROTECTED\.test\(nm\)[\s\S]{0,120}?mv\.blocksCantBreak\.add\(blk\.id\)/.test(plugSrc),
+    '🔴 A* 也不许挖受保护方块（床/箱子/工作台/熔炉/信标/刷怪笼…）—— 实机里走路把家里的床挖了')
+  ok(/treeBlockIds\(b\)\) mv\.blocksCantBreak\.add\(id\)/.test(plugSrc) && /CARVE_PROTECTED\.test\(nm\)/.test(plugSrc),
+    '树（挖穿树冠）与受保护方块（不可逆损失）是 blocksCantBreak 里两条独立规则')
+}
+
+/* 🔴 2026-10-27 实机（session-514c21b6）：AI 出岩浆后**身上还在烧**，站着吃东西被烧死
+ *   （它自己在公屏上复盘的原话）。全仓之前 grep `entity.fire` = 0 处 —— 自保、状态、
+ *   自救三个出口都不知道"我还在烧"，于是"爬出来了"就等于"安全了"，人就停在那儿等死。 */
+{
+  const stSrc = read('../src/status.mjs')
+  const lavSrc = read('../src/lava-recovery.mjs')
+  const idxSrc2 = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
+  ok(/fire: b\?\.entity\?\.fire === true/.test(stSrc), 'status 报"身上还烧着"（读 entity.fire）')
+  ok(/s\.fire === true/.test(idxSrc2), 'mc_status 文案把"还在烧"说清楚（别停下吃东西）')
+  ok(/entity\?\.fire === true[\s\S]{0,200}?别停下吃东西/.test(lavSrc),
+    '岩浆自救成功后，若还在烧就提醒"别停下吃东西"（实机就是在这儿烧死的）')
+}
+
+/* 🔴 2026-10-27（用户：「auto-eat 抢占去掉」）：走路期间必须关掉自动吃。
+ *   auto-eat 饿了会 equip 食物 + consume，那几秒不能移动，把手上的工具也换掉了。 */
+{
+  const mvSrc = read('../src/movement.mjs')
+  ok(/export async function walkTo \(self, target, opts = \{\}, ctx = \{\}\) \{[\s\S]{0,600}?ae\.disableAuto\(\)/.test(mvSrc),
+    'walkTo 一进来就关掉自动吃（disableAuto）')
+  ok(/async function walkToInner \(self, target, opts = \{\}, ctx = \{\}\)/.test(mvSrc),
+    '真正的走路实现挪进 walkToInner（外面那层只管自动吃开关）')
+  ok(/\} finally \{[\s\S]{0,300}?ae\.enableAuto\(\)/.test(mvSrc),
+    '走完（含异常/超时）在 finally 里还原自动吃')
+}
+
+/* 🔴 2026-10-27（用户：「nodig false 最短现在会挖家，ai 也没意识到要切换，设置个绕路最大
+ *   限制大于 15 格在挖」）—— `digFirst` 把 `digCost` 压到 0.4 之后 A* 走几何最短，
+ *   直着挖穿自家墙和地板。现在每挖一格额外记 `walkDigDetourMax`（默认 15）步。 */
+{
+  const plugSrc2 = read('../src/plugins.mjs')
+  const coreSrc = read('../src/core.mjs')
+  const movSrc = read('../src/movement.mjs')
+  ok(/export function patchDigDetour \(mv, \{ perBlock = 15 \} = \{\}\)/.test(plugSrc2),
+    '有"每挖一格多绕 N 步"的补丁（patchDigDetour）')
+  ok(/if \(digFirstOn\) patchDigDetour\(mv, \{ perBlock: Number\(self\.cfg\?\.walkDigDetourMax \?\? 15\) \}\)/.test(plugSrc2),
+    'digFirst（noDig:false）时挂上它')
+  ok(/walkDigDetourMax: 15/.test(coreSrc), '默认门槛 15 格（cfg.walkDigDetourMax 可调）')
+  ok(/if \(c >= 100\) return c[\s\S]{0,120}?if \(block\?\.safe\) return c/.test(plugSrc2),
+    'vendor 的 100 = "挖不了" 不许加成 115；本来就能站的格子也不算挖')
+  ok(/const onDig = \(blk\) => \{[\s\S]{0,160}?dugNames\.set/.test(movSrc),
+    '挖方块时记下名字（不然"挖了 12 格"看不出把家拆了）')
+  ok(/dugBlocksOut\(\)/.test(movSrc) && /dugHint\(\)/.test(movSrc),
+    '出口报 dugBlocks（top 4），挖 ≥3 格时 hint 说明挖了什么')
+}
+
+
+/* ═══════════════ ㉔ 悬空自救：清头顶（clearHead）+ 结果里报 airborne ═══════════════
+ * 🔴 2026-10-28（用户：「卡在半空有没有可能是内部参数的问题」→ 实机确认就是）。
+ *   三条一起改：悬空不再白等 6 秒、失败时说清"你是挂着的"、不挖那趟补一级"清头顶"。 */
+section('㉔ 悬空自救：清头顶那格 + 结果里报 airborne')
+{
+  /* 假 bot：脚下 y=64，头顶 y=65 是 `name` 那一块 */
+  const mkHeadBot = (name) => {
+    const b = {
+      dug: 0,
+      entity: { position: new Vec3(0.5, 64, 0.5), onGround: true, velocity: { x: 0, y: 0, z: 0 } },
+      blockAt: () => ({ name, boundingBox: 'block', position: new Vec3(0, 65, 0) }),
+      pathfinder: { bestHarvestTool: () => null },
+      dig: async () => { b.dug++ },
+    }
+    return b
+  }
+  for (const n of ['stone', 'dirt']) {
+    const b = mkHeadBot(n)
+    ok(await clearHeadCell(b, { levels: 1 }) === 1 && b.dug === 1, `头顶是 ${n} ⇒ 挖掉它（1 格）`)
+  }
+  /* 往上开路要 2 层：同一块石头在 y+1、y+2 都算 ⇒ levels:2 会挖两下（目标在上方时用这个） */
+  {
+    const b = mkHeadBot('stone')
+    ok(await clearHeadCell(b, { levels: 2 }) === 2 && b.dug === 2, 'levels:2 ⇒ 连清两层（往上开路用）')
+  }
+  for (const n of ['air', 'cave_air']) {
+    const b = mkHeadBot(n)
+    ok(await clearHeadCell(b, { levels: 1 }) === 0 && b.dug === 0, `头顶是 ${n} ⇒ 不动手`)
+  }
+  for (const n of ['chest', 'crafting_table', 'farmland', 'oak_log', 'oak_leaves', 'bedrock', 'lava']) {
+    const b = mkHeadBot(n)
+    ok(await clearHeadCell(b) === 0 && b.dug === 0, `头顶是 ${n} ⇒ 不挖（保护名单 / 不可挖 / 不是方块）`)
+  }
+  /* 全局把走路挖块关掉时，`clearHead` 这一级也不许动手 */
+  {
+    const b = mkHeadBot('stone')
+    const r = await escapeMove(b, { x: 0, y: 64, z: 10 }, 'clearHead', { cfg: { walkCanDig: false } })
+    ok(r?.dug === 0 && b.dug === 0, 'cfg.walkCanDig=false ⇒ clearHead 不动手（配置仍然优先）')
+  }
+  {
+    const b = mkHeadBot('stone')
+    const r = await escapeMove(b, { x: 0, y: 64, z: 10 }, 'clearHead', { cfg: { walkCanDig: true } })
+    ok(r?.dug === 1 && r?.clearHead === true, '允许挖 ⇒ clearHead 真挖一格，并把 clearHead 记进结果')
+  }
+  /* 源码口径：结果里必须有 airborne、hint 必须直说"挂在半空" */
+  const src = read('../src/movement.mjs')
+  ok(/airborne: \{ vy:/.test(src), '结果里报 `airborne`（离地时给 vy/vh，still 表示一动不动）')
+  ok(/挂在半空、一动不动/.test(src), 'hint 直说"挂在半空、一动不动"，并指路（挖头顶 / 走到地面）')
+  ok(/Math\.hypot\(Number\(v\.x\) \|\| 0, Number\(v\.z\) \|\| 0\)/.test(src),
+    'moveBusyKind 用真实速度判"在不在动"（不是只看 onGround）')
+}
+
+
+section('㉓ 目标在头顶上方 ⇒ 自动往上挖（2026-10-28 用户：「move 在上面的时候自动挖不行吗」）')
+{
+  /* 实测场景（session-514c21b6 02:57:34）：垫柱子把人顶进 1×1 竖井，
+   *   四面石头、`y+1` 是空气、`y+2` 才是石头 ⇒ 只清脚位+头位等于白挖。 */
+  /* ① 目标在斜上方（水平差 1 格）：前方 y+2 那格也要挖 */
+  const b = mkCarveBot({ '1,63,0': 'stone', '1,66,0': 'stone' })
+  const n = await carve(b, { x: 1, y: 67, z: 0 })
+  ok(n === 1 && b.dug.includes('1,66,0'), '目标在斜上方 ⇒ 连前方 y+2 那格一起挖开（不然跳/垫都顶头）', JSON.stringify({ n, dug: b.dug }))
+  /* ② 目标就在**正上方**（水平零位移，`dirs` 为空）：该清自己头顶 —— 实机就是这样被关住的 */
+  const b2 = mkCarveBot({ '0,66,0': 'stone' })
+  const n2 = await carve(b2, { x: 0, y: 67, z: 0 })
+  ok(n2 === 1 && b2.dug.includes('0,66,0'), '目标在正上方 ⇒ 清自己头顶那格（不是放弃）', JSON.stringify({ n2, dug: b2.dug }))
+}
+{
+  /* 目标只高 1 格（正常台阶）：不许碰 y+2 —— 那多半是正常天花板 */
+  const b = mkCarveBot({ '1,63,0': 'stone', '1,64,0': 'stone', '1,66,0': 'stone' })
+  const n = await carve(b, { x: 1, y: 65, z: 0 })
+  ok(!b.dug.includes('1,66,0'), '只差 1 格 ⇒ 不开天窗（不挖 y+2）', JSON.stringify(b.dug))
+}
+{
+  /* 调用方指定了那一格（only）：挖完主格，若目标在上方还要接着清 y+2 */
+  const b = mkCarveBot({ '1,63,0': 'stone', '1,64,0': 'stone', '1,66,0': 'stone' })
+  const n = await carve(b, { x: 0, y: 67, z: 0 }, { only: { x: 1, y: 64, z: 0 } })
+  ok(n === 2 && b.dug.includes('1,64,0') && b.dug.includes('1,66,0'), 'only 分支：主格 + 上方那格都挖', JSON.stringify({ n, dug: b.dug }))
+}
+{
+  /* clearHeadCell 按层数清：目标在上 = 2 层 */
+  const b = mkCarveBot({ '0,66,0': 'stone' })
+  const n = await mod.clearHeadCell(b, { levels: 2 })
+  ok(n === 1 && b.dug.includes('0,66,0'), 'clearHeadCell(levels:2) 会挖 y+2（y+1 是空气就跳过）', JSON.stringify({ n, dug: b.dug }))
+  const b2 = mkCarveBot({ '0,66,0': 'stone' })
+  const n2 = await mod.clearHeadCell(b2, { levels: 1 })
+  ok(n2 === 0, 'clearHeadCell(levels:1) 只清 y+1 —— y+2 的石头不动', JSON.stringify({ n2, dug: b2.dug }))
+}
+{
+  const src = read('../src/movement.mjs')
+  ok(/export const MOVE_PLAN = \[[^\]]*'clearHead'/.test(src), '挖的趟（MOVE_PLAN）里也有 clearHead —— 头顶挡路才够得着')
+  ok(/levels = 2/.test(src), 'clearHeadCell 支持按层清（levels）')
+  ok(/const needAbove = ty != null && ty >= fy \+ 2/.test(src), 'carveStepAhead 判“目标在头顶上方 2 格以上”')
+  ok(/wantY > myY\) \? 2 : 1/.test(src), '目标在上面才清 2 层，否则只清 1 层（不乱开天窗）')
 }
 
 console.log(`check-move-progress：pass=${pass} fail=${fail}`)

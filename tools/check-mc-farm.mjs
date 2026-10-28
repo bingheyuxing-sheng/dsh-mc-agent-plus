@@ -16,7 +16,8 @@
  *   ⑦ 躺上了要区分"醒了"和"还躺着"（多人服要所有人才跳夜）；
  *   ⑧ 作物熟不熟按 `age >= num_values - 1` 判，查不到就 `null`（不知道就别当熟）；
  *   ⑨ 播种/锄地**每格都回读**：锄完不是 farmland ⇒ `till-unconfirmed`；撒了种子没长出作物 ⇒ `sow-unconfirmed`；
- *   ⑩ 没锄头 ⇒ `no-hoe` 并指 `mc_craft wooden_hoe`；种子用完 ⇒ 跳过并不当失败；
+ *   ⑩ 没锄头 ⇒ **那一格**跳过（`skipped.why = no-hoe`）并指 `mc_craft wooden_hoe`，不许整批罢工；
+ *      种子用完 ⇒ 跳过并不当失败；
  *   ⑪ 时间不够 ⇒ 剩下的进 `remaining`（再叫一次接着干）；
  *   ⑫ 插件面接线：`index.js` 的 `mc_act` 有 sleep/wake/farm 三个 mode + 参数，并直接调 `src/farm.mjs`（`core.mjs` 卡在 ≤1000 行，不再往门面上加薄包装）。
  *   ⑬ `bot.blockAt()` **只认真 `Vec3`**：本文件所有查询走 `at()` 口子（用户 2026-10-26 实机撞
@@ -360,7 +361,7 @@ section('⑨ farmArea：锄地→播种，每步回读')
     items: [item('wheat_seeds', 3)],
   })
   const s2 = await farmArea(fakeSelf(b2), { x: 0, y: 63, z: 0 })
-  ok(s2.ok === false && s2.reason === 'no-hoe', '没锄头 ⇒ no-hoe', s2.text)
+  ok(s2.ok === false && s2.skipped.some((x) => x.why === 'no-hoe'), '没锄头 ⇒ 那一格跳过并报 no-hoe（整批不罢工）', s2.text)
   ok(/wooden_hoe/.test(s2.text), '要指路 mc_craft wooden_hoe', s2.text)
   ok(!b2.calls.some((c) => c[0] === 'activate'), '没锄头就一次都不挥')
 
@@ -516,6 +517,20 @@ section('⑪ `bot.blockAt()` 只认真 Vec3 —— 纯对象要能兜住')
   const createAt = conn.indexOf('mineflayer.createBot({')
   const patchAt = conn.indexOf('patchBlockAt(b)')
   ok(createAt > 0 && patchAt > createAt, 'patchBlockAt(b) 就在 createBot 之后（同一个 bot，不漏包）')
+}
+
+
+/* 🔴 2026-10-28 实机（用户：「mc_act { mode:"farm" } 这样也不需要锄头吗」）：
+ *   没锄头原来会**整批 return**，自动找地必捞到生土 ⇒ 连已耕地撒种、熟作物收割都不干了。
+ *   缺工具只该让"那一格"跳过，不该让整批不动。 */
+section('⑫ 没锄头不许整批罢工（能种的先种）')
+{
+  const farmSrc2 = readFileSync(new URL('../src/farm.mjs', import.meta.url), 'utf8')
+  const farmCode2 = farmSrc2.split('\n').filter((l) => !/^\s*(\*|\/\/|\/\*)/.test(l)).join('\n')
+  ok(!/reason: 'no-hoe'[\s\S]{0,120}?return \{/.test(farmCode2), '没锄头不再整批 return（交给逐格跳过）')
+  ok(/const noHoe = willTill\.length > 0 && !hoe/.test(farmCode2), '缺锄头只记一个标记 noHoe')
+  ok(/if \(!hoe\) \{ skipped\.push\(\{ pos: s\.pos, why: 'no-hoe'/.test(farmCode2), '逐格兜底：土那格进 skipped（没干，不是干失败）')
+  ok(/noHoe \? '[^']*没有锄头[^']*'/.test(farmCode2), '返回文案会说清“土那几格没锄”并给合成建议')
 }
 
 

@@ -24,9 +24,10 @@ import { patchDigTime } from './dig-speed.mjs'
 import { applyProfile, classifyTerrainCached, profileFor } from './terrain.mjs'
 import { avoidBlockIds, treeBlockIds } from './bridge.mjs'
 import { PLANT_PASSABLE } from './block-names.mjs'
+import { inLavaNow } from './world-observer.mjs'
 /* 门的判断/去重/冷却只有一份（`src/movement.mjs`）：上半格可能没有 `open` 属性，
  * 必须统一下半块判断；两处各写一份就会各按一次（踩坑 #175/#176）。 */
-import { DOOR_PRESS_COOL_MS, doorBaseKey, doorFaceOf, doorOpenStateOf } from './movement.mjs'
+import { CARVE_PROTECTED, DOOR_PRESS_COOL_MS, doorBaseKey, doorFaceOf, doorOpenStateOf } from './movement.mjs'
 /**
  * ── 现成的 mineflayer 生态插件（PrismarineJS 官方/社区项目；**这些都不自己写**） ──────
  *
@@ -455,6 +456,43 @@ const IRON_DOOR_RE = /^iron_(door|trapdoor)$/
  *
  * 只过滤木门/栅栏门/活板门；铁门按不开，保留原行为。
  */
+/**
+ * **每挖一格额外记 `perBlock` 步**（默认走 `cfg.walkDigDetourMax` = 15）。
+ *
+ * 为什么需要：`digFirst`（显式 `noDig:false`）把 `digCost` 压到 0.4 之后，A* 眼里
+ * "挖一格"几乎等于"走一步"，于是它选的是**几何最短**——直着挖穿自家墙、把地板刨开。
+ * 用户实机原话：「nodig false 最短现在会挖家，ai 也没意识到要切换，设置个绕路最大限制
+ * 大于 15 格在挖」。给每格挖加固定的 15 步之后：绕路 ≤15 格 ⇒ 绕；>15 格 ⇒ 才挖。
+ *
+ * 两个入口都要包（`vendor/lib/movements.js`）：
+ * - `safeOrBreak(block, toBreak)` —— 走/跳时顺手挖开的那几格（:298）；
+ * - `breakLabor(block)` —— 垫方块/爬 1×1 柱子时挖的（:261）。
+ * ⚠️ vendor 用 **100** 表示"这格挖不了"（`safeToBreak` 失败），绝不能加成 115 ——
+ * 那会把"禁挖"变成"可行但贵一点"。所以只在 `cost < 100` 且**真的挖了**时才加。
+ */
+export function patchDigDetour (mv, { perBlock = 15 } = {}) {
+  if (!mv || !(Number(perBlock) > 0)) return mv
+  const add = Number(perBlock)
+  if (typeof mv.safeOrBreak === 'function' && !mv.__dshDigDetour) {
+    mv.__dshDigDetour = true
+    const origSafe = mv.safeOrBreak.bind(mv)
+    mv.safeOrBreak = (block, toBreak) => {
+      const c = origSafe(block, toBreak)
+      if (c >= 100) return c          // 100 = 挖不了，别动
+      if (block?.safe) return c       // 这格本来就能站，压根没挖
+      return c + add
+    }
+    const origLabor = typeof mv.breakLabor === 'function' ? mv.breakLabor.bind(mv) : null
+    if (origLabor) {
+      mv.breakLabor = (block) => {
+        const c = origLabor(block)
+        return c >= 100 ? c : c + add
+      }
+    }
+  }
+  return mv
+}
+
 export function patchDoorMoves (mv, { digPenalty = 0 } = {}) {
   if (!mv) return mv
   const doorAt = (node, p) => {
@@ -750,6 +788,19 @@ export function movements (self, { terrain = null, digFirst = false } = {}) {
    *    塞进 `blocksCantBreak` 之后 `safeToBreak()` 返回 false ⇒ 那条 move 记 100（不可行）。
    *    ⚠️ 只影响**寻路**；`mc_dig` 砍树不走 A*，照旧能砍。 */
   for (const id of treeBlockIds(b)) mv.blocksCantBreak.add(id)
+  /* 🔴 2026-10-27 实机（session-514c21b6，**AI 自己记的账**）：
+   *   「**床没了**：我在家附近用 noDig:false 走动时把 black_bed (-10,79,38) 挖掉，
+   *     掉落的床 5 分钟后消失 → 重生点失效，要重做一张床」。
+   *   那次走路是**上游 A* 在挖**：`CARVE_PROTECTED`（床/箱子/工作台/熔炉/附魔台/信标/
+   *   刷怪笼/传送门/矿石…）只拦 DSH 自己的 `carveStepAhead` / `stepUp`（`diggableBlock`），
+   *   上游 A* 的 dig 只看它自己的 `blocksCantBreak`（vendor 默认只有 chest + 不可挖方块）
+   *   ⇒ 保护名单根本管不到它，"走路"就把家里的床砸了，而且掉落物 5 分钟就消失。
+   *   这里把**同一张名单**灌进去：受保护方块 A* 一律不许挖。
+   *   ⚠️ 只影响**寻路**；`mc_dig` / `mc_act{break}` 是 AI 显式下令，不走 A*，照旧能挖。 */
+  for (const blk of b?.registry?.blocksArray ?? []) {
+    const nm = String(blk?.name ?? '')
+    if (Number.isFinite(blk?.id) && CARVE_PROTECTED.test(nm)) mv.blocksCantBreak.add(blk.id)
+  }
   /* 🔴 2026-10-23（二档，移植自 mindcraft / baritone 的同一个坑）：
    *    `avoidBlockIds()` 里含 `lava` ⇒ 一旦人**真掉进岩浆**，A* 眼里四面八方全是
    *    "不能站"，就再也规划不出"游出去"的路（只剩原地跳的 Escape）。
@@ -760,8 +811,10 @@ export function movements (self, { terrain = null, digFirst = false } = {}) {
    *    "岩浆湖是水下通道"，平时就会规划着往里钻。 */
   const lavaId = b?.registry?.blocksByName?.lava?.id
   if (typeof lavaId === 'number') {
+    /* 🔴 2026-10-27：判据从 `entity.isInLava` 换成 `inLavaNow`（照 `inWaterNow` 的三层兜底）——
+     *    浮在岩浆表面时 `entity.isInLava` 可能读不到，于是 lava 留在黑名单里，A* 连"游出去"都规划不出来。 */
     let inLava = false
-    try { inLava = b?.entity?.isInLava === true } catch { /* 假 bot 没有 entity */ }
+    try { inLava = inLavaNow(b) } catch { /* 假 bot 没有 entity */ }
     if (inLava) mv.blocksToAvoid.delete(lavaId)
     else mv.blocksToAvoid.add(lavaId)
     mv.__dshInLava = inLava
@@ -808,6 +861,10 @@ export function movements (self, { terrain = null, digFirst = false } = {}) {
    *   安全边界照旧。`cfg.walkDigFirst:false` 可退回"能绕就绕"，`cfg.walkDigFirstCost` 微调。 */
   const digFirstOn = Boolean(digFirst) && self.cfg?.walkDigFirst !== false
   if (digFirstOn) mv.digCost = Number(self.cfg?.walkDigFirstCost ?? 0.4)
+  /* 🔴 2026-10-27（用户：「nodig false 最短现在会挖家，ai 也没意识到要切换，设置个绕路最大
+   *   限制大于 15 格在挖」）—— 光压 `digCost` 等于"挖一格 ≈ 走一步"，A* 会挖穿自家墙地板。
+   *   每挖一格再记 `walkDigDetourMax`（默认 15）步 ⇒ 绕 15 格以内不挖，超过才挖。 */
+  if (digFirstOn) patchDigDetour(mv, { perBlock: Number(self.cfg?.walkDigDetourMax ?? 15) })
   mv.scafoldingBlocks = scaffoldingItemIds(b)      // 背包里能垫的方块（**item id**，见该函数注释）
   /* 2026-10-18：门只许"按开"，不许挖；已经开着就别再按（否则等于关回去）。见 `patchDoorMoves`。 */
   /* `preferDoors`（默认开）：给"还要挖方块"的移动加 8 点惩罚 —— 平地挖一格石头本来

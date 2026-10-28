@@ -485,7 +485,10 @@ section('⑨ 二档补丁：藤蔓能爬、掉进岩浆能规划着游出来')
   ok(/const CLIMBABLE_NAMES = \[[\s\S]*?'vine'[\s\S]*?'weeping_vines'[\s\S]*?'cave_vines_plant'[\s\S]*?\]/.test(src),
     '藤蔓族名单齐全（vine / 缠怨藤 / 垂泪藤 / 洞穴藤蔓 各两个形态）')
   ok(/patchClimbables\(mv, b\)/.test(src), 'movements() 结尾真的调了 patchClimbables')
-  ok(/inLava = b\?\.entity\?\.isInLava === true/.test(src), '岩浆避让按"当下是否在岩浆里"判')
+  /* 🔴 2026-10-27：判据从 `entity.isInLava` 换成 `inLavaNow`（三层兜底）——
+   *  断言只验"用当下位置判 + 在岩浆里就放开黑名单"这个语义，别把某一行写法钉死。 */
+  ok(/inLavaNow\(b\)/.test(src) && /if \(inLava\) mv\.blocksToAvoid\.delete\(lavaId\)/.test(src),
+    '岩浆避让按"当下是否在岩浆里"判')
 }
 
 console.log('\n' + '─'.repeat(50))

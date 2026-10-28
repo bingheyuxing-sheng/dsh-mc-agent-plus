@@ -1504,6 +1504,27 @@ section('龙息云提醒（2026-10-19 用户：「现在不会躲龙息，检测
   ok('steer 的 summary 能认出 breath', autoSrc.includes('summary: ball') && autoSrc.includes('MC 自保：龙息云在'))
 }
 
+/* 🔴 2026-10-28 用户：「现在游泳还是不是自动浮，要游的时候才会浮。我要的是 auto 自动浮起来，
+ *   可关掉。和有没有 move 没关系」—— 新增 autoFloat：头在水下就按住 jump，眼睛一出水立刻松手。
+ *   和 waterRecover 是两件事：那条是自己搜出口逃出去，这条只负责"别沉底"。 */
+section('autoFloat：落水自动上浮（与 move 无关、可关）')
+{
+  const autoSrc3 = readFileSync(new URL('../extensions/mc_auto.mjs', import.meta.url), 'utf8')
+  ok('默认开', /autoFloat: true,/.test(autoSrc3))
+  ok('三档模式都有它（ai-led 也开）', (autoSrc3.match(/autoFloat: true/g) || []).length >= 4)
+  ok('显式写过就覆盖模式默认（over 列表里有 autoFloat）', /over\('autoFloat'\)/.test(autoSrc3))
+  ok('头在水下就浮（用 submergedIn 判头部方块，不看可能过期的氧气读数）',
+    /const headUnder = Boolean\(e\?\.isInWater\) && submergedIn\(b, e\)/.test(autoSrc3))
+  ok('按住 jump（走 holdCtl 统一口子）', /holdCtl\(sess, 'jump', 900/.test(autoSrc3))
+  ok('眼睛一出水立刻松手', /\} else if \(!headUnder && s\.floatHeld\) \{/.test(autoSrc3))
+  ok('工具刚调完的 1.2 秒里让开（不跟 mc_move 的游泳段抢 jump）',
+    /t - num\(s\.lastToolAt, 0\) > 1_200 && t - num\(s\.floatAt, 0\) > 700/.test(autoSrc3))
+  ok('这一段里不叫醒、不寻路（只有 holdCtl）',
+    !/if \(beh\.autoFloat !== false\) \{[\s\S]{0,700}?(wakeForDanger|startWaterRecover)/.test(autoSrc3))
+  ok('状态字段齐（floatAt / floatHeld / lastFloatLoggedAt）',
+    /floatAt: 0,/.test(autoSrc3) && /floatHeld: false,/.test(autoSrc3) && /lastFloatLoggedAt: 0,/.test(autoSrc3))
+}
+
 /* ───────────────────────── 汇总 ───────────────────────── */
 
 console.log('')

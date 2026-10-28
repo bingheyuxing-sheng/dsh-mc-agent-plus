@@ -1112,8 +1112,11 @@ section('⑧ 战斗策略层接线 —— attack() 真的会撤 / 会换 / 会�
     ok(!/self\.(dig|placeBlock|useItem)\(/.test(atkNo), 'attack.mjs 不自己调别的动作能力（只走 ctx 回调）')
     has(atkNo, "from './combat-strategy.mjs'", 'attack.mjs 真的 import 了策略层')
     has(atkNo, 'if (Date.now() - t00 >= budget - 100)', '🔴 attack.mjs：循环有总预算闸门（不然一轮轮各吃满预算）')
-    has(atkNo, 'kite ? Math.min(COMBAT_PHASE_MS, KITE_STEP_MS + 100) : COMBAT_PHASE_MS',
-      '🔴 attack.mjs：一个战斗阶段比总预算短（否则"重新观察"永远不发生）；放风筝时再压到 ~1.3 秒（打一两下就退）')
+    /* 🔴 2026-10-28（用户：「mc_attack 每次只给 1.2 秒追击窗口」）：相位不再压到
+     *   `COMBAT_PHASE_MS`(1.2 秒) —— pvp 打完一个相位就 return，压短等于整次调用只打 1.2 秒。
+     *   现在吃满剩余；`COMBAT_PHASE_MS` 只留给放风筝的节奏。 */
+    has(atkNo, 'kite ? Math.min(COMBAT_PHASE_MS, KITE_STEP_MS + 100) : Number.MAX_SAFE_INTEGER',
+      '🔴 attack.mjs：战斗相位吃满这一轮剩余；放风筝时才压到 ~1.3 秒（打一两下就退）')
     has(atkNo, 'kite = false', '🔴 attack.mjs：放风筝是**显式开关**（默认关，老行为一字不变）')
     has(atkNo, 'KITE_MAX = 3', 'attack.mjs：一次调用最多退 3 步（再多就是"跑路"，那是 AI 叫 mc_move 的事）')
     has(atkNo, 'function kiteSpotOf', 'attack.mjs：退路先算"安全落脚点"再走（不是闷头后退）')
@@ -1407,6 +1410,138 @@ section('㉑ 换武器"没生效"要说得清 —— 有更好的却没换时给
   ok(/threatScoreOf, EQUIP_COOLDOWN_MS,/.test(src), 'EQUIP_COOLDOWN_MS 从 combat-strategy 导入（不是猜的数字）')
 }
 
+
+/* ─────────── ㊳ 站桩 stand（用户 m05940 / m06001）───────────
+ * 用法是「自己在头顶搭个 2 格高的小平台，钻进去打末影人（末影人 3 格高进不来）」。
+ * 所以三件事必须成立：① 一步不挪（挪出去就掉出那个洞）；② 够不着就打不着、
+ * 也不许报成打死；③ 头顶到底封没封必须如实报（那是这套打法成不成立的前提）。 */
+section('㊳ 站桩 stand —— 不挪一步 / 打不着就等 / 头顶封没封如实报')
+{
+  const { attack, standHeadroomOf } = await import(new URL('../src/attack.mjs', import.meta.url))
+
+  /* 假 bot：加 attack/lookAt/blockAt。blockAt 只认 Vec3（喂普通 {x,y,z} 会报 pos.floored），
+   * 这里按"脚位往上 headroom-1 格是空气、再往上是石头"造一个 2 格洞。 */
+  const mkStandBot = (entities, { headroom = 2, me = [0, 64, 0] } = {}) => {
+    const f = mkFightBot(entities, { withPvp: true, me })
+    const calls = { swings: 0, looks: 0, moves: 0 }
+    f.bot.attack = () => { calls.swings++ }
+    f.bot.lookAt = async () => { calls.looks++ }
+    f.bot.blockAt = (v) => {
+      const dy = v.y - me[1]
+      const solid = dy >= headroom || dy < 0
+      return solid
+        ? { position: v, name: 'stone', boundingBox: 'block' }
+        : { position: v, name: 'air', boundingBox: 'empty' }
+    }
+    return { ...f, calls }
+  }
+  const mkCtx2 = () => {
+    const calls = { move: [] }
+    const ctx = {
+      t: (p) => p,
+      callLeft: () => 60_000,
+      abortSignal: null,
+      hasPvp: true,
+      moveTo: async (pos, opts) => { calls.move.push({ pos, opts }) },
+      equipTo: async () => {},
+    }
+    return { ctx, calls }
+  }
+  const zAt = (id, z, y = 64) => ent({ id, name: 'zombie', type: 'hostile', kind: 'Hostile mobs', pos: { x: 0, y, z } })
+
+  {   /* 够得着：站桩照样挥，且一步没挪 */
+    const f = mkStandBot([zAt('z1', 2)])
+    const { ctx, calls } = mkCtx2()
+    const r = await attack(f.bot, { who: 'zombie', budget: 400, stand: true }, ctx)
+    ok(r.stood === true, '🔴 stand:true ⇒ 结果里 stood:true（下游能看出这是站桩那一轮）', JSON.stringify({ stood: r.stood }))
+    ok(r.standAt && r.standAt.y === 64 && r.standAt.x === 0 && r.standAt.z === 0, '🔴 结果带 standAt（站在哪打的）', JSON.stringify(r.standAt))
+    ok(calls.move.length === 0, '🔴 站桩一步都不挪（ctx.moveTo 一次都没调）', String(calls.move.length))
+    ok(f.calls.swings > 0, '🔴 够得着就照打（不是站着不动手）', String(f.calls.swings))
+    ok(f.calls.looks > 0, '🔴 出手前先转头看目标（手动分支原来不看方向，站着不动更容易打空）', String(f.calls.looks))
+    ok(r.headroom === 2, '🔴 头顶封到 2 格如实报出来（这套打法的前提）', String(r.headroom))
+    ok(/头顶封到 2 格/.test(String(r.standText ?? '')), '🔴 2 格洞时给一句"进不来、这一轮没挪"', String(r.standText ?? '').slice(0, 40))
+  }
+
+  {   /* 够不着：原地等，不许误报打死 */
+    const f = mkStandBot([zAt('z1', 6)])
+    const { ctx, calls } = mkCtx2()
+    const r = await attack(f.bot, { who: 'zombie', budget: 400, stand: true }, ctx)
+    ok(calls.move.length === 0, '🔴 够不着也不追（站桩就是不挪）', String(calls.move.length))
+    ok(f.calls.swings === 0, '🔴 4.5 格外一下都没挥（不是空挥）', String(f.calls.swings))
+    ok(r.killed !== true && r.gone !== true, '🔴 没打到就不许报 killed/gone', JSON.stringify({ k: r.killed, g: r.gone }))
+    ok(r.outOfReach && r.outOfReach.distance > 4.5, '🔴 说清"它离我多远"（outOfReach）', JSON.stringify(r.outOfReach))
+    ok(r.combat !== 'killed', '结局不是 killed', String(r.combat))
+  }
+
+  {   /* 头顶没封（能站 3 格）⇒ 必须提醒先封顶 */
+    const f = mkStandBot([zAt('z1', 2)], { headroom: 3 })
+    const { ctx } = mkCtx2()
+    const r = await attack(f.bot, { who: 'zombie', budget: 400, stand: true }, ctx)
+    ok(r.headroom === 3, '头顶 3 格如实报', String(r.headroom))
+    ok(/没封/.test(String(r.standWarn ?? '')) && /封顶/.test(String(r.standWarn ?? '')),
+      '🔴 头顶没封 ⇒ 直说"末影人进得来，先封顶"', String(r.standWarn ?? '').slice(0, 60))
+  }
+
+  {   /* 头顶只有 1 格 ⇒ 连自己都站不下 */
+    const f = mkStandBot([zAt('z1', 2)], { headroom: 1 })
+    const { ctx } = mkCtx2()
+    const r = await attack(f.bot, { who: 'zombie', budget: 400, stand: true }, ctx)
+    ok(/只有 1 格/.test(String(r.standWarn ?? '')), '🔴 连自己都站不下时也得说', String(r.standWarn ?? '').slice(0, 60))
+  }
+
+  {   /* 纯函数 + 不误伤：没有 blockAt 就返回 null，别炸 */
+    ok(standHeadroomOf({ entity: { position: new Vec3(0, 64, 0) } }) === null, '没有 blockAt ⇒ 返回 null（不猜）')
+    const fb = { entity: { position: new Vec3(0, 64, 0) }, blockAt: (v) => ({ boundingBox: v.y <= 65 ? 'empty' : 'block' }) }
+    ok(standHeadroomOf(fb) === 2, '纯函数：脚位+1 格空气、再顶石头 ⇒ 2', String(standHeadroomOf(fb)))
+  }
+
+  {   /* 源码接线：stand 必须真的把这些路堵死 */
+    const src = readFileSync(new URL('../src/attack.mjs', import.meta.url), 'utf8')
+    ok(/&& !standMode/.test(src), 'attack.mjs：站桩时不用 pvp 插件（GoalFollow 会拽着人追）')
+    ok(/kite && !standMode && canMove/.test(src), 'attack.mjs：站桩时不放风筝')
+    ok(/if \(standMode\) \{\n\s*actions\.push\('hold'\)/.test(src.replace(/\r\n/g, '\n')),
+      'attack.mjs：站桩时 reposition 变成 hold（不挪）')
+    ok(/await sleep\(150\)/.test(src) && /distOf\(target\) > 4\.5\) \{/.test(src),
+      'attack.mjs：站桩够不着时原地等它走近')
+    ok(/target\.position\.offset\(0, Math\.min\(1\.3/.test(src), 'attack.mjs：出手前 lookAt 目标（按目标高度抬头）')
+    ok(/standHeadroomOf/.test(src), 'attack.mjs：头顶高度走 standHeadroomOf')
+  }
+}
+
 for (const d of TMP_DIRS) { try { rmSync(d, { recursive: true, force: true }) } catch {} }
+/* 🔴 2026-10-27 实机（用户：「attack 好像没有寻路，老是被卡住」）：3.6 格外必须先用
+ *   `ctx.moveTo`（= walkTo，有绕路/挖/搭/跳）走过去，不能再靠 pvp 的 GoalFollow 裸跟。 */
+{
+  const atkNo = readFileSync(new URL('../src/attack.mjs', import.meta.url), 'utf8')
+  ok(/d0 > 8/.test(atkNo), '追不上的病根：8 格外的目标要先自己走过去（8 格内 pvp 的 GoalFollow 自己挪得动）')
+  ok(/Math\.min\(budgetLeft\(\) - 2_000, 2_000\)/.test(atkNo),
+    '🔴 走近只肯花 2 秒，并且先给战斗留 2 秒（不然"走过去站一下就回来"）')
+  ok(/战斗接近：先走到/.test(atkNo), '接近时用 ctx.moveTo（现成 walkTo），带 reason 便于日志排查')
+  ok(/连续 3 次都走不到/.test(atkNo), '连续 3 次走不到就收手，别把 8 轮预算全花在同一个走不到的目标上')
+  ok(/走近时失败：/.test(atkNo), '够不着时把"走近为什么失败"写进 note（不再三选一瞎猜）')
+}
+
+/* 🔴 2026-10-28（用户：「有高低差呢」）：近战以前只判距离 —— pvp 的挥拳只看距离，
+ *   隔着一层地板/墙照样空打到预算耗尽；有高低差时 GoalFollow 也不会自己上下走。
+ *   这两条把「出手前查视线」和「差 2 格以上先自己走近」钉住。 */
+const atkSrc2 = readFileSync(new URL('../src/attack.mjs', import.meta.url), 'utf8')
+const minSrc2 = readFileSync(new URL('../src/mining.mjs', import.meta.url), 'utf8')
+ok(/import \{ losBlockerAlong \} from '\.\/mining\.mjs'/.test(atkSrc2),
+  'attack 复用了 mining 的视线采样（losBlockerAlong），不另写一份')
+ok(/const losBlockOf = \(e\) => \{/.test(atkSrc2) && /losBlockerAlong\(b, from, Math\.floor\(tp\.x\)/.test(atkSrc2),
+  '有一个"眼睛→目标"的视线检查（从眼睛高度出发，采样到目标格）')
+ok(/const los0 = losBlockOf\(target\)/.test(atkSrc2) && /\{ mcLos: true \}/.test(atkSrc2),
+  'pvp 分支：被方块挡着就不进战斗，如实报"隔着什么、先挖开"')
+ok(/const losM = losBlockOf\(target\)/.test(atkSrc2) && /if \(losM\) \{ losBlocked = losM; break \}/.test(atkSrc2),
+  '手动挥拳分支：被挡就一下都不挥（不再对着墙空挥）')
+ok(/\.\.\.\(losBlocked \? \{ losBlocked: \{ x: losBlocked\.at\.x/.test(atkSrc2),
+  '返回里带 losBlocked（挡路的方块坐标与名字），模型能直接去挖它')
+ok(/const dy0 = Math\.abs\(Number\(target\?\.position\?\.y/.test(atkSrc2)
+  && /if \(d0 > 8 \|\| \(dy0 >= 2 && d0 > 3\.5\)\) \{/.test(atkSrc2),
+  '目标差 2 格以上且在攻击距离外 ⇒ 先自己走近（pvp 的 GoalFollow 不会上下走）')
+
+const minSrc2b = readFileSync(new URL('../src/mining.mjs', import.meta.url), 'utf8')
+ok(/export function losBlockerAlong \(b, from, gx, gy, gz, near\)/.test(minSrc2b),
+  'mining.mjs exports losBlockerAlong (attack reuses one sampler)')
 console.log(`\ncheck-core-attack：pass=${pass} fail=${fail}`)
 process.exit(fail ? 1 : 0)

@@ -11,7 +11,7 @@
  * 同名的 `reachOf`，那个是"这个材料我够不够得着做"，跟"我离这块方块多远"不是一回事）。
  */
 import { isDropEntity } from './entity-names.mjs'
-import { isWaterLike } from './block-names.mjs'
+import { isWaterLike, isLavaLike } from './block-names.mjs'
 
 /**
  * 读一个实体的血量（读不到就 null）。
@@ -70,6 +70,22 @@ export function inWaterNow (b) {
      *    站在 seagrass / tall_seagrass / kelp 那格就被判成"在陆地上" ⇒ swim 分支不触发、原地卡死。
      *    改用 isWaterLike（把水里植物也算进来）。 */
     return isWaterLike(n)
+  } catch { return false }
+}
+
+/** 我现在泡在岩浆里吗（脚在岩浆里，或眼睛那格是岩浆）。
+ *  🔴 2026-10-27 实机（用户：「现在掉在岩浆里动不了」）：这一层原来只有 `inWaterNow`，
+ *    掉进岩浆后所有分支都当"站在陆地上" ⇒ 走 A* ⇒ 岩浆格 `safe:false` ⇒ NoPath ⇒ 原地挨烧。
+ *    判据照 `inWaterNow` 的三层兜底：`entity.isInLava` 在**浮在岩浆表面**时也可能读不出来。 */
+export function inLavaNow (b) {
+  try { if (b?.entity?.isInLava) return true } catch { /* 往下退 */ }
+  try {
+    const eye = b?._getBlockAtEyeLevel?.()?.name
+    if (isLavaLike(eye)) return true
+  } catch { /* 往下退 */ }
+  try {
+    const feet = b?.entity?.position?.floored?.()
+    return feet && typeof b?.blockAt === 'function' ? isLavaLike(b.blockAt(feet)?.name) : false
   } catch { return false }
 }
 

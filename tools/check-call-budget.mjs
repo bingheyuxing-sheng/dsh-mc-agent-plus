@@ -229,6 +229,8 @@ section('④ walkTo() —— 到点带着进度返回，文案是"再叫一次"�
   ok(/不是走不通/.test(r.hint ?? ''), '并且明确"不是走不通"（预算到点是正常返回）', String(r.hint).slice(-60))
   ok(/再叫一次 mc_move/.test(r.hint ?? ''), '并告诉模型"再叫一次 mc_move 接着走"', String(r.hint).slice(-60))
   ok(fake.calls.stop >= 1, '到点后调了 pathfinder.stop()（不把后台寻路留着）', `stop=${fake.calls.stop}`)
+  ok(mc.cfg.moveBudgetMs <= CALL_MS, '🔴 `cfg.moveBudgetMs` 兜底值 ≤ CALL_MS（不然"没传预算"的内部走路会以为能走更久，实际被硬掐）',
+    `${mc.cfg.moveBudgetMs} vs ${CALL_MS}`)
 
   // 本轮只剩 2 秒：按剩余时间截断
   const fake2 = mkBot({ hang: true })

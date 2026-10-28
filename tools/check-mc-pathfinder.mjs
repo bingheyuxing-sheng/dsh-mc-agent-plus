@@ -293,15 +293,15 @@ const mvSrc = readFileSync(join(HERE, '..', 'src', 'movement.mjs'), 'utf8')
 const countOf = (hay, needle) => hay.split(needle).length - 1
 
 ok(/noDig: \{ type: 'boolean'/.test(mcIndexSrc), 'mc_move 有 noDig 参数')
-ok(/walk \/ fly \/ jump \/ swim \/ boat/.test(mcIndexSrc), 'mode 说明里没有 walk-nodig（已删）')
+ok(/walk \/ fly \/ jump \/ boat/.test(mcIndexSrc), 'mode 说明里没有 walk-nodig / swim（都已删）')
 ok(!/mode === 'walk-nodig'/.test(mcIndexSrc), '分发里没有 walk-nodig 分支（已删）')
 ok(/const noDig = args\.noDig !== false/.test(mcIndexSrc),
   '默认不挖：只有显式 noDig:false 才允许挖')
 const seqSrc = readFileSync(join(HERE, '..', 'src', 'sequence.mjs'), 'utf8')
 ok(/noDig: s\.noDig !== false/.test(seqSrc), 'mc_sequence 的 move 步骤默认也不挖（和 mc_move 一致）')
-ok(countOf(mcIndexSrc, 'noDig, intent: intentArgOf(args.intent)') === 1
-  && countOf(mcIndexSrc, 'noDig, noTower: args.allowTower !== true, intent: intentArgOf(args.intent)') === 1,
-  'noDig 传进了两条走路调用（walk 与「swim 给坐标」那条）')
+/* 2026-10-27（用户：「把 mode swim 去掉」）：swim 分支删了，现在只剩 walk 这一条出口。 */
+ok(countOf(mcIndexSrc, 'noDig, noTower: args.allowTower !== true, intent: intentArgOf(args.intent)') === 1,
+  'noDig 传进了走路调用（walk 那条；swim 分支已删）')
 /* 2026-10-25（用户：「move和dig如果没办法到那格应该自动切换成可破坏」）：
  *   walk 那条改走 `walkWithAutoDig` —— 先不挖走一遍，走不通自动改成挖穿挡路方块再走。 */
 ok(/walkWithAutoDig\(sess, target, \{ noDig, noTower: args\.allowTower !== true/.test(mcIndexSrc),
@@ -321,6 +321,17 @@ ok(/autoDigWorth/.test(mcIndexSrc) && /AUTO_DIG_REASONS/.test(mcIndexSrc),
   ok(ghosts.length === 0, '名单里没有幽灵值（每个都真在 movement 里出现过）', ghosts.join(',') || '无')
   ok(names.includes('NoPath'), '认了 NoPath（"这条路走不通"最主要的那个）', names.join(','))
 }
+/* 🔴 2026-10-28 实机（用户：「工具报回来的移动预算只有 4 秒左右，所以从 y48 爬回地表花了六七次调用」）：
+ *   第一遍"一格不挖"只分 40% 预算，以前以 `timeout` 结束时**不认**（只列 NoPath 一类）⇒
+ *   "4 秒用完 + 剩下 6 秒白扔"，一次调用只推进 3~4 格。这三条把修好的行为钉住。 */
+ok(/String\(r\.reason \?\? ''\) === 'timeout' && Boolean\(r\.blockedAhead\)/.test(mcIndexSrc),
+  '第一遍 timeout 但眼前真被方块挡着 ⇒ 剩下时间改成挖穿（不再白扔）')
+/* 🔴 2026-10-28（用户：「刚刚的 move 就给 4 秒」）：40% 切分已撤销 —— 第一遍直接吃满。
+ *   真走不通会自己早退（NoPath 实测 0.3 秒），不需要预先切给第二遍。 */
+ok(/noDig: true, budget: total \}\)/.test(mcIndexSrc) && !/total \* 0\.4/.test(mcIndexSrc),
+  '第一遍"一格不挖"直接吃满预算（不再切 40%），走不通自己早退、剩下的留给挖穿')
+ok(/budgetPlan: \{ totalMs: total, trialMs: total/.test(mcIndexSrc),
+  '返回里带 budgetPlan（这一轮一共几秒 / 试绕路几秒 / 挖穿几秒）')
 ok(countOf(mvSrc, 'noDig = false, xz = false } = {}, ctx = {})') === 3,
   'walkToUnguarded / walkToOnce / walkPathfinder 三个函数都收 noDig（连 xz 一起逐层转发）',
   String(countOf(mvSrc, 'noDig = false, xz = false } = {}, ctx = {})')))

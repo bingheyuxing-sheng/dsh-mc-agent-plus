@@ -73,7 +73,6 @@ import {
 import { join, dirname, basename, sep } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-
 const Vec3 = vec3pkg.Vec3 ?? vec3pkg
 const HERE = dirname(fileURLToPath(import.meta.url))
 
@@ -185,9 +184,11 @@ export const DEFAULTS = {
   authUser: process.env.MC_AUTH_USER ?? '',
   authPass: process.env.MC_AUTH_PASS ?? '',
   connectTimeoutMs: 45_000,
-  moveBudgetMs: 40_000,
+  /* 🔴 2026-10-28 参数审计：原来 40_000（超单次硬上限 CALL_MS）—— "忘了传 budget"的内部走路会以为有 40 秒，实际 11 秒就被掐。 */
+  moveBudgetMs: CALL_BUDGET_MS,
   preferDoors: true, doorDigPenalty: 8,   // 优先走门/绕路：给"挖墙"加代价（2026-10-18）
   walkDigFirst: true, walkDigFirstCost: 0.4,   // 2026-10-27：显式 noDig:false ⇒ 挖按"多走一步"计价，走最短那条（见 src\plugins.mjs 的 digFirst）
+  walkDigDetourMax: 15,   // 2026-10-27：每挖一格额外按"多绕 N 步"记账 ⇒ 绕 ≤N 格不挖、超过才挖（用户：noDig:false 会挖家）
   /* 2026-10-23：耕地/土径不进 A* 的落脚点（防踩坏、防挖开挡路的）。代价：唯一通路时寻路报 NoPath 而不是硬穿。 */
   protectFarmland: true,
   chatHistory: 300,

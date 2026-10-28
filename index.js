@@ -30,6 +30,7 @@ import { resolve, sep, join, isAbsolute, dirname, basename } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
 import { McBot, lossless, logLine, logDebug, logOnce, logLevel, libraryInfo, CALL_MS, callBudget, redactPath } from './src/core.mjs'
 import { defineTool, toolDefKind, loosenNumberParams, coerceNumberArgs } from './src/tool-def.mjs'
+import { inWaterNow } from './src/world-observer.mjs'
 /* 路线图第 ⑥ 条：把每个动作的结局说清（已确认成功 / 动作失败 / 结果未知）。纯函数，不碰游戏状态。 */
 import { outcomeOf, verdictText } from './src/task-runner.mjs'
 import { runText } from './src/task-exec.mjs'
@@ -2785,28 +2786,50 @@ export function apply(ctx, rawConfig) {
    *   `src/movement.mjs` 根本不产生这几个 reason（真实值是下面这些，含大写 `NoPath`）。
    *   写错就等于自动挖穿从来没生效过，所以列真值并把断言钉在 `check-mc-pathfinder`。 */
   const AUTO_DIG_REASONS = new Set(['NoPath', 'ceiling', 'goal-not-standable', 'goal-reached-elsewhere', 'goal_reached-but-far'])
+  /* 🔴 2026-10-28 实机（用户：「工具报回来的移动预算只有 4 秒左右，所以从 y48 爬回地表花了六七次调用」）：
+   *   第一遍只给 40%（10 秒 → 4 秒），而以 `timeout` 结束时以前**不认**（这里只列 NoPath 一类），
+   *   于是"4 秒用完 + 剩下 6 秒直接扔掉"，一次调用只推进 3~4 格。
+   *   眼前确实有方块挡着（`blockedAhead`）时，剩下的时间正好改成挖穿 —— 仍不超过这一次调用的总预算。 */
   const autoDigWorth = (r) => Boolean(r) && r.arrived === false
-    && (AUTO_DIG_REASONS.has(String(r.reason ?? '')) || r?.stepUp?.why === 'no-headroom')
+    && (AUTO_DIG_REASONS.has(String(r.reason ?? '')) || r?.stepUp?.why === 'no-headroom'
+      || (String(r.reason ?? '') === 'timeout' && Boolean(r.blockedAhead)))
   const walkWithAutoDig = async (sess, target, opts, budgetMs, autoDig) => {
     const total = callBudget(budgetMs)
     if (!autoDig) return await sess.bot.walkTo(target, { ...opts, noDig: opts.noDig !== false, budget: total })
+    /* 🔴 2026-10-27 实机（用户：「水里用 move」）：`noDig:true` 那套"先一格不挖试 40%、走不通再改成挖穿"
+     *   在**深水**里毫无意义 —— 水格挖不动也绕不开，游泳是唯一的路。以前照样按 40% 试、失败再来一遍，
+     *   实测 5 次 `swim-budget` 全是 `budgetMs × 0.4`（9000→3.8 秒、10000→4.0 秒）：一条 20 格的河
+     *   被切成两段各 3~4 秒，模型得连叫三次才过。深水里直接一遍吃满预算（第二遍对游泳没有新信息）。 */
+    let deepWater = false
+    try { deepWater = inWaterNow(sess?.bot) && sess?.bot?.entity?.onGround !== true } catch { deepWater = false }
+    if (deepWater) return await sess.bot.walkTo(target, { ...opts, noDig: true, budget: total })
+    const secOf = (ms) => `${(Math.max(0, Math.round(ms / 100)) / 10).toFixed(1)} 秒`
     const t0 = Date.now()
-    const first = await sess.bot.walkTo(target, { ...opts, noDig: true, budget: Math.max(1500, Math.min(Math.floor(total * 0.4), total - 1500)) })
-    if (!autoDigWorth(first)) return first
+    /* 第一遍（一格不挖）只分 40%：优先让它绕路。剩下的时间一定留给"挖穿"那一遍，
+     * 别再出现"第一遍 4 秒超时、剩下 6 秒白扔"（2026-10-28 实机）。 */
+    /* 🔴 2026-10-28（用户：「刚刚的 move 就给 4 秒」）：这里以前把第一遍切成 `total × 0.4`
+     *    —— 10 秒的预算第一遍只有 4 秒，用户看到的就是"move 只给 4 秒"。
+     *    现在第一遍**直接吃满**：真走不通会很快返回（实测 NoPath 0.3 秒），剩下的时间自然
+     *    全留给"挖穿"那一遍；而"一直在走、只是没走到"本来就不该被切碎。
+     *    第二遍的门槛提到 3 秒 —— 剩不到 3 秒挖穿也挖不了几块，白折腾。 */
+    const first = await sess.bot.walkTo(target, { ...opts, noDig: true, budget: total })
+    if (!autoDigWorth(first)) return { ...first, budgetPlan: { totalMs: total, trialMs: total } }
     const left = total - (Date.now() - t0)
-    if (left < 1500) return first
+    if (left < 3_000) return { ...first, budgetPlan: { totalMs: total, trialMs: total, digMs: 0 } }
     const second = await sess.bot.walkTo(target, { ...opts, noDig: false, budget: left })
     if (second?.arrived === true) {
       return {
         ...second,
         autoDug: true,
-        hint: [second.hint, '（默认不挖走不通，已自动改成挖穿挡路的方块过去）'].filter(Boolean).join(' '),
+        budgetPlan: { totalMs: total, trialMs: total, digMs: left },
+        hint: [second.hint, `（这一轮一共 ${secOf(total)}：先试"不挖绕路"没成，最后 ${secOf(left)} 改成挖穿挡路的方块过来的）`].filter(Boolean).join(' '),
       }
     }
     return {
       ...first,
       autoDugTried: true,
-      hint: [first.hint, `（不挖和挖穿都试过了，还是没到：${first.reason ?? '未知原因'}）`].filter(Boolean).join(' '),
+      budgetPlan: { totalMs: total, trialMs: total, digMs: left },
+      hint: [first.hint, `（这一轮一共 ${secOf(total)}：先试不挖绕路、再用 ${secOf(left)} 挖穿，都没到：${second?.reason ?? first.reason ?? '未知原因'}）`].filter(Boolean).join(' '),
     }
   }
 
@@ -3040,6 +3063,9 @@ export function apply(ctx, rawConfig) {
          * 同一个朝向两个口径会让模型读错。统一成度。 */
         `朝 yaw ${Math.round((((s.yaw * 180) / Math.PI) % 360 + 360) % 360)}° / pitch ${Math.round((s.pitch * 180) / Math.PI)}°`,
         `血 ${round2(s.health)}/20`, `食 ${s.food}`, `手 ${s.held ?? '空'}`,
+        /* 🔴 2026-10-27 实机：AI 从岩浆爬出来后「脚还在岩浆边就停下吃东西，直接烧死了」。
+         *   `entity.fire`（身上着火）必须在状态里出现，否则模型不知道自己还在烧。 */
+        ...(s.fire === true ? ['🔥 **身上还在烧**（刚从岩浆/火里出来，别停下吃东西：先走到水里或空地，火灭了再干别的）'] : []),
         `${s.gamemode ?? '?'} / ${s.dimension ?? '?'} / 时间 ${s.time ?? '?'}`,
       )
       // 在水里就把氧气一起报出来：淹死 = 氧气掉到 0 之后开始掉血，不报这一项 AI 看不出自己快淹死了。
@@ -3050,8 +3076,8 @@ export function apply(ctx, rawConfig) {
           ? '，头在水下（憋气中）'
           : (s.submerged === false ? '，头在水面上' : '')
         bits.push(s.air == null
-          ? `在水里${head || '（读不到氧气读数）'}${s.submerged === true ? '：mc_move {"mode":"swim"} 上浮' : ''}`
-          : `在水里（氧气 ${s.air}/20${s.air <= 6 ? '，快淹死了：mc_move {"mode":"swim"} 上浮' : ''}）${head}`)
+          ? `在水里${head || '（读不到氧气读数）'}${s.submerged === true ? '（游泳会自己上浮换气）' : ''}`
+          : `在水里（氧气 ${s.air}/20${s.air <= 6 ? '，快淹死了：直接 mc_move 到岸上，路上自己会上浮' : ''}）${head}`)
       }
     } else {
       bits.push('不在游戏里')
@@ -4076,8 +4102,8 @@ export function apply(ctx, rawConfig) {
   ctx.tools.register(asTool({
     name: 'mc_move',
     description: '移动。mode="walk" 走过去（自动避障；**在水里会自动改成"直接游"**）；mode="fly" 创造直飞（约 9 格/秒，会先发飞行权限包）；'
-      + 'mode="jump" 原地跳一下（不需要坐标）；'
-      + 'mode="swim" 在水里游到 x/y/z（不给坐标就只上浮换气）。\n'
+      + 'mode="jump" 原地跳一下（不需要坐标）；\n'
+      + '在水里不用选模式：给 x/y/z 就自己游过去（默认一直浮在水面，不会沉下去）。\n'
       + 'mode="boat" 开船（先 use 上船；下船用 mode="dismount"）。\n'
       + '🔴 **一次只走 10 秒**。没走到返回 `arrived:false`+`remaining`+`hint`——**再叫一次往同一目标走**。\n'
       + '🔴 默认不垫 1×1 柱（`allowTower:true` 才允许）；上高处走斜台阶会报 `pillaredWith`。\n'
@@ -4085,7 +4111,7 @@ export function apply(ctx, rawConfig) {
       + '🔴 走不动会分清挡着的是什么：`entity`（实体，别挖）/ `lava`（岩浆，挖不动）/ `waiting_chunks`（区块没加载，等）/ `stepUp`（一格台阶）。\n'
       + '🧭 `intent` 决定"到"的标准：near（默认）/ stand / interact（2.2 格）/ same-level。\n'
       + '🔴 **长程赶路只给 x/z 就够**（`xz:true`）：不必猜高度，按"到那一列"算（哪一层由寻路器定）—— 别编个 y 把自己挂半空。**给了 y 就按 y 走，xz 被忽略。**\n'
-      + '🔴 没走到时报 `pathLen`（剩余路径几格）+ `estCalls`（还要几次调用，一次 10 秒 ≈ 43 格）。\n'
+      + '🔴 没走到时报 `pathLen`（剩余路径几格）+ `estCalls`（还要几次调用，一次 10 秒 ≈ 24 格）。\n'
       + '🔴 结果带 `above`（头顶净空 `headroom` / `canJump`）：`canJump:false` 就是跳不起来（`note` 说哪格堵着），先挖开或换落点，别反复 `mode:"jump"`。\n'
       + '🔴 掐断报 `reason:"walk-hung"`（服务端不回包，不是路不通）；`digStalled`=挖方块卡在回包上。别原样第三次重叫。\n'
       + '🔴 **卡住时按执行顺序升**（`planStep`=最后试的那级）：允许挖（`noDig:false`，或自动升级那一遍）时 开门→重算→跳→**挖**→后退→绕行→垫柱；'
@@ -4095,10 +4121,10 @@ export function apply(ctx, rawConfig) {
       x: { type: 'number' },
       y: { type: 'number', description: '脚底那格：y=77 站在 76 的方块上，不是 76 那块' },
       z: { type: 'number' },
-      mode: { type: 'string', description: 'walk / fly / jump / swim / boat（创造缺省 fly；jump 不需坐标；swim 不给坐标=只上浮换气；boat 要先上船）' },
+      mode: { type: 'string', description: 'walk / fly / jump / boat（创造缺省 fly；jump 不需坐标；boat 要先上船；水里自动游，没有 swim）' },
       noDig: { type: 'boolean', description: '走路时挖不挖方块（**默认不挖**，只绕路；绕不过去会自动改成挖穿再走一遍）；写 false = 第一遍就允许挖，而且**按最短路线挖**（该挖就挖，不再优先绕路）' },
       xz: { type: 'boolean', description: '长程赶路：只给 x/z 就够（按"到那一列"算 GoalXZ）；给了 y 就按 y 走；写 false 等于必须给 y；fly/boat 仍必须给 y' },
-      budgetMs: { type: 'number', description: 'walk/swim 最长时间（≤10000）；swim 上浮默认 9000' },
+      budgetMs: { type: 'number', description: '走路/游泳最长时间（≤10000）' },
       waterRecover: { type: 'boolean', description: '游不动时自动找出口（默认 true）' },
       allowTower: { type: 'boolean', description: '允许垫 1×1 柱往上爬（默认不许，容易摔死）' },
       intent: { type: 'string', description: 'near（默认）/ stand / interact / same-level' },
@@ -4115,13 +4141,11 @@ export function apply(ctx, rawConfig) {
        *   唯一区别是硬盖住 `noDig:false`，而默认本来就不挖，留着只会让人多学一个值。 */
       const noDig = args.noDig !== false
       if (mode === 'jump') return { ...(await sess.bot.jump()), ...aroundOf(sess) }
-      if (mode === 'swim') {
-        // 给了坐标 = 游过去（walkTo 在水里会自动走"直接游"那条）；没给 = 只上浮换气
-        if (args.x !== undefined && args.y !== undefined && args.z !== undefined) {
-          return { ...withOutcome(await sess.bot.walkTo(coordOf(args), { budget: callBudget(args.budgetMs), noTower: args.allowTower !== true, noDig, intent: intentArgOf(args.intent), waterRecover: typeof args.waterRecover === 'boolean' ? args.waterRecover : undefined }), { expect: 'moved' }), ...aroundOf(sess) }
-        }
-        return { ...withOutcome(await sess.bot.swimUp({ hold: callBudget(args.budgetMs ?? 9_000) }), { expect: 'moved' }), ...aroundOf(sess) }
-      }
+      /* 🔴 2026-10-27（用户 m05868：「把 mode swim 去掉」）：这个分支删了。
+       *   给坐标那条本来就等于 `walkTo`（人在水里会自动走"直接游"那条，见 movement.mjs 的
+       *   `walkToOnce` 游泳分支）；不给坐标那条只是上浮换气 —— 而上浮现在由游泳循环自己保：
+       *   在水里一律按着 jump 浮着（`swimJumpWanted`），空气低于 `SWIM_MIN_AIR` 之前也会先浮上去。
+       *   于是"游泳"不再是一个模式，游不游由**人在哪儿**决定。 */
       /* 🔴 2026-10-23（P0-a，用户 m00634）：允许**只给 x/z** —— 长程目标的 y 是猜的，
        *    以前强制三维点等于逼 AI 编一个高度（编高就垫方块上天、编低就 NoPath）。
        *    `xz:true` 或"给了 x/z 没给 y"都按"到那一列"算；替换成的 y 只是**当天的脚下高度**，
@@ -4138,7 +4162,7 @@ export function apply(ctx, rawConfig) {
       }
       const wantsXZ = !yGiven
       if (args.x === undefined || args.z === undefined) {
-        throw new Error('walk/fly 需要 x/z；只想跳一下请给 mode:"jump"，在水里上浮请给 mode:"swim"')
+        throw new Error('walk/fly 需要 x/z；只想跳一下请给 mode:"jump"（水里会自动游，没有 swim）')
       }
       const target = wantsXZ
         ? { x: numOf(args.x, 'x'), y: Math.floor(Number(sess.bot.bot?.entity?.position?.y ?? 64)), z: numOf(args.z, 'z') }
@@ -4154,7 +4178,7 @@ export function apply(ctx, rawConfig) {
         if (wantsXZ) throw new Error('boat 要有终点高度，必须给 y（xz:true 只对 walk 有效）')
         return { ...withOutcome(await sess.bot.driveBoat(target, { arrive: args.intent === 'stand' ? 1.2 : 2, budget: callBudget(args.budgetMs) }), { expect: 'moved' }), ...aroundOf(sess) }
       }
-      if (use !== 'walk') throw new Error(`未知 mode："${use}"（可用 walk / fly / jump / swim / boat）`)
+      if (use !== 'walk') throw new Error(`未知 mode："${use}"（可用 walk / fly / jump / boat）`)
       /* 2026-10-25：走不通就自动改成「挖穿挡路的方块」再走一次（显式 `noDig:false` 除外）。 */
       return { ...withOutcome(await walkWithAutoDig(sess, target, { noDig, noTower: args.allowTower !== true, intent: intentArgOf(args.intent), waterRecover: typeof args.waterRecover === 'boolean' ? args.waterRecover : undefined, xz: wantsXZ }, args.budgetMs, noDig === true), { expect: 'moved' }), ...aroundOf(sess) }
     },
@@ -4369,12 +4393,14 @@ export function apply(ctx, rawConfig) {
     name: 'mc_attack',
     description: '**打实体**：中英文名都认，24 格内会追上去；不给 who 就按 priority 挑。\n'
       + '· `kite:true` 放风筝：近战怪打一下退一步。\n'
+      + '· `stand:true` 站桩：一步不挪，只打 4.5 格内（自己搭个 2 格高小平台钻进去打末影人就靠它；够不着就原地等它走近）。\n'
       + '· 血 < 12、身边两只以上怪、或者碰上苦力怕/骷髅/女巫/末影人 —— 先撤，别硬打。\n'
       + '· 打完顺手报 Boss 血条（有 boss 在场时）。',
     parameters: {
       who: { type: 'string', description: '玩家/实体名（中英文都认）' },
       priority: { type: 'string', description: '选目标：threat(默认)/nearest/weakest(血最少)' },
       kite: { type: 'boolean', description: '放风筝：近战怪打一下退一步' },
+      stand: { type: 'boolean', description: '站桩：一步不挪，只打 4.5 格内的（默认 false）' },
     },
     output: text(undefined, (a, v) => String(v?.text ?? compactJson(v))),
     timeoutMs: CALL_MS + 1_000,

@@ -349,13 +349,19 @@ async function shootInner (b, args = {}, ctx = {}) {
     const c = Math.cos(pitch)
     const v = new Vec3(-Math.sin(yaw) * c * speed, Math.sin(pitch) * speed, -Math.cos(yaw) * c * speed)
     const p = from.clone()
-    const reach = from.distanceTo(to) + 3
+    /* 🔴 2026-10-28（用户：「平视 5 格也报弹道被方块挡」）：以前 `reach = 距离 + 3` —— 采样会
+     *    **越过目标再往后飞 3 格**。目标贴着墙/柱子站时，背后那格实心方块就被当成"挡在弹道上"
+     *    ⇒ 5 格平射也报挡。现在只采到目标为止（留 0.15 格余量，免得终点正好压在格边界上）。 */
+    const reach = Math.max(0.5, from.distanceTo(to) + 0.5)
+    const tgtCell = `${Math.floor(to.x)},${Math.floor(to.y)},${Math.floor(to.z)}`
     let unknown = false
     /* 只跳过"自己站的那一格"（约 0.3 格），原来写 1.3 —— 紧贴着脸的墙（1 格）整段被跳过 ⇒ 漏检。 */
     const probe = (sx, sy, sz) => {
       const d = Math.hypot(sx - from.x, sy - from.y, sz - from.z)
       if (d < 0.6) return null
       if (d > reach) return 'done'
+      /* 目标自己所在的那一格不算"挡"（水晶底座、怪站的地面都在这一格里）。 */
+      if (`${Math.floor(sx)},${Math.floor(sy)},${Math.floor(sz)}` === tgtCell) return null
       let blk = null
       try { blk = b.blockAt(new Vec3(Math.floor(sx), Math.floor(sy), Math.floor(sz))) } catch { blk = null }
       /* 读不到（区块没加载）≠ 没有：记一笔继续往后看，一路都读不到才算"不知道"。 */
@@ -474,8 +480,19 @@ async function shootInner (b, args = {}, ctx = {}) {
       const scan = solveArrowAll({ from, to: base?.aim ?? to, speed: spd0 })
       if (!scan) return null
       const tol = Math.max(0.4, Number(ctx?.maxAimError ?? 0.4) + 0.6)
-      for (const c of scan.cands) {
-        if (!(c.err <= tol)) continue
+      /* 🔴 2026-10-28（用户：「shoot 之前有射着射着突然往天上射，不知道射什么」）：
+       *    以前按 `scan.cands` 的**原顺序**挑第一条合格的 —— 里面从近乎直射到 70°+ 的高抛都有，
+       *    挑到哪条看运气。近距离被 1 格台阶挡一下，就可能挑到 60°+ 的"往天上抛"，实机上就是
+       *    "突然往天上射一箭"。现在：① 先按 |仰角| 从小到大排（能直射就直射）；
+       *    ② 目标不在高处（上方 4 格以内）时，仰角 > 70° 的解一律不采用 —— 那是抛物线打远靶的
+       *    角度，近距离只会让箭飞向天上再落回来。 */
+      const upNeeded = (to.y - from.y) > 4
+      const dist0 = from.distanceTo(to)
+      const cands = scan.cands.filter((c) => c.err <= tol).sort((x, y) => Math.abs(x.deg) - Math.abs(y.deg))
+      for (const c of cands) {
+        /* 近距离（≤12 格）用不着大仰角 —— 那是用户说的"往天上射"；远靶才允许到 85°。 */
+        const maxDeg = dist0 <= 12 ? 60 : 85
+        if (!upNeeded && c.deg > maxDeg) continue
         if (blockedAlong(c.pitch, scan.yaw, to, spd0)) continue
         return {
           yaw: scan.yaw,

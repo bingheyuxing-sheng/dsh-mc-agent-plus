@@ -723,5 +723,20 @@ section('㉑ 弹道被方块挡着 ⇒ 不放箭，并说清挡在哪一格')
   }
 }
 
+/* 🔴 2026-10-28 实机（用户：「平视 5 格也报弹道被方块挡」+「射着射着突然往天上射」）：
+ *   ① 采样以前会**越过目标再飞 3 格** —— 目标背后贴着墙时把墙当成挡路；
+ *   ② 候选弹道以前按数组原顺序挑，可能挑到 60°+ 的高抛 ⇒ 实机上"突然朝天上射一箭"。
+ *   这两条把修好的行为钉住。 */
+const { readFile: rfSrc } = await import('node:fs/promises')
+const shootSrc = await rfSrc(new URL('../src/shoot.mjs', import.meta.url), 'utf8')
+ok(/const reach = Math\.max\(0\.5, from\.distanceTo\(to\) \+ 0\.5\)/.test(shootSrc),
+  '弹道采样只到目标为止（不再越过目标往后飞 3 格，避免把目标背后的墙当成挡路）')
+ok(/const tgtCell = /.test(shootSrc) && /=== tgtCell\) return null/.test(shootSrc),
+  '目标自己所在的那一格不算挡（水晶底座、怪站的地面都在那一格）')
+ok(/\.filter\(\(c\) => c\.err <= tol\)\.sort\(\(x, y\) => Math\.abs\(x\.deg\) - Math\.abs\(y\.deg\)\)/.test(shootSrc),
+  '候选弹道按仰角从小到大挑（能直射就直射，不再按数组原顺序碰运气）')
+ok(/const maxDeg = dist0 <= 12 \? 60 : 85/.test(shootSrc) && /if \(!upNeeded && c\.deg > maxDeg\) continue/.test(shootSrc),
+  '近距离（≤12 格）不用 >60° 的仰角解（"往天上射"的根源），远靶才放宽到 85°')
+
 console.log(`\n${fail ? '❌' : '✅'} ${pass} 通过 / ${fail} 失败`)
 process.exit(fail ? 1 : 0)

@@ -64,6 +64,9 @@ import {
 import { Vec3 } from 'vec3'
 import { BRIDGE_FATAL } from './bridge.mjs'
 import { isLiquid, isPassable, isSolidBlock } from './block-names.mjs'
+/* 🔴 2026-10-28（用户：「有高低差呢」）：近战以前只判距离，隔着一层地板/墙照挥 ——
+ *    `losBlockerAlong` 已经在 `mining.mjs` 里（眼到目标 7 点采样，只认实心方块），直接复用。 */
+import { losBlockerAlong } from './mining.mjs'
 
 /**
  * 挨打记录：`bot → { at, health }` 上一次看到的样子。
@@ -147,13 +150,49 @@ function kiteSpotOf (b, target, { distance = KITE_DISTANCE } = {}) {
   return null
 }
 
-export async function attack (b, { who = null, budget = 20_000, kite = false, priority = 'threat' } = {}, ctx = {}) {
+/** 玩家脚下往上还有几格能站（1 = 只有脚下这一格；2 = 用户要的"2 格洞"；>=3 = 头顶没封）。
+ *  🔴 2026-10-27：`stand` 是给"在头顶搭个小平台、站在 2 格洞里打末影人"用的 ——
+ *    末影人 3 格高进不来，所以"头顶到底封没封"才是这套打法成不成立的前提，必须如实报出来。
+ *  🔴 `b.blockAt()` 只认真 Vec3：这里必须用 `position.offset()`，喂普通 `{x,y,z}` 会报 `pos.floored is not a function`。 */
+export function standHeadroomOf (b) {
+  const p = b?.entity?.position
+  if (!p || typeof p.offset !== 'function' || typeof b.blockAt !== 'function') return null
+  let h = 1
+  for (let i = 1; i <= 4; i++) {
+    let blk = null
+    try { blk = b.blockAt(p.offset(0, i, 0)) } catch { return null }
+    if (!blk) return null
+    if (blk.boundingBox === 'empty') h++
+    else break
+  }
+  return h
+}
+
+export async function attack (b, { who = null, budget = 20_000, kite = false, priority = 'threat', stand = false } = {}, ctx = {}) {
+  /* 🔴 2026-10-27（用户 m05940 + m06001）：`stand:true` = **这一步一步都不许挪**。
+   *   目的不是"走近打"，是用户自己在头顶搭个 2 格高的小平台钻进去打末影人（末影人 3 格高进不来）。
+   *   所以：① 不走 `ctx.moveTo`（reposition / kite 全跳过）；② 不用 pvp 插件（GoalFollow 会拽着人追）；
+   *   ③ 出手前自己 `lookAt`（手动分支原来不看方向，站着不动更容易打空）；④ 够不着就原地等它来。 */
+  const standMode = stand === true
   const needle = who ? String(who).trim().toLowerCase() : null
   const alias = needle ? NAME_ALIAS[needle] : null
-  const hasPvp = Boolean(ctx.hasPvp) && typeof b.pvp?.attack === 'function'
+  /* 🔴 站桩不能用 pvp：`bot.pvp.attack()` 内部是 GoalFollow，会把人拽着追过去 —— 一站桩就失效。 */
+  const hasPvp = Boolean(ctx.hasPvp) && typeof b.pvp?.attack === 'function' && !standMode
   /* 🔴 位置要**每次现读**（`b.entity.position` 是活的）——
    *    旧写法在函数开头 `const me = b.entity.position` 抓一次，走位之后就过期了。 */
   const distOf = (e) => { try { return e.position.distanceTo(b.entity.position) } catch { return Infinity } }
+  /** 眼睛 → 目标之间有没有实心方块挡着（`null` = 看得见）。 */
+  const losBlockOf = (e) => {
+    try {
+      const p = b.entity?.position
+      const tp = e?.position
+      if (!p || !tp) return null
+      const eh = Number(b.entity?.height) > 0 ? Number(b.entity.height) : 1.8
+      const from = new Vec3(p.x, p.y + eh * 0.85, p.z)
+      return losBlockerAlong(b, from, Math.floor(tp.x), Math.floor(tp.y), Math.floor(tp.z),
+        { fx0: Math.floor(p.x), fy0: Math.floor(p.y), fz0: Math.floor(p.z) })
+    } catch { return null }
+  }
   /* 🔴 2026-10-18：快照改成**可刷新**的（目标跑了要能换下一只 —— 用户转来游戏里 AI 的原话
    *    「目标跑了也不换目标，这一轮就废了」）。原来 `all/list/pick/target` 在开头算一次就再也不变。 */
   const snapshotAll = () => Object.values(b.entities ?? {})
@@ -318,9 +357,23 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
 
   /** 这次调用还剩多少总预算（每一轮进攻都从这里面扣，不能每轮各拿一份满预算） */
   const budgetLeft = () => Math.max(0, budget - (Date.now() - t00))
-  /** 这一个进攻阶段的时间上限：**比总预算短**，否则"重新观察"永远不会发生（见 COMBAT_PHASE_MS 注释）。
-   *  放风筝时再压到 1.3 秒：节奏是"打一两下 → 退一步"，不是"顶 3 秒 → 退一次"。 */
-  const phaseMs = () => callBudget(Math.min(budgetLeft(), kite ? Math.min(COMBAT_PHASE_MS, KITE_STEP_MS + 100) : COMBAT_PHASE_MS), 4_000)
+  /** 这一个进攻阶段的时间上限 —— **吃满这一轮剩下的**（留 300ms 收尾）。
+   *
+   *  🔴 2026-10-28（用户：「你刚刚改了什么，attack 现在基本用不了，① mc_attack 每次只给
+   *     1.2 秒追击窗口」）：以前非站桩一律压到 `COMBAT_PHASE_MS`(1.2 秒)。可 pvp 那条路
+   *     **打完一个相位就 return** —— 一次 `mc_attack` 只有 1.2 秒在打，再加上"先走近"
+   *     花掉的几秒，用户看到的就是"1.2 秒追击窗口"。
+   *     现在：打满剩余；`COMBAT_PHASE_MS` 只留给放风筝的节奏（打一两下 → 退一步）。
+   *     "每 N 秒重新评估"仍然成立 —— 那是策略循环的活，不是拿预算去卡它。
+   */
+  const phaseMs = () => callBudget(
+    Math.min(
+      budgetLeft(),
+      ctx.callLeft() - 300,
+      kite ? Math.min(COMBAT_PHASE_MS, KITE_STEP_MS + 100) : Number.MAX_SAFE_INTEGER
+    ),
+    4_000
+  )
 
   /** 有 pvp：交给插件追+打，自己等到"目标没了 / 这一轮用完"
    *  `opts.shield`：这一轮值得举盾吗（副手有盾 + 目标近战贴脸 / 远程在射我 / 被围） */
@@ -364,6 +417,15 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
     let lastDist = distOf(target)
     const hpStart = Number(b.health)
     try {
+      /* 🔴 2026-10-28（用户：「有高低差呢」）：pvp 的挥拳只判**距离**，不管中间有没有东西 ——
+       *    隔着一层地板/墙时它照样空打到预算耗尽。这里先做视线检查，被挡就不进战斗。 */
+      const los0 = losBlockOf(target)
+      if (los0) {
+        throw Object.assign(new Error(
+          `眼睛到「${label}」之间隔着 ${los0.blocker}（${los0.at.x},${los0.at.y},${los0.at.z}）`
+          + ' —— 挥了也是空；先挖开那一格，或者绕到能看见它的位置再打'
+        ), { mcLos: true })
+      }
       await b.pvp.attack(target)
       while (Date.now() - t0 < bd) {
         if (ctx.abortSignal?.aborted) break
@@ -433,8 +495,11 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
     if (!gone && !pvpErr && !hardHurt && !chaseGiveUp) {
       note = inRange
         ? `打了 ${(waitedMs / 1000).toFixed(1)} 秒还没打死（这一轮的时间到了）—— 再叫一次 mc_attack 接着打`
-        : `追了 ${(waitedMs / 1000).toFixed(1)} 秒还没进到攻击距离（3.5 格）—— 走不过去 / 被方块挡住 / 目标跑太快；`
-          + '先 mc_move 到它旁边，或者换个近一点的目标'
+        /* 🔴 2026-10-27：以前这里只能三选一瞎猜（"走不过去 / 被方块挡住 / 目标跑太快"）——
+         *   现在追击是自己走过去的，走不动的原因能直接带出来（NoPath / 卡住 / 目标在飞）。 */
+        : `追了 ${(waitedMs / 1000).toFixed(1)} 秒还没进到攻击距离（3.5 格）—— `
+          + (moveErr ? `走近时失败：${moveErr}` : '走不过去 / 被方块挡住 / 目标跑太快')
+          + '；先 mc_move 到它旁边，或者换个近一点的目标'
     }
     return {
       attacked: label, distance: d, killed, gone, health: b.health, via: 'pvp', waitedMs,
@@ -458,6 +523,7 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
     const leftMs2 = ctx.callLeft() - 400
     const bd = leftMs2 <= 100 ? 0 : Math.max(0, Math.min(phaseMs(), leftMs2))
     let swings = 0
+    let losBlocked = null
     let sawDamage2 = false
     let hardHurt = false
     let lastHp2 = hpBefore
@@ -470,10 +536,31 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
     /* 挥砍节奏按**手里那把**算（剑 700ms / 斧 1250ms / 镐 850ms / 空手 250ms，含 1 tick 余量，见 src/combat-timing.mjs）。
      * 旧版写死 620ms：拿斧或铲时每次都在冷却没满时挥 —— 那一刀是**打折伤害**。 */
     let swing = swingCooldownMsOf(b)
+    /* 站桩：不追，等目标自己走进 4.5 格（末影人会自己凑过来；追过去就掉出那个 2 格洞了）。 */
+    const waitFrom = Date.now()
+    if (standMode) {
+      while (Date.now() - t0 < bd && distOf(target) > 4.5) {
+        if (ctx.abortSignal?.aborted) break
+        if (!b.entities?.[target.id] || target.isValid === false) break
+        await sleep(150)
+        sample()
+      }
+    }
+    const waitedMs = standMode ? Date.now() - waitFrom : 0
     while (Date.now() - t0 < bd) {
       if (ctx.abortSignal?.aborted) break
       if (!b.entities?.[target.id] || target.isValid === false) break
       if (distOf(target) > 4.5) break
+      /* 隔着方块就不挥（挥了也是空，而且看不出原因） */
+      const losM = losBlockOf(target)
+      if (losM) { losBlocked = losM; break }
+      /* 🔴 手动分支原来直接 `b.attack()`，不看方向 —— 目标在头顶上方时就是空挥。站桩尤其要抬头。 */
+      if (standMode && typeof b.lookAt === 'function' && target.position) {
+        try {
+          const eh = Number(target.height) > 0 ? Number(target.height) : 1.8
+          await b.lookAt(target.position.offset(0, Math.min(1.3, eh * 0.5), 0))
+        } catch { /* 看不过去也照打，别因为转头失败就不出手 */ }
+      }
       await ctx.t(Promise.resolve(b.attack(target)), 'attack', `攻击 ${label}`)
       swings++
       swing = swingCooldownMsOf(b)
@@ -504,10 +591,32 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
      *    —— `gone && !killed` 那句"别当成打死了"在挨打时永远看不到。合成一条。 */
     const notes = []
     if (gone && !killed) notes.push('目标不见了，但**没读到过它掉血** —— 说不清是我打死的还是它走远/区块卸载了（别当成打死了）')
+    if (losBlocked) notes.push(`眼睛到「${label}」之间隔着 **${losBlocked.blocker}**（${losBlocked.at.x},${losBlocked.at.y},${losBlocked.at.z}）—— 这一轮一下都没挥（挥了也是空）；先挖开它，或者换个能看见目标的身位`)
     if (hardHurt) notes.push(`这一轮挨了 ${(hpStart - Number(b.health)).toFixed(0)} 点伤害 —— 血掉太快，提前收手`)
+    const nowDist = distOf(target)
     return {
       attacked: label, distance: d, swings, killed, gone, health: b.health,
+      ...(losBlocked ? { losBlocked: { x: losBlocked.at.x, y: losBlocked.at.y, z: losBlocked.at.z, name: losBlocked.blocker } } : {}),
       ...(notes.length ? { note: notes.join('；') } : {}),
+      ...(standMode
+        ? {
+            stood: true,
+            standAt: b.entity?.position
+              ? { x: Math.floor(b.entity.position.x), y: Math.floor(b.entity.position.y), z: Math.floor(b.entity.position.z) }
+              : null,
+            ...(standHeadroomOf(b) != null ? { headroom: standHeadroomOf(b) } : {}),
+            ...(waitedMs ? { waitedMs } : {}),
+            ...(swings === 0
+              ? {
+                  outOfReach: {
+                    distance: Number(nowDist.toFixed(1)),
+                    targetY: Math.floor(target.position.y),
+                    myY: Math.floor(b.entity?.position?.y ?? 0),
+                  },
+                }
+              : {}),
+          }
+        : {}),
       ...(pickup ? { pickup } : {}),
       ...(drops.length ? { drops } : {}),
       _sawDamage: sawDamage2, _inRange: inRange, _gone: gone, _killed: killed, _hardHurt: hardHurt,
@@ -691,7 +800,11 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
     if (step.action === 'complete') break
 
     /* ── 够不着，试够了 ── */
-    if (step.action === 'stop') { unreachable = true; break }
+    if (step.action === 'stop') {
+      /* 站桩：策略层说"够不着"不算这一轮失败 —— 这一轮本来就是要站在洞里等它来。 */
+      if (!standMode) { unreachable = true; break }
+      actions.push('hold')
+    }
 
     /* ── 换武器 ── */
     if (step.action === 'equip') {
@@ -716,15 +829,67 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
 
     /* ── 重新找位 ── */
     if (step.action === 'reposition') {
-      if (!canMove) { unreachable = true; moveErr = '够不着，但这次调用没给我移动能力（ctx.moveTo 不在）'; break }
-      const mp = b.entity?.position
-      const tp = target.position
-      const pt = mp && tp ? approachPointOf({ x: mp.x, y: mp.y, z: mp.z }, { x: tp.x, y: tp.y, z: tp.z }, 3) : null
-      if (!pt) { unreachable = true; moveErr = '算不出往哪挪（我和目标位置重合）'; break }
-      try { await ctx.moveTo(pt, { reason: `战斗走位：${step.why}` }) } catch (e) { moveErr = String(e?.message ?? e) }
-      mem.repositions++
-      mem.lastInRange = null
-      continue
+      /* 🔴 站桩：一步都不挪 —— 直接落到下面的"进攻"，由进攻段原地等目标走近。
+       *   挪一下就走出了那个 2 格洞，防护立刻失效（用户 m06001 的用法就是这样）。 */
+      if (standMode) {
+        actions.push('hold')
+      } else {
+        if (!canMove) { unreachable = true; moveErr = '够不着，但这次调用没给我移动能力（ctx.moveTo 不在）'; break }
+        const mp = b.entity?.position
+        const tp = target.position
+        const pt = mp && tp ? approachPointOf({ x: mp.x, y: mp.y, z: mp.z }, { x: tp.x, y: tp.y, z: tp.z }, 3) : null
+        if (!pt) { unreachable = true; moveErr = '算不出往哪挪（我和目标位置重合）'; break }
+        try { await ctx.moveTo(pt, { reason: `战斗走位：${step.why}` }) } catch (e) { moveErr = String(e?.message ?? e) }
+        mem.repositions++
+        mem.lastInRange = null
+        continue
+      }
+    }
+
+    /* ── 先追过去（这一步**有寻路**） ──
+     * 🔴 2026-10-27 实机（用户：「attack 好像没有寻路，老是被卡住」）：session-514c21b6 最近
+     *   2 小时的 8 次 `mc_attack` 里 5 次是「追了 1.2 秒还没进到攻击距离」→ `unreachable`
+     *   + `outcome:failed`，目标距离 4.1 / 6.7 / 7.2 / 11.6 格。
+     *   原因不是"没寻路"，而是当时"追"只交给 pvp 的 `GoalFollow`（裸跟：撞墙、遇水、遇沟、
+     *   遇高低差就干等），而会绕路/会挖/会搭/会跳的 `walkTo` 全程没参与 —— 目标在 7~11 格
+     *   时，每段 1.2 秒根本走不到位，8 轮全废。
+     *   ⇒ 3.6 格外先自己走过去（`ctx.moveTo` 就是现成 walkTo），到了再交给 pvp 挥拳。 */
+    if (!standMode && canMove && step.action !== 'equip') {
+      const d0 = distOf(target)
+      /* 🔴 2026-10-28（用户：「attack 现在基本用不了」）：门槛 5.5 → **8 格**，
+       *    而且只肯花 2 秒、并且**先给战斗留 2 秒**（`budgetLeft() - 2_000`）。
+       *    以前 5.5 格就先走近、最多吃 3 秒 —— 一次调用只有 10 秒，走近吃掉 3 秒、
+       *    战斗相位再被 1.2 秒封顶，等于"走过去站一下回来"。
+       *    6~8 格交给 pvp 的 GoalFollow 自己挪（它一秒能挪 3~4 格），真走不动再降级走近。 */
+      /* 🔴 2026-10-28（用户：「有高低差呢」）：pvp 的 `GoalFollow` 遇到高低差只会往上蹭/
+       *    往下等 —— 垂直方向它基本不自己解决。所以只要还没进攻击距离，差 2 格以上也先走上去
+       *    （我们的 walkTo 会跳、会挖、会垫）。 */
+      const dy0 = Math.abs(Number(target?.position?.y ?? 0) - Number(b.entity?.position?.y ?? 0))
+      if (d0 > 8 || (dy0 >= 2 && d0 > 3.5)) {
+        const mp = b.entity?.position
+        const tp = target.position
+        const pt = mp && tp ? approachPointOf({ x: mp.x, y: mp.y, z: mp.z }, { x: tp.x, y: tp.y, z: tp.z }, 2.2) : null
+        const pickMs = Math.min(budgetLeft() - 2_000, 2_000)
+        if (pt && pickMs >= 600) {
+          try {
+            await ctx.moveTo(pt, { arrive: 2.0, budget: pickMs, reason: `战斗接近：先走到「${label}」旁边` })
+            mem.approachFails = 0
+          } catch (e) {
+            moveErr = String(e?.message ?? e).slice(0, 140)
+            mem.approachFails = (mem.approachFails ?? 0) + 1
+          }
+          mem.repositions++
+          mem.lastInRange = null
+          actions.push('approach')
+          if ((mem.approachFails ?? 0) >= 3) {
+            unreachable = true
+            moveErr = `连续 3 次都走不到「${label}」旁边：${moveErr ?? '原因不明'}`
+            break
+          }
+          if (ctx.callLeft() <= 800) { timedOut = true; break }
+          continue
+        }
+      }
     }
 
     /* ── 进攻（一个阶段） ──
@@ -757,7 +922,7 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
      *   · 策略层没在建议撤/拉开距离（那说明该拉开 8 格，不是退 3 格，决策权在 AI）
      *   · 血还够（`HEALTH_LOW` 以下别再浪）
      *   · 这一步的预算够（不够就先打，别"退到一半时间没了"） */
-    if (kite && canMove && mem.kites < KITE_MAX &&
+    if (kite && !standMode && canMove && mem.kites < KITE_MAX &&
         !RANGED_RE.test(label) &&
         !(Number(b.health) <= HEALTH_LOW) &&
         foes.filter((f) => f.id !== target.id).length === 0 &&
@@ -788,6 +953,10 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
 
   /* ═══════════ ③ 组装结果 ═══════════ */
 
+  const standAt = standMode && b.entity?.position
+    ? { x: Math.floor(b.entity.position.x), y: Math.floor(b.entity.position.y), z: Math.floor(b.entity.position.z) }
+    : null
+  const headroom = standMode ? standHeadroomOf(b) : null
   const killed = last?._killed === true
   const gone = last?._gone === true
   const combat = combatOutcomeOf({
@@ -845,6 +1014,19 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
         }
       : {}),
     ...(unreachable ? { unreachable: true } : {}),
+    /* 站桩这一轮的账（用户 m05940/m06001：站在自己搭的 2 格洞里打末影人） */
+    ...(standMode
+      ? {
+          stood: true,
+          standAt,
+          ...(headroom != null ? { headroom } : {}),
+          ...(standAt && headroom != null && headroom < 2
+            ? { standWarn: `你站的地方只有 ${headroom} 格高 —— 自己都快站不下，先挖开头顶或换个位置` }
+            : headroom != null && headroom > 2
+              ? { standWarn: `你头顶还有 ${headroom - 1} 格空隙没封（能站高度 ${headroom} 格）—— 末影人 3 格高，进得来也够得到你。先封顶再来` }
+              : { standText: '站桩：头顶封到 2 格，末影人进不来；这一轮一步没挪' }),
+        }
+      : {}),
     ...(moveErr ? { strategyError: moveErr } : {}),
     /* 手里现在到底是什么 + 这一轮换过什么（用户 2026-10-19 要的"看得见"） */
     held: b.heldItem ? `${b.heldItem.name}x${b.heldItem.count ?? 1}` : '空手',

@@ -370,6 +370,17 @@ export async function breakBlock (self, { x, y, z, allowDangerous = false, noCle
 export const STAIR_MAX_STEPS = 64
 export const STAIR_STEP_MS = 3_000
 
+/* 🔴 2026-10-27 实机（两个会话 115 次 `mode:"stair"` 调用，57 次报"卡住"= 50%，用户：「一半是失败的」）：
+ *   其中 **41 次耗时 ≥9.5 秒** —— 每步平均 1.72 秒，10 秒预算只够 6 步，最后那一步必然越过预算边界：
+ *   循环顶部只在**开始前**看预算，而每步的 `walkTo` 又单独给 3 秒，于是"时间到"被写成"卡住"
+ *   （`!ok → reason = 'stuck'`）。模型看到"卡住"就去 mc_observe / 换方向，把还能接着挖的活丢掉。
+ *   现在：每步走路预算跟着剩余时间走（`STAIR_WALK_MS`），剩余不够一步就直接收工成 `budget`。 */
+export const STAIR_WALK_MS = 1_500
+export const STAIR_MIN_STEP_MS = 1_200
+/* 前方脚下是空的（地下矿洞遍地都是）时允许往下掉几格继续 —— 落差 ≤3 格不摔伤。
+ *   以前一律 `reason = 'no-floor'` 整趟放弃（实机 31/115 = 27%，用户只能原地重叫、方向不变又撞同一堵）。 */
+export const STAIR_DROP_OK = 3
+
 /** 朝哪挖：给了目标 x/z 用主轴；给了 dir（"x+"/"x-"/"z+"/"z-"）直接用；都没给按当前朝向 */
 export function stairDirOf (b, { pos = null, dir = null } = {}) {
   const p = b?.entity?.position
@@ -391,6 +402,26 @@ export function stairDirOf (b, { pos = null, dir = null } = {}) {
   const vx = -Math.sin(yaw); const vz = -Math.cos(yaw)
   if (Math.abs(vx) >= Math.abs(vz)) return { x: vx >= 0 ? 1 : -1, z: 0, name: 'x' + (vx >= 0 ? '+' : '-') }
   return { x: 0, z: vz >= 0 ? 1 : -1, name: 'z' + (vz >= 0 ? '+' : '-') }
+}
+
+/** 前方脚下是空的时，往下找"能站的层"（走过去会掉下去，掉 1~3 格不摔伤）。
+ *  返回 `{ stand, below }`（`stand` 是能站的那层 y，`below` 是脚下实心方块名）；
+ *  底下是液体 `{ liquid: true }`；落差超过 `maxDrop` 或落点被堵 `null`（⇒ 调用方按 no-floor 停）。
+ *  `blkAt(x, y, z)` 由调用方给（便于自检注假世界）。 */
+export function stairDropOf (blkAt, fx, fy, fz, { maxDrop = STAIR_DROP_OK } = {}) {
+  for (let stand = fy - 1; stand >= fy - maxDrop; stand--) {
+    const below = blkAt(fx, stand - 1, fz)
+    if (!below) return null
+    if (isLiquid(below.name)) return { liquid: true }
+    if (isAir(below.name)) continue
+    /* 落点那格 + 它头顶必须是空的，否则是"掉进一格缝里"，不硬落 */
+    const at = blkAt(fx, stand, fz)
+    const head = blkAt(fx, stand + 1, fz)
+    if (!at || !head) return null
+    if (!isAir(at.name) || !isAir(head.name)) return null
+    return { stand, below: below.name }
+  }
+  return null
 }
 
 export async function digStair (self, {
@@ -424,7 +455,8 @@ export async function digStair (self, {
   const blkAt = (x, y, z) => b.blockAt(new Vec3(x, y, z))
 
   while (steps < MAX) {
-    if (Date.now() - t0 > budgetMs) { reason = 'budget'; break }
+    /* 剩余时间不够走一步 ⇒ 直接收工成 budget（不再让 walkTo 越过预算边界后误判 stuck） */
+    if (budgetMs - (Date.now() - t0) < STAIR_MIN_STEP_MS) { reason = 'budget'; break }
     if (up ? cur.y >= ty : cur.y <= ty) { reason = 'done'; break }
     const fx = cur.x + d.x; const fz = cur.z + d.z
     /* 往上 / 往下各一步；脚下 (fy-1) 必须是实心（台阶面），不能踩空 */
@@ -438,7 +470,11 @@ export async function digStair (self, {
     const floor = blkAt(fx, fy - 1, fz)
     if (!floor) { reason = 'unloaded'; break }
     if (isLiquid(floor.name)) { reason = 'liquid'; break }
-    if (isAir(floor.name)) { reason = 'no-floor'; break }
+    /* 前方脚下是空的（矿洞）：不当场放弃 —— 挖完前面那几格再量落差，
+     * 能下去就下去（`stairDropOf`），落差太大或底下有液体才停。 */
+    const hollowAhead = !up && isAir(floor.name)
+    /* 往上挖时前方脚下空着是"没台阶面"，不能套用往下掉那套 —— 照旧停，别把上升挖成坠落。 */
+    if (up && isAir(floor.name)) { reason = 'no-floor'; break }
 
     /* 🔴 2026-10-26 实机（用户：「dig stair 往上挖还是只挖两格会被卡住」）：
      *   往上挖时只清了**前方**那 3 格，漏了"我自己得跳上去"这件事 —— 跳跃需要
@@ -469,29 +505,55 @@ export async function digStair (self, {
       }
     }
 
+    /* 前方原来是空的 ⇒ 量落差，找能站的层（往前走会掉下去，1~3 格不摔伤） */
+    let standY = fy
+    if (hollowAhead) {
+      const dr = stairDropOf(blkAt, fx, fy, fz)
+      if (!dr) { reason = 'no-floor'; break }
+      if (dr.liquid) { reason = 'liquid'; break }
+      standY = dr.stand
+      notes.push(`🕳 前方脚下是空的（矿洞），往前走会掉 ${cur.y - standY} 格到 y=${standY}`)
+    }
+    /* 每步走路预算跟着剩余时间走（以前固定 3 秒，最后一步必然越过总预算 ⇒ 被误判成卡住） */
+    const stepBudget = Math.max(600, Math.min(STAIR_WALK_MS, budgetMs - (Date.now() - t0)))
+
     let w = null
     try {
-      w = await self.walkTo({ x: fx, y: fy, z: fz }, { noDig: true, budgetMs: STAIR_STEP_MS, intent: 'stand' })
+      /* 🔴 2026-10-28 参数审计：这里原来写 `budgetMs:` —— `walkTo` 只认 `budget`，
+       *    多出来的键被静默丢掉，于是每步走路都用上了 `cfg.moveBudgetMs` 兜底值（40 秒），
+       *    一步就把整个 dig 调用的时间吃光，回来只会报"时间到/卡住"。 */
+      w = await self.walkTo({ x: fx, y: standY, z: fz }, { noDig: true, budget: stepBudget, intent: 'stand' })
     } catch (e) {
       notes.push(`⚠ 走过去失败：${e?.message ?? e}`)
     }
     steps++
     let now = b.entity.position.floored()
-    let ok = w?.arrived || (now.x === fx && now.z === fz && Math.abs(now.y - fy) <= 1)
-    if (!ok && Date.now() - t0 < budgetMs) {
+    let ok = w?.arrived || (now.x === fx && now.z === fz && Math.abs(now.y - standY) <= 1)
+    if (!ok && budgetMs - (Date.now() - t0) >= STAIR_MIN_STEP_MS) {
       /* 🔴 一次没上去就**再试一次**，别一步就判死。两个原因：
        *   ① movement 的上台阶动作是"先单独起跳、再叠 forward"（STEP_UP_JUMP_MS），
        *      窄井里第一次常常差一点；
        *   ② 刚清开的头顶方块可能还没同步到本地世界，第一次跳当然被顶回来。
        * 以前这里一次失败直接 `stuck` + break —— 用户看到的就是"卡住"。 */
       try {
-        const w2 = await self.walkTo({ x: fx, y: fy, z: fz }, { noDig: true, budgetMs: STAIR_STEP_MS, intent: 'stand' })
+        const w2 = await self.walkTo({ x: fx, y: standY, z: fz }, { noDig: true, budget: stepBudget, intent: 'stand' })
         now = b.entity.position.floored()
-        ok = w2?.arrived || (now.x === fx && now.z === fz && Math.abs(now.y - fy) <= 1)
+        ok = w2?.arrived || (now.x === fx && now.z === fz && Math.abs(now.y - standY) <= 1)
       } catch (e) { notes.push(`⚠ 再走一次也没成：${e?.message ?? e}`) }
     }
     cur = now
-    if (!ok) { reason = 'stuck'; break }
+    if (!ok) {
+      /* 🔴 时间到被砍断 ≠ 卡住。剩余时间不够再走一步时如实报 budget；
+       *   说成"卡住"会让模型去 mc_observe / 换方向，把本来接着叫一次就能挖完的活丢掉。 */
+      if (budgetMs - (Date.now() - t0) < STAIR_MIN_STEP_MS) { reason = 'budget'; break }
+      reason = 'stuck'
+      /* 真卡住要自带诊断：卡在哪、要去的那格是什么、自己头顶通不通 —— 省掉一趟 mc_observe */
+      const atName = blkAt(fx, standY, fz)?.name ?? '未加载'
+      const headName = blkAt(fx, standY + 1, fz)?.name ?? '未加载'
+      const myHead = blkAt(cur.x, cur.y + 1, cur.z)?.name ?? '空气'
+      notes.push(`⛔ 卡在 ${cur.x},${cur.y},${cur.z}：要去的 ${fx},${standY},${fz} 脚位是 ${atName}、头顶是 ${headName}，自己头顶是 ${myHead}`)
+      break
+    }
     /* 平台已去掉：每步都是下降步 */
   }
 
@@ -507,9 +569,9 @@ export async function digStair (self, {
   const climbed = now.y - start.y
   const tail = {
     done: '✅ 到目标高度了。',
-    budget: '⏱ 这一轮 10 秒用完了 —— 再叫一次 `mc_dig {mode:"stair", y:' + ty + '}` 接着挖（已经挖好的不会白挖）。',
+    budget: `⏱ 这一轮分到的时间用完了（这次 ${Math.round(budgetMs / 1000)} 秒）—— 再叫一次 \`mc_dig {mode:"stair", y:${ty}}\` 接着挖（已经挖好的不会白挖）。`,
     liquid: '🌊 前面是水/岩浆，不往那边挖了 —— 换个方向（`dir:"x-"` 之类）或者先绕开。',
-    'no-floor': '🕳 前面脚下是空的（深洞/矿洞），不敢再挖 —— 换个方向，或者先看看那边是什么。',
+    'no-floor': '🕳 前面脚下是空的，落差超过 3 格（怕摔、也怕下面是深洞或岩浆）—— 换个方向（`dir:"x-"` 之类），或者先看看那边是什么。',
     /* 🔴 2026-10-27：`stuck` 原来写死成"挖开了但没走过去（卡住）"——每轮明明已经推进了
      *    5 格（y 75→70、70→65）也照样这么报，模型以为整轮白干。按"到底有没有推进"分开说。 */
     stuck: climbed !== 0
@@ -547,8 +609,8 @@ export async function dig (self, {
    * "破坏 water 这一轮的时间用完了"）。淹死时的正确动作是**上浮换气**，不是挖水。 */
   const fluid = name ?? (pos ? b.blockAt(new Vec3(pos.x, pos.y, pos.z))?.name : null)
   if (fluid && isLiquid(fluid)) {
-    throw new Error(`${fluid} 是流体，挖不掉 —— 想从水里出来：mc_move {"mode":"swim"} 按住 jump 上浮换气，`
-      + '露出水面后再 mc_move 往岸上走（不知道岸在哪就先 mc_scan 找最近的干燥方块）。')
+    throw new Error(`${fluid} 是流体，挖不掉 —— 想从水里出来：直接 mc_move 朝岸边走`
+      + '（游泳时会自己按住 jump 浮在水面，不会沉）；不知道岸在哪就先 mc_scan 找最近的干燥方块。')
   }
   // 先把要挖的方块列出来（collectBlock 要一份目标清单，它自己会走过去 + 捡掉落物）
   /* 📋 任务记账（用户 2026-10-08 路线图第 ②③ 条）：**一次要挖 4 个以上 = 一件"活儿"**。
@@ -997,7 +1059,7 @@ const LOS_ENDS = Object.freeze([
  * 跳过：目标自己那格、贴身 ≤1 格的方块（射线第一块常常是自己踩的地板，与 ① 同口径）。
  * 读不到方块（区块没加载）⇒ 这一条不算被挡（判不了就别拒绝干活，与 ④ 同口径）。
  */
-function losBlockerAlong (b, from, gx, gy, gz, near) {
+export function losBlockerAlong (b, from, gx, gy, gz, near) {
   const at = (x, y, z) => { try { return b.blockAt(new Vec3(x, y, z)) } catch { return null } }
   let first = null
   for (const [ex, ey, ez] of LOS_ENDS) {

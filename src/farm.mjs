@@ -376,13 +376,11 @@ export async function farmArea (self, args = {}, ctx = {}) {
   // ② 一把就能干完的活：先看锄头和种子够不够，别干到一半才发现没有
   const willTill = spots.filter((s) => TILLABLE.has(s.soil))
   const hoe = willTill.length ? hoeOf(b) : null
-  if (willTill.length && !hoe) {
-    return {
-      ok: false, reason: 'no-hoe', soil: willTill.map((s) => s.soil),
-      text: `要锄地但**背包里没有锄头**（${willTill.length} 格土等着锄）—— 先 \`mc_craft {name:"wooden_hoe"}\`（2 木板 + 2 木棍），再来。`
-        + (seedPick ? '' : ' 顺带：种子也没有，`mc_inventory` 看看有没有 `wheat_seeds`。'),
-    }
-  }
+  /* 🔴 2026-10-28 实机（用户：「mc_act { mode:"farm" } 这样也不需要锄头吗」）：这里原来没锄头就
+   *   整批 `return`，把下面逐格兜底（"没有锄头就跳过这一格"）整个废掉了。自动找地一定会捞到
+   *   生土（`farmSpotsNear` 把 dirt / grass_block / dirt_path 都算候选），于是"没锄头"连已经
+   *   耕好的地撒种、熟了的作物收割都不干了。缺工具是**这一格干不了**，不是**整批不许干**。 */
+  const noHoe = willTill.length > 0 && !hoe
 
   const keep = heldSnapshotOf(b)
   const done = []
@@ -445,7 +443,7 @@ export async function farmArea (self, args = {}, ctx = {}) {
         failed.push({ pos: s.pos, why: 'not-soil', note: `那是 ${soilName || '空气'}，锄不了` }); continue
       }
       if (soilName !== 'farmland') {
-        if (!hoe) { failed.push({ pos: s.pos, why: 'no-hoe', note: '没有锄头' }); continue }
+        if (!hoe) { skipped.push({ pos: s.pos, why: 'no-hoe', note: '这格是土，没有锄头锄不了' }); continue }
         const eq = await self.equip({ name: hoe.name })
         if (eq?.equipped === false) { failed.push({ pos: s.pos, why: 'equip-failed', note: `拿不起 ${hoe.name}` }); continue }
         try {
@@ -496,6 +494,7 @@ export async function farmArea (self, args = {}, ctx = {}) {
   if (planted) bits.push(`种 ${planted} 格`)
   const text = (bits.length ? `🌾 ${bits.join('、')}` : '🌾 这一轮一格都没种上')
     + (skipped.length ? `；跳过 ${skipped.length} 格` : '')
+    + (noHoe ? '；没有锄头，土那几格没锄（`mc_craft {name:"wooden_hoe"}`：2 木板 + 2 木棍）' : '')
     + (failed.length ? `；失败 ${failed.length} 格（${failed.slice(0, 3).map((f) => `${f.pos.x},${f.pos.z}:${f.why}`).join(' / ')}）` : '')
     + (skipped.some((s) => s.why === 'budget') ? '；时间到了，剩下的再叫一次就好' : '')
     + (planted ? `\n🌱 长熟要一会儿：` + [...new Set(done.map((d) => CROP_TO_SEED[d.crop] ?? d.crop))].join('、') + ' —— 别原地等，去干别的，回头用 `mc_scan` 看 `age`。' : '')

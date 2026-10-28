@@ -131,6 +131,16 @@ export const AUTO_DEFAULTS = {
   /** 水下自救（自己搜出口、游上去）。**默认开**，可关（用户 2026-10-19：「要让 ai 能开关」「要默认开」） */
   waterRecover: true,
 
+  /**
+   * 落水**自动上浮**（用户 2026-10-28：「现在游泳还是不是自动浮，要游的时候才会浮。我要的是 auto
+   * 自动浮起来，可关掉。和有没有 move 没关系」）。
+   *
+   * 只管"别沉底"：头在水下就按住 `jump` 往上浮，眼睛一出水立刻松手。**不依赖 AI 调任何工具**
+   * （不需要 `mc_move`）、不寻路、不叫醒、不动位置。
+   * 和 `waterRecover`（缺氧时自己搜出口、走一整条出水路线）是两件事：那条是"逃出去"，这条是"浮着"。
+   */
+  autoFloat: true,
+
   /** 自保叫醒时**先停下手里的事**（默认开）。用户 2026-10-14 任务驱动第三步：
    * "先停止采集，再由 AI 决定逃跑、战斗还是继续任务"。
    *
@@ -156,9 +166,9 @@ const RANGES = {
 const MODE_DEFAULTS = {
   /* 2026-10-23 审计：ai-led 承诺「连保命后退也不做」，但 waterRecover:true 会自己规划出水路线
    * （walkTo）并抢 jump 控制位 —— 与工具描述直接矛盾，还会和 AI 的寻路抢 goal。改 false。 */
-  'ai-led': { lookAround: false, autoEat: false, pickup: false, wearArmor: false, follow: false, avoidReact: false, creeperFlee: false, waterRecover: false },
-  balanced: { lookAround: false, autoEat: false, pickup: false, wearArmor: false, follow: false, avoidReact: true, creeperFlee: true, waterRecover: true },
-  legacy: { lookAround: true, autoEat: true, pickup: true, wearArmor: true, follow: true, avoidReact: true, creeperFlee: true, waterRecover: true },
+  'ai-led': { lookAround: false, autoEat: false, pickup: false, wearArmor: false, follow: false, avoidReact: false, creeperFlee: false, waterRecover: false, autoFloat: true },
+  balanced: { lookAround: false, autoEat: false, pickup: false, wearArmor: false, follow: false, avoidReact: true, creeperFlee: true, waterRecover: true, autoFloat: true },
+  legacy: { lookAround: true, autoEat: true, pickup: true, wearArmor: true, follow: true, avoidReact: true, creeperFlee: true, waterRecover: true, autoFloat: true },
 }
 
 /** 任务停滞判定（毫秒）：台账 90 秒没变化就算"卡住了" */
@@ -610,7 +620,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     over('lookAround'); over('autoEat'); over('pickup'); over('wearArmor')
     // avoidReact / creeperFlee 现在都**不再移动位置**了（用户 2026-10-21）：前者早就不按 back，
     // 后者只剩"举盾 + 叫醒"。留着这两个键是为了兼容老配置和 mc_auto status 的读数。
-    over('avoid', 'avoidReact'); over('creeperFlee'); over('waterRecover')
+    over('avoid', 'avoidReact'); over('creeperFlee'); over('waterRecover'); over('autoFloat')
     // follow：显式给了玩家名 = 明确授权的跟随任务，任何模式都允许
     out.follow = (mode === 'legacy' || ex.includes('follow')) && Boolean(cfg?.follow)
     return out
@@ -659,6 +669,9 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
         /** 🔴 水下自动救援（2026-10-15 用户点名的"水下寻路"）：限流时间戳 + 正在跑 + 上一次结果。
          *  **绝不偷偷接管** —— 每次跑完都 `agent.steer` 报一条，并记进 stats。 */
         waterRecoverAt: 0,
+        floatAt: 0,
+        floatHeld: false,
+        lastFloatLoggedAt: 0,
         waterRecoverBusy: false,
         waterRecoverLast: null,
         lastArmorAt: 0,
@@ -1640,6 +1653,24 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     }
     const inWater = submerged || Boolean(e?.isInWater)
     if (submerged) { if (!s.submergedSince) s.submergedSince = t } else s.submergedSince = 0
+    /* 落水**自动上浮**（autoFloat）：只管"别沉底"，头在水下就按住 jump，眼睛一出水立刻松手。
+     * 不寻路、不叫醒、不动位置，也不需要 AI 先叫 `mc_move` —— 用户 2026-10-28 点名要这个。
+     * 工具刚调完的 1.2 秒里让开：`mc_move` 的游泳段自己在控 jump，别跟它抢。 */
+    if (beh.autoFloat !== false) {
+      const headUnder = Boolean(e?.isInWater) && submergedIn(b, e)
+      if (headUnder && t - num(s.lastToolAt, 0) > 1_200 && t - num(s.floatAt, 0) > 700) {
+        s.floatAt = t
+        s.floatHeld = true
+        holdCtl(sess, 'jump', 900, () => { try { b.setControlState('jump', false) } catch { /* 忽略 */ } })
+        if (t - num(s.lastFloatLoggedAt, 0) > 30_000) {
+          s.lastFloatLoggedAt = t
+          logLine('mc_auto：头在水下 → 自动按住 jump 上浮（autoFloat，可在设置里关）')
+        }
+      } else if (!headUnder && s.floatHeld) {
+        s.floatHeld = false
+        try { b.setControlState('jump', false) } catch { /* 忽略 */ }
+      }
+    }
     const subMs = s.submergedSince ? t - s.submergedSince : 0
     const subSec = Math.round(subMs / 1000)
     /* 🔴 氧气读数可能是**旧的**：mineflayer 不在客户端让它自己往下走，只在服务端发 `air_supply`
@@ -2344,6 +2375,8 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       + '`ai-led` = AI 决策，反射层只监测事件/叫醒/记决策，不替它吃捡穿跟，连保命后退也不做；'
       + '`balanced` = AI 决策 + 紧急保命只剩水下自救（危险方块/苦力怕只叫醒、不移动）；'
       + '`legacy` = 旧的自动行为全开。\n'
+      + '**落水自动浮**（`autoFloat`，默认开）：头在水下就自己按住 jump 浮上来，**不用先叫 mc_move**；'
+      + '`set {"autoFloat":false}` 关。\n'
       + '**事件层**：溺水/窒息/苦力怕/挨打/被打断/停滞 → 按优先级入队去重，叫醒只给事实，每个动作记一条决策审计。\n'
       + `**空闲层**：闲 ${AUTO_DEFAULTS.idleWakeSec} 秒叫醒（每小时 ${AUTO_DEFAULTS.idleWakeMaxPerHour} 次；没动作 ⇒ 间隔翻倍，封顶 30 分钟），45s 没动手补一条"别问，直接做"。\n`
       + '用法：`status`（默认）｜`off` 关反射层（🔴 **不是全停**：空闲叫醒还开，要 `set {"idleWake":false}`；`avoid` 独立开关）｜`on` 全开｜'

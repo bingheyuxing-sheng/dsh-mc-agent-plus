@@ -292,7 +292,12 @@ export async function runStep (self, s) {
     case 'toss':    return self.tossItem(s)
     case 'say':     return { said: self.chatSay(s.text ?? '') }
     case 'jump':    return self.jump()
-    case 'swim':    return (s.x != null && s.y != null && s.z != null) ? self.walkTo(s) : self.swimUp(s)
+    /* 🔴 2026-10-28 参数审计：这一步以前直接 `self.walkTo(s)` —— 步骤里写的 `budgetMs`
+     *    没有键能接住（`walkTo` 只认 `budget`），一路落到 `cfg.moveBudgetMs` 兜底值，
+     *    把整串步骤的时间全吃掉。和上面 fly 那条是同一个坑。 */
+    case 'swim':    return (s.x != null && s.y != null && s.z != null)
+      ? self.walkTo(s, { budget: callBudget(s.budgetMs) })
+      : self.swimUp(s)
     default:
       throw new Error(`未知步骤 op："${op}"（可用：wait/move/look/toward/place/break/dig/use/useitem/attack/equip/give/toss/say/jump/swim）`)
   }

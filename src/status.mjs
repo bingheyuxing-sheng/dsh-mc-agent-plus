@@ -106,6 +106,10 @@ export function statusOf (b, ctx = {}) {
     // 0 = 已经在窒息掉血（mineflayer 读到的原始值可能是负数，已夹到 0）。
     air: airNow,
     submerged: submergedNow,
+    /* 🔴 2026-10-27 实机（session-514c21b6，AI 自己的复盘）：「从岩浆里爬出来脚还在岩浆边
+     *   就停下吃东西，直接烧死了」。全仓之前**没有任何地方读 `entity.fire`**（grep 0 处）——
+     *   出了岩浆不等于火灭了：引燃还在烧，站着不动就是等死。不报这一项，模型不知道"现在不能停"。 */
+    fire: b?.entity?.fire === true,
     ...(bossBars.length ? { bossBars } : {}),
   }
 }
