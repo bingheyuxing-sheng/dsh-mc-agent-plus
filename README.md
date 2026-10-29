@@ -13,7 +13,7 @@
 ```
 yzi1b/whale-craft（原始项目，MIT）
         └─► blueziii/dsh-mc-agent v0.6.38（持续开发的上游，MIT）
-                └─► 本仓库（bingheyuxing-sheng/dsh-mc-agent）
+                └─► 本仓库（bingheyuxing-sheng/dsh-mc-agent-plus）
                      = 0.6.38 的完整代码 + 2026-10-29 的队伍体验改动
 ```
 

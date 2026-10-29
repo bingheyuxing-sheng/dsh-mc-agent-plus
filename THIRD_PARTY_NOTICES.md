@@ -10,7 +10,7 @@ dsh-mc-agent 自身以 **MIT** 发布（见 `LICENSE`）。它**不打包**任�
 | [yzi1b/whale-craft](https://github.com/yzi1b/whale-craft) | MIT | **原始项目**：本插件全部基础能力的来源 |
 | [blueziii/dsh-mc-agent](https://github.com/blueziii/dsh-mc-agent) | MIT | **代码基线（上游）**：本仓库基于其 `v0.6.38`（commit `f081451`）；`src/`、`extensions/`、`tools/` 的绝大多数代码、以及 0.6.2–0.6.38 的全部体验修复都来自这里 |
 
-本仓库（`bingheyuxing-sheng/dsh-mc-agent`）在上游基础上只做了 2026-10-29 的增量改动
+本仓库（`bingheyuxing-sheng/dsh-mc-agent-plus`）在上游基础上只做了 2026-10-29 的增量改动
 （任务板属主、观战页/播报、本机服务端自动拉起、账户标识），并按 MIT 继续分发。
 
 ## 运行时依赖
