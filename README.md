@@ -6,6 +6,33 @@
 
 本仓库是 [whale-craft](https://github.com/yzi1b/whale-craft)（作者 yzi1b）的魔改版，改名 `dsh-mc-agent`。
 
+## 来源与上游（务必先读）
+
+**这个仓库不是从零写的**，它是二次开发的成果。代码来源与关系如下：
+
+```
+yzi1b/whale-craft（原始项目，MIT）
+        └─► blueziii/dsh-mc-agent v0.6.38（持续开发的上游，MIT）
+                └─► 本仓库（bingheyuxing-sheng/dsh-mc-agent）
+                     = 0.6.38 的完整代码 + 2026-10-29 的队伍体验改动
+```
+
+| 角色 | 项目 | 说明 |
+| --- | --- | --- |
+| 原始项目 | [yzi1b/whale-craft](https://github.com/yzi1b/whale-craft) | 全部基础能力的来源（40 个 `mc_*` 工具、寻路/挖掘/合成/战斗/记忆…） |
+| **代码基线（上游）** | [blueziii/dsh-mc-agent `v0.6.38`](https://github.com/blueziii/dsh-mc-agent) | 在 whale-craft 上继续开发的版本；本仓库的 `src/`、`extensions/`、`tools/` 绝大多数代码来自它，**0.6.2–0.6.38 的 60+ 条游戏体验修复也全部来自它** |
+| 本仓库叠加 | 本仓库 | 2026-10-29 加的队伍协作与连接体验（见下） |
+
+### 本仓库在上游基线上**新增/修改**的部分（2026-10-29）
+
+- 任务板属主：`tasks.json` 每件活带 `owner`，`auto`/`resume` 只接自己的或无主的；`mc_task` 新增 `board`/`claim`/`assign`
+- 队伍观战页（`.express/team/team.html`，10 秒刷新）+ 死亡/收工公屏播报
+- 「连接到MC」：本机服务端自动拉起（`127.x` 且端口没开）、历史地址只收真地址、账户类型改「离线账户」
+- 会话顶部状态条显示「本对话用的账户」
+
+> 上游 0.6.x 已经实现的**按存档分记忆**（`memoryScope` / `worlds/`）和**历史气泡点击填入**，本仓库直接沿用，不再重复实现。
+> 许可：本仓库与两个上游均为 **MIT**，见 [LICENSE](LICENSE) 与 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
 ## 能干什么
 
 - **进服就能玩** —— 离线 / 微软正版 / 第三方皮肤站三种账户；连上就有位置、血量、背包、时间、天气

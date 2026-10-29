@@ -13,11 +13,16 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/blueziii/dsh-mc-agent.git"
+    "url": "git+ssh://git@github.com/bingheyuxing-sheng/dsh-mc-agent.git"
   },
-  "homepage": "https://github.com/blueziii/dsh-mc-agent#readme",
+  "homepage": "https://github.com/bingheyuxing-sheng/dsh-mc-agent#readme",
   "bugs": {
-    "url": "https://github.com/blueziii/dsh-mc-agent/issues"
+    "url": "https://github.com/bingheyuxing-sheng/dsh-mc-agent/issues"
+  },
+  "upstream": {
+    "base": "https://github.com/blueziii/dsh-mc-agent/tree/f081451",
+    "baseVersion": "0.6.38",
+    "original": "https://github.com/yzi1b/whale-craft"
   },
   "engines": {
     "node": ">=22",
