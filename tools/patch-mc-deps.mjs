@@ -59,15 +59,22 @@ const EOL = src.includes('\r\n') ? '\r\n' : '\n'
 let changed = 0
 let missing = 0
 
-/** 幂等替换：已含新文本就跳过；否则要求旧锚点存在 */
-function rep (oldText, newText, label) {
+/** 幂等替换：已含新文本就跳过；否则按旧锚点逐个试。
+ *  `extraOld` 用来容纳 vendor 的「中间形态」——旧版补丁打过、新版补丁还没打时的样子
+ *  （例如 0.6.38 的 index.js 已有 placingStartedAt/placingBestY，但还缺 placingEquipped）。 */
+function rep (oldText, newText, label, extraOld = []) {
   const n = newText.split('\n').join(EOL)
   if (src.includes(n)) { console.log(`  = ${label}（已打过）`); return }
-  const o = oldText.split('\n').join(EOL)
-  if (!src.includes(o)) { console.error(`  ✗ ${label}：锚点找不到（vendor 版本变了？）`); missing++; return }
-  src = src.replace(o, n)
-  changed++
-  console.log(`  + ${label}`)
+  for (const cand of [oldText, ...extraOld]) {
+    const o = cand.split('\n').join(EOL)
+    if (!src.includes(o)) continue
+    src = src.replace(o, n)
+    changed++
+    console.log(`  + ${label}`)
+    return
+  }
+  console.error(`  ✗ ${label}：锚点找不到（vendor 版本变了？）`)
+  missing++
 }
 
 console.log(`vendor: ${VENDOR}`)
@@ -114,7 +121,15 @@ rep(
         placingEquipped = false
         fullStop()
       }`,
-  '垫柱计时：记录开始时间（+2026-10-27 复位预装备标记）'
+  '垫柱计时：记录开始时间（+2026-10-27 复位预装备标记）',
+  // 0.6.38 的中间形态：前两行计时已在（2026-10-25 那批补丁打的），只差 placingEquipped
+  [`      if (!placing) {
+        placing = true
+        placingStartedAt = performance.now()
+        placingBestY = bot.entity.position.y
+        placingBlock = nextPoint.toPlace.shift()
+        fullStop()
+      }`]
 )
 
 rep(
@@ -265,16 +280,19 @@ rep(
   '起点偏移：用传入的 movements 而不是全局 stateMovements'
 )
 
-if (!CHECK_ONLY && changed > 0) writeFileSync(IDX, src)
-
 /* ── goto.js：noPath 被当成"到了" ─────────────────────────────────────── */
 const GOTO = join(PF_DIR, 'lib', 'goto.js')
 
-function repIn (file, oldText, newText, label) {
+/**
+ * @param accept 可选正则：vendor 已经演进成**等价的新形态**（上游自己修过、注释不同）时，
+ *               命中即算「已打过」，不再报锚点找不到。
+ */
+function repIn (file, oldText, newText, label, accept = null) {
   const txt = readFileSync(file, 'utf8')
   const eol = txt.includes('\r\n') ? '\r\n' : '\n'
   const n = newText.split('\n').join(eol)
   if (txt.includes(n)) { console.log(`  = ${label}（已打过）`); return }
+  if (accept && accept.test(txt)) { console.log(`  = ${label}（已打过·上游演进形态）`); return }
   const o = oldText.split('\n').join(eol)
   if (!txt.includes(o)) { console.error(`  ✗ ${label}：锚点找不到（vendor 版本变了？）`); missing++; return }
   if (!CHECK_ONLY) writeFileSync(file, txt.replace(o, n))
@@ -409,6 +427,10 @@ repIn(
   'goto.js：PathStopped 带上真实原因'
 )
 
+/* index.js 的补丁全部打完后**一次性**落盘。2026-10-27 那批是后来追加的，
+ * 旧版把 write 留在它们之前 ⇒ 那几处只改了内存，vendor 里永远缺。 */
+if (!CHECK_ONLY && changed > 0) writeFileSync(IDX, src)
+
 console.log('\nmineflayer-pathfinder/lib/goto.js:')
 repIn(
   GOTO,
@@ -429,11 +451,16 @@ repIn(
         cleanup(error('NoPath', 'No path to the goal!'))
       } else if (results.status === 'timeout') {
         cleanup(error('Timeout', 'Took to long to decide path to goal!'))
-      } else if (results.path.length === 0) {
+      /* 🔴 2026-10-26 DSH 补丁（上游 #375）：搜索失败或还在增量切片时，bestNode 重建出来
+       * 就是起点、path 也是空 —— 只有 status === 'success' 且无事可走才真的是"已在目标"。
+       * 'partial'（A* 超时续算的中间态）+ 空路径不构成到达。 */
+      } else if (results.status === 'success' && results.path.length === 0) {
         cleanup()
       }
     }`,
-  'noPath 不再被当成到达'
+  'noPath 不再被当成到达',
+  // 0.6.38 自带的就是这个形态（noPath → timeout → success&&空路径），注释措辞不同而已
+  [/if \(results\.status === 'noPath'\)[\s\S]{0,900}?results\.status === 'success' && results\.path\.length === 0/]
 )
 if (CHECK_ONLY) console.log(`  （--check：未写文件）`)
 
@@ -539,6 +566,12 @@ for (const [file, re, label] of checks) {
 
 if (missing > 0) {
   console.error(`\n✗ ${missing} 处缺失`)
+  process.exit(1)
+}
+/* --check 是给 CI/自检用的：此时只读不写，所以「要打而没打」必须算不通过，
+ * 否则 vendor 明明缺补丁、检查却报「全部在位」。 */
+if (CHECK_ONLY && changed > 0) {
+  console.error(`\n✗ ${changed} 处补丁没打进 vendor（去掉 --check 再跑一次）`)
   process.exit(1)
 }
 console.log(`\n${CHECK_ONLY ? '✓ 全部补丁在位' : `✓ 完成（本次新打 ${changed} 处）`}`)

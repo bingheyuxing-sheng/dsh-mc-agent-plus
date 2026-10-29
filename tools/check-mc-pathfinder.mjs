@@ -112,7 +112,9 @@ ok(/resetPath\('use_block_error'\)/.test(indexSrc),
 ok(/!movements\.emptyBlocks\.has\(b\.type\)/.test(indexSrc),
   '起点 +1 偏移用传入的 movements 判断（不是全局 stateMovements）')
 const gotoSrc = existsSync(join(PF_DIR, 'lib', 'goto.js')) ? readFileSync(join(PF_DIR, 'lib', 'goto.js'), 'utf8') : ''
-ok(/status === 'noPath'\)[\s\S]{0,300}?path\.length === 0\)/.test(gotoSrc),
+/* 0.6.38 在两者之间插了 3 行中文注释（讲「只有 success 才算到达」），字符距离约 900 ——
+ * 上限放到 1200，仍能保证「noPath 在前、空路径在后」这个顺序约束。 */
+ok(/status === 'noPath'\)[\s\S]{0,1200}?path\.length === 0\)/.test(gotoSrc),
   'goto.js 先判 noPath 再判空路径（「无路可走」不再被当成「到了」）')
 
 // ── 假世界：一小片地板 + 那个 1 格台阶 + 一块半砖 + 一条 1 格宽走廊 ────────────────
