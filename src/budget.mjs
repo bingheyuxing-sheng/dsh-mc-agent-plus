@@ -31,7 +31,7 @@ export const TIMEOUTS = {
  * 单次工具调用的时间上限。
  * 🔴 用户要求：**一次工具调用别挂太久，宁可少量多次** —— 一次挂几分钟的时候
  *    用户看不到消息、也没法插话（"太久根本获取不了消息"）。
- *    一开始定的是 5 秒；后来用户要求"把使用工具 5 秒的限制提高到 11 秒"（2026-10-08）⇒ 改成 11 秒。
+ *    一开始定的是 5 秒；用户要求"把使用工具 5 秒的限制提高到 11 秒"（2026-10-08）⇒ 11 秒；2026-10-29 试过提到 15 秒，用户看完占比后决定维持 11 秒（动作预算 10 秒）。
  *    所以长动作（走路 / 挖一片 / 搭一片 / 盯熔炉 / 连串步骤）一律改成
  *    **到点就带着进度返回**，由模型再叫一次接着做。
  *    两道闸：① `asTool` 每次调用前设"截止时刻"，`#t` 和各个循环都看它；
@@ -55,6 +55,44 @@ export const callBudget = (v, def = CALL_BUDGET_MS, cap = CALL_BUDGET_MS) => {
 }
 /** 这一轮调用的截止时刻（ms）—— 循环里用它早停，别把整次调用挂死 */
 export const callDeadline = (ms = CALL_MS) => Date.now() + ms
+/**
+ * 启动前的时间体检 —— **剩余不够就拒绝启动**，不许硬压一个下限。
+ * 🔴 2026-10-29 用户定规：「needLeft(ms) 应该拒绝启动，而不是强行压缩」。
+ *    · 边界：剩余**等于** `minMs + slack` 时允许启动；不足才拒绝。
+ *    · `minMs`  = 这次动作的最小有效执行时间（不够就别开始）
+ *    · `wantMs` = 想用多少（默认同 minMs；通常传动作自己的上限或 `CALL_BUDGET_MS`）
+ *    · `shortfallMs` = 离"能启动"还差多少毫秒，文案层再换成秒
+ *
+ * 为什么不能光写 `Math.max(1500, 剩余 - 500)`：那等于"剩余 0 也给 1500ms"，
+ * 动作会越过本轮截止时间 —— 外层硬掐，里层却以为还有时间、不做收尾。
+ */
+export function needLeft (self, minMs, wantMs = minMs, slack = 500) {
+  /* 没有 `msLeft()` 的对象（套件里的假 self / 脚本直接调）= 当作**整整一轮**，
+   * 和 `McBot.msLeft()`「没设过就按 CALL_MS 算」保持一致。 */
+  const left = typeof self?.msLeft === 'function'
+    ? Math.max(0, Number(self.msLeft()) || 0)
+    : CALL_MS
+  const min = Math.max(0, Number(minMs) || 0)
+  const want = Math.max(min, Number(wantMs) || 0)
+  if (left < min + slack) {
+    return {
+      ok: false,
+      code: 'INSUFFICIENT_BUDGET',
+      requiredMs: min,
+      remainingMs: left,
+      shortfallMs: min + slack - left,
+    }
+  }
+  return { ok: true, budgetMs: Math.min(want, left - slack) }
+}
+
+/** `needLeft` 被拒时给模型看的一句话（秒，一位小数） */
+export function insufficientText (r, what = '这个动作') {
+  const needS = Math.round(Number(r?.requiredMs ?? 0) / 100) / 10
+  const leftS = (Number(r?.remainingMs ?? 0) / 1000).toFixed(1)
+  const shortS = Math.round(Number(r?.shortfallMs ?? 0) / 100) / 10
+  return `${what}至少要 ${needS} 秒，这一轮只剩 ${leftS} 秒（差 ${shortS} 秒）—— 没启动，下次再来`
+}
 /** 给模型看的"这一轮用完了"文案里的秒数（跟着 `CALL_MS` 走，改上限时不用再挨个改文案） */
 export const callSecText = () => `${Math.round(CALL_MS / 1000)} 秒`
 /** 动作预算的秒数（文案用） */

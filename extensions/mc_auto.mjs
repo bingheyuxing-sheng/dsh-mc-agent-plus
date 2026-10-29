@@ -70,8 +70,8 @@ export const AUTO_DEFAULTS = {
   /**
    * 运行模式（2026-10-18 用户拍板，默认 `ai-led`）：
    *   · `ai-led`   —— AI 决策：反射层只**监测事件 + 叫醒 + 记录决策**，不替它吃/捡/穿/跟/环顾，
-   *                   连"危险方块后退、苦力怕后撤、水下自救"也默认不做。
-   *   · `balanced` —— AI 决策，但保留**几乎不可逆**的紧急保命：水下自救。
+   *                   连"危险方块后退、苦力怕后撤、水下脱困"也默认不做。
+   *   · `balanced` —— AI 决策，但保留**几乎不可逆**的紧急保命：水下脱困。
    *     （危险方块和苦力怕**只叫醒、不自己移动** —— 用户 2026-10-21 定，两档都一样。）
    *   · `legacy`   —— 旧的自动行为（吃/捡/穿/跟随/环顾/保命全开）。
    * 下面这些布尔项（autoEat/pickup/wearArmor/lookAround/follow/avoid/creeperFlee/waterRecover）
@@ -128,7 +128,7 @@ export const AUTO_DEFAULTS = {
    */
   creeperFlee: true,
 
-  /** 水下自救（自己搜出口、游上去）。**默认开**，可关（用户 2026-10-19：「要让 ai 能开关」「要默认开」） */
+  /** 水下脱困（自己搜出口、游上去）。**默认开**，可关（用户 2026-10-19：「要让 ai 能开关」「要默认开」） */
   waterRecover: true,
 
   /**
@@ -322,6 +322,27 @@ const ARMOR_SLOTS = [
 const AIRY = /^(air|cave_air|void_air|short_grass|grass|tall_grass|fern|large_fern|dandelion|poppy|blue_orchid|torch|wall_torch|soul_torch|redstone_torch|vine|snow|rail|lily_pad|dead_bush|seagrass)$/
 /** 液体（不能当落脚点） */
 const LIQUID = /water|lava|bubble_column|kelp/
+
+/** 自动上浮用：眼睛那一列的水面高度（连续液体的最高一格 + 1）。这一列不是水 ⇒ null。
+ *  🔴 2026-10-29（用户：「最好让它稳在水面上」）：以前按"眼睛那格是不是液体"开关 jump，
+ *     出水就撒手、入水就又按住 —— 出水时还带着上冲速度，于是冲出水面半格再砸回来，来回拉锯。
+ *     改成按**水面高度**做带死区的开关量控制，才能稳住。 */
+const autoFloatTop = (b, e) => {
+  try {
+    const p = e?.position
+    if (!p) return null
+    const x = Math.floor(Number(p.x) || 0)
+    const z = Math.floor(Number(p.z) || 0)
+    const fy = Math.floor(Number(p.y) || 0)
+    let top = null
+    for (let y = fy - 1; y <= fy + 4; y++) {
+      const n = String(blockNameAt(b, { x, y, z }) ?? '')
+      if (LIQUID.test(n)) top = y + 1
+      else if (top != null) break
+    }
+    return top
+  } catch { return null }
+}
 
 const blockNameAt = (b, pos) => {
   try {
@@ -1450,12 +1471,12 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
           walkTo: (self, p, o) => bot.walkTo({ x: p.x, y: p.y, z: p.z }, o ?? {}),
           swimUp: (self, o) => bot.swimUp(o ?? {}),
         }),
-        WATER_RECOVER_MAX_MS, '水下自救',
+        WATER_RECOVER_MAX_MS, '水下脱困',
       )
       try {
         /* 🔴 2026-10-16 审计（P0-1，场景二）：以前这里**直接调 `bot.walkTo` / `bot.swimUp`**，
          *    完全不进动作调度器 —— 于是"表里写着 `mc_move` 占着 movement，实际驱动 bot 的是
-         *    水下自救"，两者只靠 `_moveGen`（后进者赢）仲裁，谁都不告诉谁。
+         *    水下脱困"，两者只靠 `_moveGen`（后进者赢）仲裁，谁都不告诉谁。
          *    现在把它登记成一个**紧急级**动作：占 `movement`、有 actionId、能被 `mc_diag` 看见。
          *    `priority:'emergency'`（100）比 `mc_move` 的 `user`（60）高 ⇒ 它**真的会抢占**
          *    在跑的寻路（`src/action-scheduler.mjs` 的规矩：紧急级不受观察模式限制 ——
@@ -1481,14 +1502,14 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
           }
         }
       } catch (e) {
-        res = { ok: false, reason: 'error', note: `自救过程出错：${e?.message ?? e}`, tried: [], log: [] }
+        res = { ok: false, reason: 'error', note: `脱困过程出错：${e?.message ?? e}`, tried: [], log: [] }
       }
       s.waterRecoverBusy = false
       s.waterRecoverLast = { ...(res ?? {}), at: t }
       s.stats.waterRecovers++
       if (res?.ok) s.stats.waterEscapes++
       try {
-        logLine(`mc_auto：水下自救 ${res?.ok ? '出来了' : '没出来'}（${res?.reason ?? '?'}）—— ${res?.note ?? ''}`)
+        logLine(`mc_auto：水下脱困 ${res?.ok ? '出来了' : '没出来'}（${res?.reason ?? '?'}）—— ${res?.note ?? ''}`)
       } catch { /* 日志失败不影响 */ }
       const agent = s.agent
       if (!agent || typeof agent.steer !== 'function') return
@@ -1501,7 +1522,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
             summary: res?.ok ? 'MC 自保：我自己从水里出来了一趟' : 'MC 自保：在水里没找到出口',
           },
         }))
-      } catch (e) { s.lastError = `水下自救通知失败：${e?.message ?? e}` }
+      } catch (e) { s.lastError = `水下脱困通知失败：${e?.message ?? e}` }
     })()
     return true
   }
@@ -1653,21 +1674,40 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     }
     const inWater = submerged || Boolean(e?.isInWater)
     if (submerged) { if (!s.submergedSince) s.submergedSince = t } else s.submergedSince = 0
-    /* 落水**自动上浮**（autoFloat）：只管"别沉底"，头在水下就按住 jump，眼睛一出水立刻松手。
-     * 不寻路、不叫醒、不动位置，也不需要 AI 先叫 `mc_move` —— 用户 2026-10-28 点名要这个。
-     * 工具刚调完的 1.2 秒里让开：`mc_move` 的游泳段自己在控 jump，别跟它抢。 */
+    /* 落水**自动上浮**（autoFloat）：目标不是"别沉底"，而是**稳稳停在水面上**。
+     * 用户 2026-10-29：「自动上浮跳动太大，平稳一点…最好让它稳在水面上」——
+     * 老写法是"眼睛一入水就按住 900ms、一出水立刻撒手"：水中 jump 是持续加速度，出水那一刻
+     * 还带着上冲速度 ⇒ 冲出水面半格、再砸回水里，来回拉锯。
+     * 现在按**水面高度**做带死区的开关量控制（每拍 500ms 重估一次）：
+     *   · 眼睛低于水面 0.12 格以上 ⇒ 按住 jump（400ms 短脉冲，下拍再判）
+     *   · 眼睛高出水面 0.10 格以上 ⇒ 松手
+     *   · 中间是死区 ⇒ 维持上一拍，不来回切
+     *   · 已经在往上冲、离水面不到半格 ⇒ 提前松手，靠惯性出水，别冲过头
+     * 不寻路、不叫醒、不动位置，也不需要 AI 先叫 `mc_move`。工具刚调完的 1.2 秒里让开：
+     * `mc_move` 的游泳段自己在控 jump，别跟它抢。 */
     if (beh.autoFloat !== false) {
-      const headUnder = Boolean(e?.isInWater) && submergedIn(b, e)
-      if (headUnder && t - num(s.lastToolAt, 0) > 1_200 && t - num(s.floatAt, 0) > 700) {
-        s.floatAt = t
-        s.floatHeld = true
-        holdCtl(sess, 'jump', 900, () => { try { b.setControlState('jump', false) } catch { /* 忽略 */ } })
-        if (t - num(s.lastFloatLoggedAt, 0) > 30_000) {
+      /* 🔴 别再拿 `e.isInWater` 或"眼睛那格是不是液体"当开关：前者泡在水柱里是 undefined
+       *    （2026-10-08 实机），后者一出水就撒手 ⇒ 上下拉锯。只用水面高度说话。 */
+      const ap = e?.position
+      const topY = autoFloatTop(b, e)
+      const eyeY = ap ? Number(ap.y) + 1.6 : null
+      const vy = Number(e?.velocity?.y ?? 0)
+      const ready = topY != null && eyeY != null && t - num(s.lastToolAt, 0) > 1_200
+      const below = ready ? topY - eyeY : 0
+      const overshoot = ready && vy > 0.20 && below < 0.5
+      const rise = ready && below > 0.12 && !overshoot
+      const drop = ready && (below < -0.10 || overshoot)
+      if (rise) {
+        if (!s.floatHeld && t - num(s.lastFloatLoggedAt, 0) > 30_000) {
           s.lastFloatLoggedAt = t
-          logLine('mc_auto：头在水下 → 自动按住 jump 上浮（autoFloat，可在设置里关）')
+          logLine(`mc_auto：沉在水面下 ${below.toFixed(2)} 格 → 自动上浮（autoFloat，可在设置里关）`)
         }
-      } else if (!headUnder && s.floatHeld) {
+        s.floatHeld = true
+        s.floatAt = t
+        holdCtl(sess, 'jump', 400, () => { try { b.setControlState('jump', false) } catch { /* 忽略 */ } })
+      } else if (drop && s.floatHeld) {
         s.floatHeld = false
+        s.floatAt = t
         try { b.setControlState('jump', false) } catch { /* 忽略 */ }
       }
     }
@@ -2373,7 +2413,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     description: '🤖 **自主层**（让它像正常玩家）：不传参数 = 看状态。\n'
       + '**模式**（`set {"mode":"ai-led"|"balanced"|"legacy"}`，默认 `ai-led`）：'
       + '`ai-led` = AI 决策，反射层只监测事件/叫醒/记决策，不替它吃捡穿跟，连保命后退也不做；'
-      + '`balanced` = AI 决策 + 紧急保命只剩水下自救（危险方块/苦力怕只叫醒、不移动）；'
+      + '`balanced` = AI 决策 + 紧急保命只剩水下脱困（危险方块/苦力怕只叫醒、不移动）；'
       + '`legacy` = 旧的自动行为全开。\n'
       + '**落水自动浮**（`autoFloat`，默认开）：头在水下就自己按住 jump 浮上来，**不用先叫 mc_move**；'
       + '`set {"autoFloat":false}` 关。\n'
@@ -2462,7 +2502,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
           + `｜自保提醒 ${s.stats.alerts ?? 0}（叫醒 ${s.stats.dangerWakes ?? 0}）｜危险提醒 ${s.stats.escapes}（只叫醒、不移动）`
           + `｜跟随 ${s.stats.follows}｜叫醒 ${s.stats.wakes}`
           + `（其中催促 ${s.stats.nudges ?? 0}）｜限流挡掉 ${s.stats.denied}`)
-        lines.push(`　🌊 水下自救 ${s.stats.waterRecovers ?? 0} 次（出来 ${s.stats.waterEscapes ?? 0} 次）`
+        lines.push(`　🌊 落水后自己上来 ${s.stats.waterRecovers ?? 0} 次（成功 ${s.stats.waterEscapes ?? 0} 次）`
           + (s.waterRecoverLast
             ? `｜上一次：${s.waterRecoverLast.ok ? '出来了' : '没出来'}（${s.waterRecoverLast.reason ?? '?'}）—— ${String(s.waterRecoverLast.note ?? '').slice(0, 80)}`
             : '｜还没跑过'))

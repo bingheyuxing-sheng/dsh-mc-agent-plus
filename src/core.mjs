@@ -214,7 +214,7 @@ export { withTimeout, raceAbort } from './async-util.mjs'
 export { logLine, logDebug, logOnce, logLevel, stamp } from './log.mjs'
 /** 挑方块/垫脚料已搬到 src/place-items.mjs（路线图第 ④ 条第六刀）；这里保留同名导出 */
 export { isFullBlockItem, scaffoldingItemIds, pickPlaceItem } from './place-items.mjs'
-export { TIMEOUTS, CALL_MS, CALL_BUDGET_MS, callBudget, callDeadline, callSecText, budgetSecText } from './budget.mjs'
+export { TIMEOUTS, CALL_MS, CALL_BUDGET_MS, callBudget, callDeadline, callSecText, budgetSecText, needLeft, insufficientText } from './budget.mjs'
 /** 实体名字与分类已搬到 `src/entity-names.mjs`（路线图第 ④ 条第四刀）；都是私有件，无需 re-export */
 import { isDropEntity } from './entity-names.mjs'
 /* 路线图第 ④ 条第五刀：日志基建（stamp/logLevel/logDebug/logLine/logOnce + 轮转）搬到
@@ -229,7 +229,7 @@ import { NON_FULL_BLOCK, isFullBlockItem, NO_SCAFFOLD, scaffoldingItemIds, pickP
  * 搬到 src/inventory.mjs —— 第一次搬"读 bot 实时状态"的东西，只读、不 await、不改状态。 */
 import { invSnap, invUsed, canHarvestNow, toolKinds, countOf, freeSlot,
          inventoryView, giveItem, clearInventory, tossItem, equipFor, setEnchantRegistry } from './inventory.mjs'
-import { TIMEOUTS, CALL_MS, CALL_BUDGET_MS, callBudget, callDeadline, callSecText, budgetSecText } from './budget.mjs'
+import { TIMEOUTS, CALL_MS, CALL_BUDGET_MS, callBudget, callDeadline, callSecText, budgetSecText, needLeft, insufficientText } from './budget.mjs'
 import { entityHealth, inWaterNow, slowDigWhy, dropsNear, dropHint, blockReachOf, stateNameOf } from './world-observer.mjs'
 import { grabDrops } from './pickup.mjs'
 import { digMsFor, patchDigTime, bestToolFor } from './dig-speed.mjs'

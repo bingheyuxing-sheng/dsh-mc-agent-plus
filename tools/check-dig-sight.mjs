@@ -6,7 +6,7 @@
  *   ① 贴身 1 格（脚下 / 头顶 / 水平相邻 / 斜角）一律放行
  *   ② 前后左右四格只要有一格是空的（空气 / 可通行）⇒ 能挖
  *   ②′ 四面有空**还要过视线**：眼睛到这一格的 7 条采样线全被实心方块挡住 ⇒ 拦（issue #3）
- *   ③ 四面全被实心包住 ⇒ 才是"隔着方块挖"，拦下并说清是哪面
+ *   ③ 四面全被实心包住 ⇒ 从朝我这一面挖进去（2026-10-29）；挖不动才拦下并说清是哪面
  *   ④ 读不到方块 / 够不着 ⇒ 不拦（判不了就别拒绝干活）
  *
  * 用法：node tools/check-dig-sight.mjs（必须从包目录跑，理由见 check-core-dig.mjs 顶部）
@@ -48,7 +48,7 @@ const TMP = []
 /**
  * 假 bot：目标方块在 (0,64,3)，玩家站在 (0,64,0)。
  *   `open` = 'north' → 北面 (0,64,2) 是空气，其余三面实心（有一面空 ⇒ 能挖）
- *   `open` = 'none'  → 前后左右四面全是 stone（四面被包 ⇒ 拦）
+ *   `open` = 'none'  → 前后左右四面全是 stone（四面被包 ⇒ 挖进去）
  *   `open` = null    → 邻居读不到（blockAt 返回 null）⇒ 判不了，不拦
  */
 const mkBot = ({ open = 'north', walls = [] } = {}) => {
@@ -112,16 +112,16 @@ const mkMc = (fake) => {
   return mc
 }
 
-/* ─────────── ① 四面全实心 ⇒ 一格都不挖 ─────────── */
-section('① 前后左右四面全被实心包住 ⇒ 不挖，并说清挡着的是哪面')
+/* ─────────── ① 四面全实心 ⇒ 挖进去，不再停手 ─────────── */
+section('① 前后左右四面全被实心包住 ⇒ 从朝我这一面挖进去（2026-10-29 用户：「为什么没有直接挖过去」）')
 {
   const fake = mkBot({ open: 'none' })
   const mc = mkMc(fake)
   const out = await mc.dig({ pos: { x: 0, y: 64, z: 3 } })
-  ok(fake.calls.dig === 0, '没调用 bot.dig（一格都没挖）', `dig=${fake.calls.dig}`)
-  ok(out.some((l) => /四面都被实心方块包着/.test(l)), '明说"四面都被实心方块包着"', String(out[0]).slice(0, 90))
-  ok(out.some((l) => /\*\*stone\*\*/.test(l)), '报出挡着的方块名', String(out[0]).slice(0, 90))
-  ok(out.some((l) => /0, 64, 2/.test(l)), '给出其中一面的坐标（可以去挖它）')
+  ok(fake.calls.dig >= 1, '真的动手挖了（不再"一格都不挖"）', `dig=${fake.calls.dig}`)
+  ok(out.some((l) => /🧹 先把挡路的 stone/.test(l)), '说出来先挖开了哪块挡路的', String(out[0]).slice(0, 90))
+  ok(out.some((l) => /挖掉 iron_ore/.test(l)), '挖通之后把矿挖了', String(out.find((l) => /iron_ore/.test(l)) ?? '').slice(0, 90))
+  ok(!out.some((l) => /四面都被实心方块包着/.test(l)), '不再报"四面被包、我停手了"')
 }
 
 /* ─────────── ② 有一面是空的 ⇒ 照常挖 ─────────── */
@@ -146,15 +146,13 @@ section('③ 邻居读不到（区块没加载）⇒ 不拦（不能凭空拒绝
 }
 
 /* ─────────── ④ mc_act {mode:"break"} 同一条判据 ─────────── */
-section('④ breakBlock 也走同一条判据')
+section('④ breakBlock 也走同一条判据（四面全实心 ⇒ 挖进去）')
 {
   const fake = mkBot({ open: 'none' })
   const mc = mkMc(fake)
   const r = await mc.breakBlock({ x: 0, y: 64, z: 3 })
-  ok(r?.broken === false, 'broken=false', JSON.stringify({ broken: r?.broken }))
-  ok(r?.blockedBy === 'stone', 'blockedBy=stone', String(r?.blockedBy))
-  ok(/四面都被实心方块包着/.test(r?.note ?? ''), 'note 里说清四面都被包着', String(r?.note).slice(0, 80))
-  ok(fake.calls.dig === 0, '没调用 bot.dig', `dig=${fake.calls.dig}`)
+  ok(r?.broken === 'iron_ore', '四面全实心也挖通了（broken=方块名）', JSON.stringify({ broken: r?.broken }))
+  ok(fake.calls.dig >= 1, '调用了 bot.dig', `dig=${fake.calls.dig}`)
 
   const fake2 = mkBot({ open: 'north' })
   const mc2 = mkMc(fake2)

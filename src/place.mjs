@@ -24,7 +24,7 @@ import { isAir, isLiquid, canPlaceInto, isEntityItem } from './block-names.mjs'
 import { pickPlaceItem, isFullBlockItem } from './place-items.mjs'
 import { heldText } from './inventory.mjs'
 import { standableY, portalAt } from './movement.mjs'
-import { CALL_BUDGET_MS } from './budget.mjs'
+import { CALL_BUDGET_MS, needLeft, insufficientText } from './budget.mjs'
 
 /* 🔴 2026-10-23 实机（同一段时间里一条 `mc_move` 挂了 208 秒）：`b.placeBlock` 要等服务端
  *    把方块放进去才 settle，服务端不理（拒绝/失步/延迟）就**永不 settle** ——
@@ -85,6 +85,66 @@ export function placeRef (self, pos) {
  * 用"等真的离地"而不是死等固定毫秒：跳跃的滞空窗口只有几百毫秒，
  * 而 `bot.placeBlock` 内部还要先 `await bot.lookAt(...)` 再发包（`generic_place.js:37`）。
  */
+/**
+ * 放完方块**回头看世界**，而不是只看回包（用户 2026-10-29：
+ *   「竖井放置必须确认方块真的出现……要区分三种情况：服务器尚未确认、放置请求被拒绝、
+ *     方块实际已经出现但客户端没及时收到结果」）。
+ *
+ * 以前只有一个判据：`placeBlock()` 的 Promise 在 1500~2500ms 内有没有 settle。于是三种完全
+ * 不同的情况被压成一句“放不上”：
+ *   ① 服务端其实放上了，只是回包慢/丢了  → 被判失败，于是又跳又放，把人顶出竖井；
+ *   ② 服务端明确拒绝（位置被占、够不着、权限）→ 该换地方，却被当成“再试一次”；
+ *   ③ 服务端还在处理（还没回包，方块也还没出现）→ 该再等一会儿，不该立刻重试。
+ *
+ * 现在一律先看**世界**：目标格真的变成期望方块 ⇒ `appeared`（回包慢也算成功）；
+ * 拿到明确拒绝 ⇒ `refused`；到点还没有 ⇒ `pending`（说清等了多久、那格当前是什么）。
+ */
+export async function confirmPlaced (b, target, { name = null, before = null, waitMs = 1_200, stepMs = 100 } = {}) {
+  const t0 = Date.now()
+  const want = name ? String(name).replace(/^minecraft:/, '') : null
+  const was = before ? String(before).replace(/^minecraft:/, '') : null
+  const empty = new Set(['air', 'cave_air', 'void_air'])
+  let got = null
+  for (;;) {
+    try {
+      const blk = target ? b.blockAt(target, false) : null
+      got = blk?.name ? String(blk.name).replace(/^minecraft:/, '') : null
+      /* 🔴 2026-10-29：**没有期望名字时必须要求“和放置前不一样”** —— 以前只判“非空气”，
+       *   于是往水/草丛这类可替换格里放时，那格本来就有 water/grass，会被当成“放上了”，
+       *   反过来把真失败报成成功（check-core-place 就是这么照出来的）。 */
+      const okName = want ? got === want : (Boolean(got) && !empty.has(got) && got !== was)
+      if (got && !empty.has(got) && okName) {
+        return { state: 'appeared', waitedMs: Date.now() - t0, expected: want ?? (was ? `not ${was}` : null), got }
+      }
+    } catch { /* 区块没加载：继续等，不当作失败 */ }
+    if (Date.now() - t0 >= waitMs) return { state: 'pending', waitedMs: Date.now() - t0, expected: want, got }
+    await sleep(stepMs)
+  }
+}
+
+/** 目标格坐标：`placeBlock(ref, face)` 放在 `ref.position + face`。 */
+function placeTargetOf (refBlock, face) {
+  try {
+    const base = refBlock?.position ?? refBlock
+    if (!base || !face) return null
+    return new Vec3(Math.floor(Number(base.x) + Number(face.x)), Math.floor(Number(base.y) + Number(face.y)), Math.floor(Number(base.z) + Number(face.z)))
+  } catch { return null }
+}
+
+/** 这个错误算不算“服务端明确拒绝”。 */
+export function isPlaceRefused (e) {
+  return /refus|refused to place|Server refused|not allowed|denied/i.test(String(e?.message ?? e ?? ''))
+}
+
+/** 三种放置结果说成人话（工具返回 / 日志共用）。 */
+export function placeConfirmText (c) {
+  if (!c) return ''
+  const at = c.got ? `那格现在是 ${c.got}` : '那格还是空的'
+  if (c.state === 'appeared') return `方块已确认出现（${c.got}，${c.waitedMs}ms）`
+  if (c.state === 'refused') return `服务端明确拒绝放置（${at}）`
+  return `发了 ${c.waitedMs}ms 服务端还没确认、方块也没出现（${at}）`
+}
+
 export async function placeWhileJumping (b, refBlock, face, { tries = 3 } = {}) {
   let lastErr = null
   /* 🔴 2026-10-25 实机（用户：「水里搭不了方块的原因是上浮比普通跳跃慢」）：
@@ -119,13 +179,33 @@ export async function placeWhileJumping (b, refBlock, face, { tries = 3 } = {}) 
         }
         await sleep(20)
       }
+      const target = placeTargetOf(refBlock, face)
+      const want = b.heldItem?.name ?? null
+      let before = null
+      try { before = target ? (b.blockAt(target, false)?.name ?? null) : null } catch { before = null }
       try {
         await Promise.race([
           Promise.resolve(b.placeBlock(refBlock, new Vec3(face.x, face.y, face.z))),
           sleep(PLACE_TIMEOUT_MS).then(() => { throw new Error(`放方块 ${PLACE_TIMEOUT_MS}ms 没回包（服务端没理）`) }),
         ])
-        return true
-      } catch (e) { lastErr = e }
+        /* 回包成功也要复核：回包说放了、世界没变 = 幽灵方块，不能算成功。 */
+        const c = await confirmPlaced(b, target, { name: want, before, waitMs: 600 })
+        try { b.__placeConfirm = c } catch { /* 记账失败不影响结果 */ }
+        if (c.state === 'appeared') return true
+        lastErr = new Error(`回包说放上了，但 ${target?.x},${target?.y},${target?.z} 还是 ${c.got ?? '空'}`)
+      } catch (e) {
+        /* 🔴 用户 2026-10-29：没回包 ≠ 没放上。先看世界再判。 */
+        const c = await confirmPlaced(b, target, { name: want, before, waitMs: 900 })
+        try { b.__placeConfirm = c } catch { /* 同上 */ }
+        if (c.state === 'appeared') return true
+        if (isPlaceRefused(e)) {
+          try { b.__placeConfirm = { ...c, state: 'refused' } } catch { /* 同上 */ }
+          /* 明确拒绝也**继续重试**剩下的次数（服务端有时是“这一瞬”拒），
+           * 但把原始消息带上 —— 外层要按 `Server refused to place` 翻译成中文。 */
+          lastErr = new Error(`服务端明确拒绝放置 —— ${e.message}`)
+        }
+        lastErr = e
+      }
       await sleep(120)   // 落地了再跳一次
     }
     throw lastErr ?? new Error('跳起来也没放上')
@@ -223,10 +303,10 @@ export async function placeBlock (self, { x, y, z, name = null } = {}, ctx = {})
         }
         /* 🔴 2026-10-28 参数审计：这里写死 25 秒 —— 比单次调用上限（11 秒）还长，走到一半
          *    就被外层掐断，而 `walkTo` 自己以为还剩 14 秒，不会收尾。压到预算以内。 */
-        await self.walkTo({ x: spot.x, y: spot.y, z: spot.z }, {
-          arrive: 2.5,
-          budget: Math.max(1_500, Math.min(CALL_BUDGET_MS, self.msLeft() - 500)),
-        })
+        /* 🔴 2026-10-29（预算收口第一步）：剩余不够就**拒绝启动**，不再压 1500 下限。 */
+        const nb = needLeft(self, 1_000, CALL_BUDGET_MS)
+        if (!nb.ok) throw new Error(insufficientText(nb, '走到那一格旁边'))
+        await self.walkTo({ x: spot.x, y: spot.y, z: spot.z }, { arrive: 2.5, budget: nb.budgetMs })
       }
     } catch (e) { approachError = e.message }
     self._selfMovingAt = Date.now()
@@ -269,6 +349,8 @@ export async function placeBlock (self, { x, y, z, name = null } = {}, ctx = {})
       try {
         await ctx.t(placeWhileJumping(b, underFeet, { x: 0, y: 1, z: 0 }), 'place', '垫脚')
       } catch (e) { padError = e }
+      /* 🔴 用户 2026-10-29：垫脚（竖井里往上垒）必须确认方块真的出现，三种情况分别记。 */
+      try { if (b.__placeConfirm) self.log(`🧱 垫脚：${placeConfirmText(b.__placeConfirm)}`) } catch { /* 日志失败不影响 */ }
       await sleep(250)
     }
     ref = placeRef(self, pos)
@@ -296,7 +378,17 @@ export async function placeBlock (self, { x, y, z, name = null } = {}, ctx = {})
     && (pos.y === feetNow.y || pos.y === feetNow.y + 1)
   try {
     if (isOwnCell) await ctx.t(placeWhileJumping(b, ref.ref, ref.face), 'place', '跳起来放到自己脚下')
-    else await ctx.t(b.placeBlock(ref.ref, new Vec3(ref.face.x, ref.face.y, ref.face.z)), 'place', '放置方块')
+    else {
+      await ctx.t(b.placeBlock(ref.ref, new Vec3(ref.face.x, ref.face.y, ref.face.z)), 'place', '放置方块')
+      /* 🔴 用户 2026-10-29：回包成功 ≠ 方块真出现（幽灵方块 / 回包丢）。回头看一眼世界。 */
+      const c = await confirmPlaced(b, placeTargetOf(ref.ref, ref.face), { name: b.heldItem?.name ?? null, waitMs: 700 })
+      try { b.__placeConfirm = c } catch { /* 同上 */ }
+      if (c.state !== 'appeared') {
+        try { self.log(`🧱 放置未确认：${placeConfirmText(c)}`) } catch { /* 同上 */ }
+        throw new Error(`在 (${pos.x},${pos.y},${pos.z}) 放完没确认：${placeConfirmText(c)}。`
+          + '**别当成放成功了**（回包成功也可能是幽灵方块）—— 等一会儿再复核，或换点位。')
+      }
+    }
   } catch (e) {
     /* 🔴 报告⑤：上游 `place_block.js:42` 抛的是英文 `Server refused to place …`，
      *    以前原样冒泡给模型。翻译成它能用的话。 */

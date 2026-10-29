@@ -1513,16 +1513,32 @@ section('autoFloat：落水自动上浮（与 move 无关、可关）')
   ok('默认开', /autoFloat: true,/.test(autoSrc3))
   ok('三档模式都有它（ai-led 也开）', (autoSrc3.match(/autoFloat: true/g) || []).length >= 4)
   ok('显式写过就覆盖模式默认（over 列表里有 autoFloat）', /over\('autoFloat'\)/.test(autoSrc3))
-  ok('头在水下就浮（用 submergedIn 判头部方块，不看可能过期的氧气读数）',
-    /const headUnder = Boolean\(e\?\.isInWater\) && submergedIn\(b, e\)/.test(autoSrc3))
-  ok('按住 jump（走 holdCtl 统一口子）', /holdCtl\(sess, 'jump', 900/.test(autoSrc3))
-  ok('眼睛一出水立刻松手', /\} else if \(!headUnder && s\.floatHeld\) \{/.test(autoSrc3))
+  /* 🔴 2026-10-29 用户：「自动上浮跳动太大，平稳一点…最好让它稳在水面上」——
+   *    旧判据是"眼睛那格是液体就按、一出水就撒手"，出水时带上冲速度 ⇒ 冲出水面再砸回来。
+   *    现在按**水面高度**（autoFloatTop）做带死区的开关量控制。 */
+  ok('按水面高度判（autoFloatTop：连续液体最高一格 + 1）',
+    /const autoFloatTop = \(b, e\) =>/.test(autoSrc3) && /const topY = autoFloatTop\(b, e\)/.test(autoSrc3))
+  ok('不再拿"眼睛那格是液体"当开关（会同复拉锯）',
+    !/const headUnder = submerged\b/.test(autoSrc3) && !/Boolean\(e\?\.isInWater\) && submergedIn/.test(autoSrc3))
+  ok('沉到水面下 0.12 格才上浮（死区，不来回切）', /below > 0\.12/.test(autoSrc3))
+  ok('高出水面 0.10 格就松手', /below < -0\.10/.test(autoSrc3))
+  ok('快出水带冲速时提前松手（别冲过头）', /vy > 0\.20 && below < 0\.5/.test(autoSrc3))
+  ok('按住 jump（走 holdCtl 统一口子，400ms 短脉冲）', /holdCtl\(sess, 'jump', 400/.test(autoSrc3))
   ok('工具刚调完的 1.2 秒里让开（不跟 mc_move 的游泳段抢 jump）',
-    /t - num\(s\.lastToolAt, 0\) > 1_200 && t - num\(s\.floatAt, 0\) > 700/.test(autoSrc3))
+    /t - num\(s\.lastToolAt, 0\) > 1_200/.test(autoSrc3))
   ok('这一段里不叫醒、不寻路（只有 holdCtl）',
     !/if \(beh\.autoFloat !== false\) \{[\s\S]{0,700}?(wakeForDanger|startWaterRecover)/.test(autoSrc3))
   ok('状态字段齐（floatAt / floatHeld / lastFloatLoggedAt）',
     /floatAt: 0,/.test(autoSrc3) && /floatHeld: false,/.test(autoSrc3) && /lastFloatLoggedAt: 0,/.test(autoSrc3))
+  /* 行为级：假世界里"眼睛那格是水" ⇔ world.submerged，其余格子是 air。 */
+  const wet = setup({ world: { inWater: true, air: 20, submerged: true, health: 20 }, patch: { lookAround: false, waterRecover: false, autoFloat: true } })
+  wet.tick(wet.at(5000))
+  ok('泡在水面下 ⇒ 真的按住 jump 往上浮（行为级）',
+    wet.w.calls.controls.filter(([k, v]) => k === 'jump' && v === true).length >= 1)
+  const dry = setup({ world: { inWater: false, air: 20, submerged: false, health: 20 }, patch: { lookAround: false, waterRecover: false, autoFloat: true } })
+  dry.tick(dry.at(5000))
+  ok('没在水里 ⇒ 一下都不按（不会站着乱跳）',
+    dry.w.calls.controls.filter(([k, v]) => k === 'jump' && v === true).length === 0)
 }
 
 /* ───────────────────────── 汇总 ───────────────────────── */

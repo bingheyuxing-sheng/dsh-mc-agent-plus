@@ -707,6 +707,9 @@ async function shootInner (b, args = {}, ctx = {}) {
       : {}),
     fired,
     shots,
+    /* 🔴 2026-10-29（用户给的输出规范，阶段 2）：多发不再把每一发的全部字段摆出来，
+     *    正常的只计数，只有“被挡 / 高抛 / 偏差大”那几发逐条写。`shots` 字段本身不动。 */
+    text: shootTextOf({ ok, weapon, fired, shots, arrowsBefore, arrowsAfter, lastTarget, noConsume, creative, why }),
     arrows: { before: arrowsBefore, after: arrowsAfter },
     ...(why ? { why } : {}),
   }
@@ -733,4 +736,28 @@ export async function shoot (b, args = {}, ctx = {}) {
       out.held = b?.heldItem ? `${b.heldItem.name}x${b.heldItem.count ?? 1}` : '空手'
     }
   }
+}
+
+/* 🔴 2026-10-29（用户给的输出规范，阶段 2）：射箭的结果以前没有 `text`，宿主把整个返回对象压成 JSON：
+ *   每一发都带 yawDeg/pitchDeg/grade/aimError/distance/blocked/arrowsUsed/aimY/heldMs ……
+ *   射 3 发就是 3 份这种壳。可模型要知道的只有：射几发、中没中、箭剩几支、哪几发有问题。
+ */
+function shootTextOf (r) {
+  const bad = (r.shots ?? []).filter((s) => s.blocked || s.lobOver || (s.aimError != null && s.aimError > 1))
+  const lines = [
+    `${r.ok ? '🏹' : '⚠️'} ${r.weapon} 射了 ${r.fired} 发`
+      + (r.lastTarget
+        ? `（目标 ${r.lastTarget.label}${r.lastTarget.dist != null ? `，${r.lastTarget.dist.toFixed(1)} 格` : ''}）`
+        : '')
+      + `；箭 ${r.arrowsBefore} → ${r.arrowsAfter}`
+      + (r.noConsume ? '（无限/创造，不耗箭）' : ''),
+  ]
+  for (const s of bad) {
+    lines.push(`第 ${s.n + 1} 发：` + (s.blocked
+      ? `被 ${s.blocked} 挡住${Array.isArray(s.blockedAt) ? `（${s.blockedAt.join(',')}）` : ''}`
+      : s.lobOver ? `被 ${s.lobOver} 挡住，改高抛越过`
+        : `偏差 ${s.aimError} 格`))
+  }
+  if (!r.ok && r.why) lines.push(r.why)
+  return lines.join('\n')
 }

@@ -184,7 +184,7 @@ export async function runSequence (self, steps, { stopOnError = true, budgetMs =
   }
   const okCount = results.filter((r) => r.ok).length
   const dText = dangerText(danger)
-  return {
+  const out = {
     requested: steps.length, succeeded: okCount, failed: results.length - okCount,
     /* 🔴 报告⑪：`remaining` 从"第一步还没做完的"算起（**含那一步本身**）⇒ 它和 `failed` 会
      *    指向同一步。想让账目不重复，看 `succeeded === stoppedAt`（stoppedAt 之前全成功）。 */
@@ -227,7 +227,10 @@ export async function runSequence (self, steps, { stopOnError = true, budgetMs =
                 + `steps 从第 ${next + 1} 步往后发就行（前面已经做完了）。`,
     }),
   }
+  out.text = seqTextOf(out, results, steps)
+  return out
 }
+
 
 /**
  * 单个步骤的分发。
@@ -301,4 +304,43 @@ export async function runStep (self, s) {
     default:
       throw new Error(`未知步骤 op："${op}"（可用：wait/move/look/toward/place/break/dig/use/useitem/attack/equip/give/toss/say/jump/swim）`)
   }
+}
+
+/* 🔴 2026-10-29（用户给的输出规范，阶段 2）：一串步骤的结果以前没有 `text`，
+ *    宿主只能把整个返回对象压成 JSON —— 10 步全成功也要 500+ 字符，而且每步都带
+ *    `{"i":0,"op":"move","ok":true,"arrived":true,"remaining":null}` 这种壳。
+ *    现在：成功的合成区间，失败的逐条（方块名/原因/下一步线索都在里面），hint 照旧。
+ *    返回对象本身不动（套件和内部都还在读 `results`）。 */
+function seqTextOf (r, results, steps) {
+  const ok = results.filter((x) => x.ok).map((x) => x.i)
+  const bad = results.filter((x) => !x.ok)
+  const spans = []
+  if (ok.length) {
+    let a = ok[0]
+    let prev = a
+    for (const n of ok.slice(1)) {
+      if (n === prev + 1) { prev = n; continue }
+      spans.push(a === prev ? String(a + 1) : `${a + 1}–${prev + 1}`)
+      a = n
+      prev = n
+    }
+    spans.push(a === prev ? String(a + 1) : `${a + 1}–${prev + 1}`)
+  }
+  const lines = [
+    `🧩 ${steps.length} 步：做成 ${r.succeeded} 步${spans.length ? `（第 ${spans.join('、')} 步）` : ''}`
+      + (bad.length ? `，第 ${bad.map((x) => x.i + 1).join('、')} 步没做成` : '（全部做完）'),
+  ]
+  for (const x of bad) {
+    /* move 步报失败时把 `arrived` / `remaining` 一并写出来 —— note 是通用文案，
+     * 模型看不到真实数值就要再叫一次工具。 */
+    const extra = (x.op === 'move' || x.op === 'swim')
+      ? `（arrived=${x.arrived}${x.remaining != null ? `，剩余 ${x.remaining} 步` : ''}）`
+      : ''
+    lines.push(`✗ 第 ${x.i + 1} 步 ${x.op}${extra}：${String(x.note ?? x.error ?? '没说原因')}`)
+  }
+  if (r.danger?.text) lines.push(`⚠️ ${r.danger.text}`)
+  for (const w of (r.warnings ?? [])) lines.push(String(w))
+  if (r.noBudget) lines.push('⚠️ 这次调用自己没分到时间，一步都没做 —— 先复核现场，别当成没动过')
+  if (r.hint) lines.push(r.hint)
+  return lines.join('\n')
 }

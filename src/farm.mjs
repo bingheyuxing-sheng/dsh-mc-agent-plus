@@ -22,7 +22,7 @@
  * 三条约定同其它叶子模块：不 import mineflayer、不反向 import `core.mjs`、插件实例状态走 `ctx`。
  */
 import { Vec3 } from 'vec3'
-import { callBudget } from './budget.mjs'
+import { callBudget, needLeft, insufficientText } from './budget.mjs'
 import { heldSnapshotOf, restoreHeldOf } from './bridge.mjs'
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, ms)))
@@ -400,7 +400,10 @@ export async function farmArea (self, args = {}, ctx = {}) {
       // 走够近（4 格内才能点）
       const d = b.entity?.position ? b.entity.position.distanceTo(at(b, s.pos)?.position ?? s.pos) : 0
       if (d > 4) {
-        const w = await self.walkTo(s.pos, { arrive: 2, intent: 'stand', noDig: true, noTower: true, budget: Math.min(Math.max(1_000, self.msLeft() - 2_000), 4_000) })
+        /* 🔴 2026-10-29：剩余不够就跳过这一格（不再 `max(1000, 剩余-2000)` 硬压） */
+        const nb = needLeft(self, 1_000, 4_000)
+        if (!nb.ok) { skipped.push({ pos: s.pos, why: 'budget', note: insufficientText(nb, '走到这一格旁边') }); continue }
+        const w = await self.walkTo(s.pos, { arrive: 2, intent: 'stand', noDig: true, noTower: true, budget: nb.budgetMs })
         if (!w?.arrived) { skipped.push({ pos: s.pos, why: 'unreachable', note: '走不过去' }); continue }
         await sleep(120)
       }

@@ -27,7 +27,7 @@ const only = onlyIdx >= 0 ? String(args[onlyIdx + 1] ?? '') : ''
 const ORDER = [
   'check-core-dig.mjs', 'check-dig-sight.mjs', 'check-drops.mjs', 'check-block-rollback.mjs', 'check-core-digtime.mjs', 'check-core-place.mjs', 'check-core-entities.mjs', 'check-core-attack.mjs', 'check-combat-timing.mjs', 'check-core-useitem.mjs', 'check-useitem-eat.mjs', 'check-shoot.mjs', 'check-fish.mjs', 'check-prep.mjs',
   'check-core-swim.mjs', 'check-core-map.mjs', 'check-core-inventory.mjs', 'check-core-equip.mjs', 'check-armor-compare.mjs', 'check-core-evidence.mjs',
-  'check-call-budget.mjs', 'check-tool-args.mjs', 'check-token-budget.mjs', 'check-async-util.mjs', 'check-worker-pool.mjs', 'check-mc-pathfinder.mjs',
+  'check-call-budget.mjs', 'check-sequence.mjs', 'check-tool-args.mjs', 'check-token-budget.mjs', 'check-async-util.mjs', 'check-worker-pool.mjs', 'check-mc-pathfinder.mjs',
   'check-danger.mjs',
   'check-action-scheduler.mjs', 'check-perf-monitor.mjs', 'check-move-progress.mjs', 'check-bridge.mjs', 'check-terrain.mjs','check-chunk-model.mjs', 
   'check-water-navigation.mjs', 'check-water-recovery.mjs', 'check-task-epoch.mjs', 'check-msa.mjs', 'check-connection-stale.mjs',

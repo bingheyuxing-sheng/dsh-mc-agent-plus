@@ -230,10 +230,14 @@ section('④ 正常等待豁免有上限（一直挖个不停不会变成"永远
   const w = moveProgressWatcher(b, { x: 10, y: 64, z: 0 }, watchOpts(clock))
   let err = null
   w.promise.catch((e) => { err = e })
-  await clock.advance(MOVE_BUSY_MAX_MS + MOVE_STUCK_MS - 200)
-  ok(err === null, `挖着不动最多推 ${MOVE_BUSY_MAX_MS}ms，之前不判卡住`)
-  await clock.advance(MOVE_SAMPLE_MS * 2)
-  ok(err?.mcStuck === true, '🔴 一直挖超过 busyMax 之后就不再当"正常等待"，照判卡住')
+  /* 🔴 2026-10-29（用户指出的真坑）：手挖一格石头 7.5 秒 —— 旧上限 6 秒 ⇒ 没镐挖硬方块
+   *    永远判不出"正在挖"。挖着不动 7.6 秒必须**不判卡**。 */
+  await clock.advance(7_600)
+  ok(err === null, '挖着不动 7.6 秒（超过手挖一格的 7.5 秒）也不判卡 —— 挖是合法工作')
+  ok(MOVE_BUSY_MAX_MS > 7_500, '工作宽限大于手挖一格石头（7.5 秒），不再把"正在挖"误判成卡住')
+  await clock.advance(MOVE_BUSY_MAX_MS)
+  ok(err?.mcStuck === true, '🔴 一直挖超过工作上限之后仍然判卡（不是无限豁免）')
+  ok(err?.mcWorkStall === 'dig', '这条卡住带 mcWorkStall=dig（挖超时 ≠ 路不通，文案分开）')
   w.stop()
 }
 /* 🔴 2026-10-28：空中单独一档宽限。一次跳跃 ~600ms ⇒ 0.6 秒内不判卡，1.2 秒还挂着就是真挂住了。 */
@@ -251,7 +255,7 @@ section('④ 正常等待豁免有上限（一直挖个不停不会变成"永远
   /* 空中宽限比挖掘短得多：`MOVE_BUSY_AIR_MS`(0.9s) + `MOVE_STUCK_MS`(2.4s) 之后必判卡，
    * 而挖掘那档要 6s + 2.4s。 */
   ok(MOVE_BUSY_AIR_MS < MOVE_BUSY_MAX_MS && MOVE_BUSY_AIR_MS <= 1000,
-    '🔴 空中宽限（0.9s）明显短于挖掘宽限（6s）—— 一次跳跃只有 ~0.6 秒', `${MOVE_BUSY_AIR_MS}ms < ${MOVE_BUSY_MAX_MS}ms`)
+    '🔴 空中宽限（0.9s）明显短于挖/放宽限 —— 一次跳跃只有 ~0.6 秒', `${MOVE_BUSY_AIR_MS}ms < ${MOVE_BUSY_MAX_MS}ms`)
   const clock = fakeClock()
   const b = mkProbe({}, { onGround: false })   // 离地但一动不动
   const w = moveProgressWatcher(b, { x: 10, y: 64, z: 0 }, watchOpts(clock))
@@ -1199,6 +1203,23 @@ section('⑧‴ 失败结果"可操作"：眼前挡路的那格 + 泳也算三�
   ok(sh2 && sh2.pillar === 7, '背包里能垫的方块数只数便宜方块（圆石 7，铁剑不算）', JSON.stringify(sh2 && sh2.pillar))
   ok(sh2 && sh2.sides.e === 'stone', '四面哪边有落脚地报出来（东边站脚那格底是石头）', JSON.stringify(sh2 && sh2.sides))
   ok(sh2 && /能跳/.test(sh2.hint) && /垫/.test(sh2.hint), '提示同时说"能跳"和"有 N 个能垫的"')
+
+  /* 🔴 2026-10-29 实机（用户原文）：`mc_move` 返回「⛔ 走不动：困在竖井里（井口 」
+   *   —— 括号里是空的（`shaftInfoOf` 根本不返 x/y/z，文案却去读坐标）；
+   *   而且旧判据 `!/:/` 永远为真 ⇒“四面全通”也是假的。
+   *   这四条钉的就是“按真字段说话 + 给得出方向”。 */
+  {
+    const cause = mod.moveCauseTextOf({ shaft: sh2, reason: 'NoPath', stuck: true })
+    ok(/困在竖井里/.test(cause) && !/井口 \s*）/.test(cause), '竖井文案不再出现空的“井口 ”', cause)
+    ok(/头顶 2 格净空|头上就是/.test(cause), '竖井文案按真字段说清头顶是什么', cause)
+    const nx = mod.moveNextTextOf({ shaft: sh2, reason: 'NoPath', stuck: true }, true)
+    ok(/挖过去|挖开|垫/.test(nx), '竖井时给得出方向（不再只说“换个目标点”）', nx)
+    /* 这个假场景四面都是空气（所以四面都通）—— 钉的是“逐面判过、结果与 sides 键一致”，
+     * 而不是旧那句永为真的 `!/:/`。 */
+    ok(Array.isArray(sh2.openSides) && sh2.openSides.length === Object.keys(sh2.sides).length
+      && sh2.openSides.every((k) => ['n', 'e', 's', 'w'].includes(k)),
+      'shaftInfoOf 带 openSides（逐面判过、不是硬编码四面全通）', JSON.stringify(sh2.openSides))
+  }
 
   // 走不到 + 不是被抢占 ⇒ 结果里带 shaft；被抢占不带
   ok(/\(exhausted \|\| e\?\.name === 'NoPath'\) && !preempted \? \(\(\) => \{ const sh = shaftInfoOf/.test(src),
@@ -2486,8 +2507,14 @@ section('㉖ 2026-10-24 导航世界模型：实体 / 未加载 / 岩浆 都不�
   ok(/repath: 900/.test(src) && /detour: 1500/.test(src) && /breakAhead: 2400/.test(src), '便宜招远短于 2.4 秒，只有挖方块保持 2.4 秒')
   ok(/STEP_UP_TRIES = 1/.test(src), '局部台阶一次移动只试一次')
   /* 2026-10-25 实机（上阶梯卡住、头顶是空的）：跳了却没上去 ⇒ 先起跳再前进，且等朝向生效 */
-  ok(/export const STEP_UP_TURN_MS = 150/.test(src), '看向后等朝向生效（150ms）再动')
-  ok(/export const STEP_UP_JUMP_MS = 80/.test(src), '先单独起跳 80ms 再叠 forward')
+  /* 🔴 2026-10-29：旧断言把 150/80 两个数字钉死 —— 一调延迟就红（想提速时最碍事）。
+   *   改成钉**上限 + 行为**：转向 ≤150ms、起跳 ≤80ms、落地立刻继续（不是死睡）。 */
+  ok(/export const STEP_UP_TURN_MS = (\d+)/.test(src) && Number(RegExp.$1) <= 150,
+    '看向后等朝向生效，但不超过 150ms（上台阶不该为转向付大钱）')
+  ok(/export const STEP_UP_JUMP_MS = (\d+)/.test(src) && Number(RegExp.$1) <= 80,
+    '先单独起跳再叠 forward，起跳等待不超过 80ms')
+  ok(/if \(e\?\.onGround === true && Number\(e\?\.position\?\.y \?\? y0\) > y0 \+ 0\.75\) break/.test(src),
+    '落地就立刻继续（不再固定睡满 settle 时间）')
   {
     const i0 = src.indexOf('export async function stepUp')
     const seg = src.slice(i0, src.indexOf('export async function escapeMove', i0))
@@ -2917,6 +2944,274 @@ section('㉓ 目标在头顶上方 ⇒ 自动往上挖（2026-10-28 用户：「
   ok(/levels = 2/.test(src), 'clearHeadCell 支持按层清（levels）')
   ok(/const needAbove = ty != null && ty >= fy \+ 2/.test(src), 'carveStepAhead 判“目标在头顶上方 2 格以上”')
   ok(/wantY > myY\) \? 2 : 1/.test(src), '目标在上面才清 2 层，否则只清 1 层（不乱开天窗）')
+}
+
+/* 🔴 2026-10-28 实机（用户：「水下还是没有上浮，而且没有寻路」）：
+ *   游泳段以前 `lookAt(goal.offset(0, 1.0, 0))` —— 目标在下方时视线朝下，`forward` 带上向下分量，
+ *   又恒按 jump ⇒ 一上一下抵消，实测 10 秒只挪 0.68 格水平。朝向只该定水平方向。 */
+section('㉓ 游泳朝向只定水平（垂直交给 jump）')
+{
+  const mvSrc = readFileSync(new URL('../src/movement.mjs', import.meta.url), 'utf8')
+  ok(/const eyeY = Number\(b\?\.entity\?\.position\?\.y \?\? me\.y\) \+ 1\.6/.test(mvSrc), '对准点用眼睛高度（脚底 + 1.6）')
+  ok(/lookAt\(new Vec3\(goal\.x, eyeY, goal\.z\), true\)/.test(mvSrc), 'lookAt 用 (goal.x, eyeY, goal.z) —— 不再带俯角')
+  ok(!/lookAt\(goal\.offset\(0, 1\.0, 0\)/.test(mvSrc), '旧的 lookAt(goal.offset(0, 1.0, 0)) 已经不在（注释里提到不算）')
+}
+
+/* 🔴 2026-10-29 实机（session-d68855bb）：AI 顺着树冠一级级往上爬（同一目标连叫两次
+ *   mc_move，y 分别 +7 / +1），最后卡在树冠里 —— 树叶禁挖 ⇒ A* 无路，脱困阶梯原地跳 5 次。
+ *   三处修法都要钉住，否则下次动 movement 很容易被改回去。 */
+section('树类方块不当台阶 / 目标在下方不跳 / 下落不算挂住')
+{
+  const mv = readFileSync(new URL('../src/movement.mjs', import.meta.url), 'utf8')
+  ok('树叶不当"一格台阶"（isTreeBlock 拦在 stepGeometryOf 里）',
+    /if \(isTreeBlock\(feetName\)\) \{/.test(mv) && /tree: true/.test(mv))
+  ok('例外只给"目标正好落在这一格顶上"（砍树/树屋才放行）',
+    /ty === fy \+ 1 && tx === x && tz === z/.test(mv))
+  ok('目标在下方时跳过"跳跃脱困"（跳只会更高）',
+    /const goalLower = Number\.isFinite\(Number\(target\?\.y\)\)/.test(mv) && /目标在下方 —— 跳只会更高/.test(mv))
+  ok('明显在下落就不报"挂在半空一动不动"',
+    /const still = vy > -0\.06 && Math\.abs\(vy\) <= MOVE_BUSY_VY_EPS/.test(mv))
+}
+
+/* ── ㉔ mc_move 的三形态（用户 2026-10-29：「默认只返回移动结果、当前位置、目标距离和下一步建议」）── */
+{
+  const { briefMoveOf, briefMoveTextOf } = mod
+  const pos = { x: 120.7, y: 64.2, z: 305.4 }
+  const arr = briefMoveOf({ arrived: true, moved: 12.4, remaining: 0, dug: 0 }, pos)
+  ok(arr.status === 'arrived', '到达 ⇒ status="arrived"')
+  ok(arr.remaining === 0, '到达 ⇒ remaining 归 0')
+  ok(arr.position && arr.position.x === 120 && arr.position.z === 305, '到达 ⇒ position 取整到格')
+  ok(arr.moved === undefined, '到达 ⇒ 不带 moved（到达就没有"挪了多少"这回事）')
+  ok(arr.cause === undefined && arr.next === undefined, '到达 ⇒ 不带 cause/next')
+  ok(Object.keys(arr).length <= 5, '到达 ⇒ 字段收敛到 ≤5 个')
+
+  const prog = briefMoveOf({ arrived: false, reason: 'timeout', moved: 12.4, remaining: 35.2 }, pos)
+  ok(prog.status === 'progress', '时间用完（没卡住）⇒ status="progress"')
+  ok(prog.moved === 12.4 && prog.remaining === 35.2, '进展 ⇒ moved/remaining 都报')
+  ok(typeof prog.next === 'string' && prog.next.includes('再叫一次'), '进展 ⇒ next 明确"再叫一次"')
+  ok(prog.cause === undefined, '进展 ⇒ 不塞 cause（没卡住就没有原因好说）')
+  ok(Object.keys(prog).length <= 6, '进展 ⇒ 字段收敛到 ≤6 个')
+
+  const blk = briefMoveOf({
+    arrived: false,
+    reason: 'stuck',
+    moved: 0,
+    remaining: 35,
+    stuck: true,
+    blockedAhead: { x: 121, y: 64, z: 306, name: 'stone', cell: 'feet', headroom: 0 },
+    roadInfo: () => ({}), nearBlocks: ['a', 'b'],
+    planTried: ['jump', 'breakAhead'],
+    hint: '这一大段话不该出现在返回里',
+  }, pos)
+  ok(blk.status === 'blocked', '卡住 ⇒ status="blocked"')
+  ok(blk.reason === 'stuck', '卡住 ⇒ 带 reason')
+  ok(typeof blk.cause === 'string' && blk.cause.includes('stone') && blk.cause.includes('121,64,306'), '卡住 ⇒ cause 说清挡路的是哪格什么方块')
+  ok(typeof blk.next === 'string' && blk.next.includes('挖开'), '卡住 ⇒ next 给出可执行建议')
+  ok(Object.keys(blk).length <= 8, '卡住 ⇒ 字段也收敛到 ≤8 个')
+  ok(blk.hint === undefined && blk.planTried === undefined && blk.nearBlocks === undefined, '卡住 ⇒ 长 hint / 逐级 planTried / 邻块清单不进返回')
+
+  ok(briefMoveTextOf(arr).startsWith('✅ 到了'), '文案：到达一句话')
+  ok(briefMoveTextOf(prog).includes('还差 35.2 格'), '文案：进展带剩余格数')
+  ok(briefMoveTextOf(blk).startsWith('⛔ 走不动：'), '文案：卡住先说"走不动"')
+  ok(briefMoveTextOf(prog).split('\n').length === 1, '文案：永远一行')
+
+  const idxSrc = (await import('node:fs/promises')).readFile ? await (await import('node:fs/promises')).readFile(new URL('../index.js', import.meta.url), 'utf8') : ''
+  ok(/const\s+finish\s*=\s*\(res\)\s*=>\s*\{[\s\S]{0,400}?briefMoveOf\(res/.test(idxSrc), 'index.js：mc_move 走 finish（brief）出口')
+  ok(/mc_move 明细 target=/.test(idxSrc), 'index.js：明细写进本地日志（不进模型上下文）')
+  ok(!/walkWithAutoDig\([^\n]*\), \{ expect: 'moved' \}\), \.\.\.aroundOf\(sess\)/.test(idxSrc), 'index.js：walk 分支不再把周围方块清单塞进返回')
+}
+
+/* 🔴 2026-10-29（用户：「mc_move noDig:false 为什么没直接挖过去」→「A 和 B」）：
+ *   A*（mineflayer-pathfinder）只为**水平**移动生成“挖穿”，脚下那一格永远不动 ⇒ 目标在下方时
+ *   无论 canDig 是不是 true 都 NoPath。所以自己补两种往下的动作：
+ *   `dropThrough`（B，挖脚下掉下去）与 `stepDown`（A，挖斜下台阶下一层）。 */
+const dropThrough = mod.dropThrough
+const stepDown = mod.stepDown
+
+function mkDownBot (cells, at = [0, 64, 0], opts = {}) {
+  const b = mkCarveBot(cells, at)
+  /* 假 bot 原本只给 `{name, position}`；真实 prismarine-block 有 `boundingBox`。
+   * `stepDown` / `dropThrough` 靠 `boundingBox === 'block'` 判“能不能站/能不能挖”，这里补上。 */
+  const blockAt0 = b.blockAt
+  b.blockAt = (v) => {
+    const r = blockAt0(v)
+    r.boundingBox = r.name === 'air' ? 'empty' : 'block'
+    return r
+  }
+  b.controls = []
+  b.stopDigging = () => {}
+  b.lookAt = async () => {}
+  b.entity.onGround = true
+  const dig0 = b.dig
+  b.dig = async (blk) => {
+    await dig0(blk)
+    if (opts.fallTo != null && Number(blk.position.y) === at[1] - 1) {
+      b.entity.position = new Vec3(at[0], opts.fallTo, at[2])
+      b.entity.onGround = true
+    }
+  }
+  b.setControlState = (k, v) => {
+    b.controls.push([k, v])
+    if (k === 'forward' && v && opts.walkTo) {
+      b.entity.position = new Vec3(...opts.walkTo)
+      b.entity.onGround = true
+    }
+  }
+  return b
+}
+
+{
+  /* B-1 成功：脚下 (0,63,0) 石头，往下 (0,61,0) 是实心 ⇒ 落点 y=62，落差 2 格 */
+  const b = mkDownBot({ '0,63,0': 'stone', '0,61,0': 'stone' }, [0, 64, 0], { fallTo: 62 })
+  const r = await dropThrough(b, { x: 0, y: 51, z: 0 })
+  ok(r.tried && r.ok && r.down === 2, 'B：目标在脚下 ⇒ 挖开脚下掉下去', JSON.stringify(r))
+  ok(b.dug.includes('0,63,0'), 'B：挖的就是脚下那一格', JSON.stringify(b.dug))
+  ok(!b.dug.includes('0,64,0'), 'B：不挖自己站的那一格', JSON.stringify(b.dug))
+}
+{
+  /* B-2 落差太大：下面全空 ⇒ 不挖 */
+  const b = mkDownBot({ '0,63,0': 'stone' }, [0, 64, 0])
+  const r = await dropThrough(b, { x: 0, y: 40, z: 0 })
+  ok(r.tried && !r.ok && r.why === 'no-landing' && b.dug.length === 0,
+    'B：3 格内没有能站的落点 ⇒ 不挖', JSON.stringify(r))
+}
+{
+  /* B-3 下面是岩浆 ⇒ 不挖 */
+  const b = mkDownBot({ '0,63,0': 'stone', '0,61,0': 'lava' }, [0, 64, 0])
+  const r = await dropThrough(b, { x: 0, y: 40, z: 0 })
+  ok(!r.ok && r.why === 'liquid-below' && b.dug.length === 0,
+    'B：挖开会掉进岩浆 ⇒ 不挖', JSON.stringify(r))
+}
+{
+  /* B-4 脚下本来就是空的（人在掉）⇒ 不是“挖脚下”能解的局面 */
+  const b = mkDownBot({}, [0, 64, 0])
+  const r = await dropThrough(b, { x: 0, y: 40, z: 0 })
+  ok(r.tried === false && r.why === 'not-solid', 'B：脚下本就是空的 ⇒ 不动手', JSON.stringify(r))
+}
+{
+  /* B-5 脚下是基岩 ⇒ 挖不动，不硬挖 */
+  const b = mkDownBot({ '0,63,0': 'bedrock', '0,61,0': 'stone' }, [0, 64, 0])
+  const r = await dropThrough(b, { x: 0, y: 40, z: 0 })
+  ok(r.tried && !r.ok && r.why === 'protected' && b.dug.length === 0,
+    'B：脚下挖不动 ⇒ 不硬挖、而且说清原因', JSON.stringify(r))
+}
+{
+  /* A-1 成功：往 +x 下一层（挖 (1,63,0)/(1,64,0)，地面 (1,62,0) 实心） */
+  const b = mkDownBot(
+    { '1,63,0': 'stone', '1,64,0': 'stone', '1,62,0': 'stone' },
+    [0, 64, 0], { walkTo: [1, 63, 0] },
+  )
+  const r = await stepDown(b, { x: 3, y: 63, z: 0 })
+  ok(r.tried && r.ok && r.down === 1 && r.dug === 2,
+    'A：挖斜下台阶（脚+头两格）走下一层', JSON.stringify(r))
+  ok(b.dug.includes('1,63,0') && b.dug.includes('1,64,0'), 'A：两格都挖开了（2 格高的通道）', JSON.stringify(b.dug))
+  ok(b.controls.some(([k, v]) => k === 'forward' && v === true) && b.controls.some(([k, v]) => k === 'forward' && v === false),
+    'A：走过去之后把 forward 松开（不留残控制位）', JSON.stringify(b.controls))
+}
+{
+  /* A-2 落点不是实心（下面是空的）⇒ 不挖，不把人送进坑 */
+  const b = mkDownBot({ '1,63,0': 'stone', '1,64,0': 'stone' }, [0, 64, 0])
+  const r = await stepDown(b, { x: 3, y: 63, z: 0 })
+  ok(r.tried === false && r.why === 'no-step' && b.dug.length === 0,
+    'A：旁边是坑不是台阶 ⇒ 一格不挖', JSON.stringify(r))
+}
+{
+  /* A-3 不挖的模式 ⇒ 不动手，并说清为什么 */
+  const b = mkDownBot(
+    { '1,63,0': 'stone', '1,64,0': 'stone', '1,62,0': 'stone' },
+    [0, 64, 0], { walkTo: [1, 63, 0] },
+  )
+  const r = await stepDown(b, { x: 3, y: 63, z: 0 }, { allowDig: false })
+  ok(r.tried && !r.ok && r.why === 'no-dig' && b.dug.length === 0,
+    'A：noDig 模式下只告知、不挖', JSON.stringify(r))
+}
+/* 🔴 2026-10-29 实机：「move 到一半死了」，却报「挂在半空不动（离地 0 格）」 */
+{
+  const cause = mod.moveCauseTextOf({ dead: true })
+  ok(/死了/.test(cause) && !/半空/.test(cause), '死了就说死了，不说“挂在半空”', cause)
+  const nx = mod.moveNextTextOf({ dead: true }, true)
+  ok(/复活|重生/.test(nx), '死了的下一步：等复活', nx)
+}
+{
+  /* 离地高度读的是 `airborne.dy`（旧文案读 `a.dy` 但那个字段从来不存在 ⇒ 恒 0） */
+  ok(/离地 3 格/.test(mod.moveCauseTextOf({ airborne: { still: true, dy: 3 } })), '离地高度按真字段报')
+  ok(!/半空/.test(mod.moveCauseTextOf({ airborne: { vy: -0.5, vh: 0.2 } })), '还在下落的不算“挂着”')
+}
+/* 2026-10-29 用户：往下自救的次数「按时间」算，不钉死 3 次 */
+{
+  ok(mod.downBudgetOk({ msLeft: () => 5000 }) === true, '剩 5 秒 ⇒ 够往下挖一层')
+  ok(mod.downBudgetOk({ msLeft: () => 1000 }) === false, '剩 1 秒 ⇒ 不开工（开了也没结果）')
+  ok(mod.downBudgetOk({}) === true, '拿不到剩余时间 ⇒ 当“够”，不因为查不到就不干活')
+  ok(mod.MOVE_DOWN_TRIES >= 5, '硬上限只防死循环（不再是 3）', String(mod.MOVE_DOWN_TRIES))
+}
+/* ── 往上走（climbUp）：目标在头顶、又没有现成台阶时的那一层 ──────────────────
+ * 为什么单列：A* 只为**水平**移动生成“挖穿”，`stepUp` 只吃已经存在的 1 格台阶；
+ * 目标在头顶好几格、周围没台阶时它一律 NoPath。用户 2026-10-29：「把往下走和往上走都当作正常的」。 */
+{
+  const climbUp = mod.climbUp
+  function mkUpBot (cells, at = [0, 64, 0], opts = {}) {
+    const b = mkCarveBot(cells, at)
+    const blockAt0 = b.blockAt
+    b.blockAt = (v) => {
+      const r = blockAt0(v)
+      r.boundingBox = r.name === 'air' ? 'empty' : 'block'
+      return r
+    }
+    b.controls = []
+    b.stopDigging = () => {}
+    b.lookAt = async () => {}
+    b.entity.onGround = true
+    const dig0 = b.dig
+    const dug = []
+    b.dig = async (blk) => { await dig0(blk); dug.push(`${blk.position.x},${blk.position.y},${blk.position.z}`) }
+    b.setControlState = (k, v) => {
+      b.controls.push([k, v])
+      if (k === 'forward' && v && opts.lift) {
+        b.entity.position = new Vec3(opts.lift[0], opts.lift[1], opts.lift[2])
+        b.entity.onGround = true
+      }
+    }
+    b.dugList = dug
+    return b
+  }
+  {
+    const b = mkUpBot({ '1,65,0': 'stone', '1,66,0': 'stone', '1,64,0': 'stone' }, [0, 64, 0], { lift: [1, 65, 0] })
+    const r = await climbUp(b, { x: 0, y: 72, z: 0 })
+    ok(r.ok === true && r.up >= 0.75 && r.dug === 2, '往上走：挖开斜上方两格后真的站上去了', JSON.stringify(r))
+    ok(b.dugList.includes('1,65,0') && b.dugList.includes('1,66,0'), '往上走：脚位 + 头位都挖了（2 格高才跳得进去）', b.dugList.join(' '))
+  }
+  {
+    const b = mkUpBot({ '1,65,0': 'stone', '1,66,0': 'stone' }, [0, 64, 0])
+    const r = await climbUp(b, { x: 0, y: 72, z: 0 })
+    ok(r.tried === false && r.why === 'no-floor', '往上走：斜下方没有实心落脚面就不挖', JSON.stringify(r))
+  }
+  {
+    const b = mkUpBot({ '1,65,0': 'water', '1,66,0': 'stone', '1,64,0': 'stone' }, [0, 64, 0])
+    const r = await climbUp(b, { x: 0, y: 72, z: 0 })
+    ok(r.tried === false && r.why === 'liquid', '往上走：斜上方是水/岩浆就不挖', JSON.stringify(r))
+  }
+  {
+    const b = mkUpBot({ '1,65,0': 'bedrock', '1,66,0': 'stone', '1,64,0': 'stone' }, [0, 64, 0])
+    const r = await climbUp(b, { x: 0, y: 72, z: 0 })
+    ok(r.tried === false && r.why === 'protected', '往上走：挖不动的方块（基岩）不碰', JSON.stringify(r))
+  }
+  {
+    const b = mkUpBot({ '1,65,0': 'stone', '1,66,0': 'stone', '1,64,0': 'stone' }, [0, 64, 0])
+    const r = await climbUp(b, { x: 0, y: 72, z: 0 }, { allowDig: false })
+    ok(r.tried === false && r.why === 'no-dig' && b.dugList.length === 0, '往上走：不许挖的那一趟一格都不动', JSON.stringify(r))
+  }
+  {
+    const b = mkUpBot({ '1,65,0': 'stone', '1,66,0': 'stone', '1,64,0': 'stone' }, [0, 64, 0])
+    const r = await climbUp(b, { x: 0, y: 72, z: 0 })
+    ok(r.tried === true && r.ok === false && r.why === 'no-lift', '往上走：挖开了但人没上去 ⇒ 不报成功', JSON.stringify(r))
+  }
+  {
+    const src = read('../src/movement.mjs')
+    ok(/export async function climbUp \(/.test(src), 'movement.mjs 里有 climbUp（往上走的能力）', '')
+    ok(/upTries < MOVE_UP_TRIES && downBudgetOk\(self\)/.test(src), '往上走也吃同一份时间预算（不是无限次）', '')
+    ok(/ascendTried/.test(src) && /ascend:/.test(src), '往上走的账单独记，不混进“脱困阶梯”', '')
+    ok(/🧗 目标在头顶/.test(src), '往上走有独立日志（不与脱困混淆）', '')
+  }
 }
 
 console.log(`check-move-progress：pass=${pass} fail=${fail}`)

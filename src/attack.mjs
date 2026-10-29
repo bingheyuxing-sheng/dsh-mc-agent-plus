@@ -54,6 +54,9 @@
 import { sleep } from './async-util.mjs'
 import { callBudget } from './budget.mjs'
 import { HOSTILE_RE, RANGED_RE, JUNK_RE, NAME_ALIAS, entityNameOf, nameFieldsOf, hostilityOf } from './entity-names.mjs'
+/* 会逃的被动动物：跑得比我们走路还快（羊 ≈4.6 格/秒 vs 4.3）⇒ 追的时候要单独判“追不上”。
+ * 2026-10-29 实机：`mc_attack {who:"sheep"}` 干等 9.5 秒、距离仍在 9.7 格。 */
+const FLEE_RE = /sheep|cow|pig|chicken|rabbit|fox|horse|donkey|mule|llama|panda|turtle|ocelot|cat|wolf|parrot|axolotl|goat|frog|camel|strider|mooshroom|polar_bear/i
 import { dropHint, dropListOf, entityHealth } from './world-observer.mjs'
 import { swingCooldownMsOf } from './combat-timing.mjs'
 import { durabilityOf, EQUIP_SLOTS } from './inventory.mjs'
@@ -441,11 +444,17 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
           break
         }
         /* ② 远程目标越跑越远（持续 2.5 秒距离都在变大、且已经 >6 格）⇒ 别把预算花在追屁股上 */
+        /* 🔴 2026-10-29（用户：「attack 卡住了 sheep … 追了 9.5 秒」）：会逃的**被动动物**
+         *   （羊 4.6 格/秒 > 我们走路 4.3 格/秒）以前不在放弃名单里 ⇒ 整整 9.5 秒干等。
+         *   它们同样“越跑越远就该收手”，给 2 秒 / 7 格的宽限（动物被打一下会先跑一段，
+         *   给太短会打不死）。 */
+        const fleer = FLEE_RE.test(label)
         const dd = distOf(target)
         if (dd <= lastDist - 0.15) grewSince = 0
         else if (dd >= lastDist + 0.15 && !grewSince) grewSince = Date.now()
         lastDist = dd
-        if (grewSince && Date.now() - grewSince >= 900 && dd > 6 && RANGED_RE.test(label)) {
+        if (grewSince && Date.now() - grewSince >= (fleer ? 2_000 : 900)
+          && dd > (fleer ? 7 : 6) && (RANGED_RE.test(label) || fleer)) {
           chaseGiveUp = true
           break
         }
@@ -482,7 +491,10 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
       note = `这一轮挨了 ${(hpStart - Number(b.health)).toFixed(0)} 点伤害 —— 血掉太快，提前收手（先撤或找掩体，别硬顶）`
     }
     if (chaseGiveUp) {
-      note = `目标越跑越远（现在 ${distOf(target).toFixed(1)} 格）—— 远程怪边跑边射，追不上；先找掩体/绕侧，或换目标`
+      note = FLEE_RE.test(label)
+        ? `「${label}」一直在逃（现在 ${distOf(target).toFixed(1)} 格）—— 它跑得比我们走路快（4.6 vs 4.3 格/秒），`
+          + '硬追只是烧时间：用 `mc_shoot` 打，或者先用方块把它围住/逼进角落'
+        : `目标越跑越远（现在 ${distOf(target).toFixed(1)} 格）—— 远程怪边跑边射，追不上；先找掩体/绕侧，或换目标`
     }
     /* 打死了 ⇒ 掉落物就掉在原地。用户 2026-10-08 原话："打完动物以后老是忘记走过去拾取" ——
      * 只**点一句**，不替它走过去（先捡哪个、走多远是决策，而且这一轮的预算基本已经花完了）。 */
@@ -499,10 +511,18 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
          *   现在追击是自己走过去的，走不动的原因能直接带出来（NoPath / 卡住 / 目标在飞）。 */
         : `追了 ${(waitedMs / 1000).toFixed(1)} 秒还没进到攻击距离（3.5 格）—— `
           + (moveErr ? `走近时失败：${moveErr}` : '走不过去 / 被方块挡住 / 目标跑太快')
-          + '；先 mc_move 到它旁边，或者换个近一点的目标'
+          /* 🔴 2026-10-29：会跑的动物（羊 4.6 格/秒）比我们走路 4.3 格/秒还快 —— 以前只说"目标跑太快"，
+           *   模型就反复再叫一次攻击。把「我挪了几格 / 它时速多少」摆出来，它才知道该换手段。 */
+          + (mem.approachMoved != null || mem.targetSpeed
+            ? `（这段我挪了 ${mem.approachMoved ?? 0} 格，它约 ${mem.targetSpeed ?? '?'} 格/秒；我走路只有 4.3 格/秒）`
+              + (Number(mem.targetSpeed ?? 0) > 4 ? '—— **比我快，追不上**：用 mc_shoot 打，或先把它逼进角落/用方块围住' : '')
+            : '')
+          + '；也可以先 mc_move 到它旁边，或换个不跑的目标'
     }
     return {
       attacked: label, distance: d, killed, gone, health: b.health, via: 'pvp', waitedMs,
+      ...(mem.approachMoved != null ? { approachMoved: mem.approachMoved } : {}),
+      ...(mem.targetSpeed ? { targetSpeed: mem.targetSpeed } : {}),
       ...(hpBefore != null && hpAfter != null && hpBefore !== hpAfter ? { targetHealth: `${hpBefore} → ${hpAfter}` } : {}),
       ...(note ? { note } : {}),
       ...(pickup ? { pickup } : {}),
@@ -865,19 +885,51 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
        *    往下等 —— 垂直方向它基本不自己解决。所以只要还没进攻击距离，差 2 格以上也先走上去
        *    （我们的 walkTo 会跳、会挖、会垫）。 */
       const dy0 = Math.abs(Number(target?.position?.y ?? 0) - Number(b.entity?.position?.y ?? 0))
-      if (d0 > 8 || (dy0 >= 2 && d0 > 3.5)) {
+        /* 🔴 2026-10-29 实机（用户：「为什么越改越差啊……走过去 打。为什么现在连打怪都不行了」）：
+         *   门槛 8 格是**错的**：3.5~8 格这段最该自己走过去，却被交给 pvp 的 `GoalFollow` 裸跟 ——
+         *   实机 `distance:4.7`、`actions:["engage"]`、6.1 秒后判「一直在逃」放弃；`distance:6.7`
+         *   更是干等 10.1 秒一点没动。**只要不在攻击距离内，就自己走**（`walkTo` 会挖、会跳、会绕）。 */
+        if (d0 > 3.5) {
         const mp = b.entity?.position
         const tp = target.position
-        const pt = mp && tp ? approachPointOf({ x: mp.x, y: mp.y, z: mp.z }, { x: tp.x, y: tp.y, z: tp.z }, 2.2) : null
-        const pickMs = Math.min(budgetLeft() - 2_000, 2_000)
+        /* 🔴 2026-10-29 实机（用户：「ai 走到了之前羊的位置，调用了 attack，之后就没动了」）：
+         *   ① `approachPointOf` 算的是「目标**当时**的位置 + 2.2 格」—— 羊 4.6 格/秒，走到那儿它早没了，
+         *      等于每轮都在朝一个空点跑；② `pickMs` 封顶 2 秒 —— 10 秒的调用里走近只占 2 秒。
+         *   改成朝**预测拦截点**走：按目标当前速度前瞻「追到它要几秒」，把点前移那么多。
+         *   （MC 的 `entity.velocity` 单位是 格/tick ⇒ ×20 得格/秒。） */
+        const tvx = Number(target?.velocity?.x ?? 0) * 20
+        const tvz = Number(target?.velocity?.z ?? 0) * 20
+        const tSpeed = Math.hypot(tvx, tvz)
+        mem.targetSpeed = Math.round(tSpeed * 10) / 10
+        const lead = Math.max(0, Math.min(1.5, d0 / 5.6))
+        const pred = tp ? { x: tp.x + tvx * lead, y: tp.y, z: tp.z + tvz * lead } : null
+        /* 🔴 2026-10-29（用户：「它现在是没有动」「不是追不上」）：`approachPointOf(me, target, 2.2)`
+         *   生成的是**我朝目标方向 2.2 格**的那个点（不是“离目标 2.2 格”）——再配 `arrive: 2.0`，
+         *   等于“只要挪 0.2 格就算到了” ⇒ 每次 approach 只前蹭 0.2 格，人看着压根没动，
+         *   9.7 格始终是 9.7 格，10 秒预算烧完报“追不上”。**这才是真根因**，跟预测无关。
+         *   现在按“走到离目标 3.2 格（攻击距离 3.5 以内）”算步长，`arrive` 收到 1.2。 */
+        const stepLen = Math.max(1.5, d0 - 3.2)
+        const pt = mp && pred ? approachPointOf({ x: mp.x, y: mp.y, z: mp.z }, pred, stepLen) : null
+        /* 给足 4 秒：追上 9 格外的目标本来就要 2~3 秒，2 秒只够挪一半。 */
+        const pickMs = Math.min(budgetLeft() - 1_500, 4_000)
         if (pt && pickMs >= 600) {
+          const p0 = mp ? { x: mp.x, y: mp.y, z: mp.z } : null
           try {
-            await ctx.moveTo(pt, { arrive: 2.0, budget: pickMs, reason: `战斗接近：先走到「${label}」旁边` })
-            mem.approachFails = 0
+            await ctx.moveTo(pt, { arrive: 1.2, budget: pickMs, reason: `战斗接近：先走到「${label}」旁边` })
           } catch (e) {
             moveErr = String(e?.message ?? e).slice(0, 140)
-            mem.approachFails = (mem.approachFails ?? 0) + 1
           }
+          /* 这一轮实际挪了多少格：追不上时模型靠这个判断「它比我快」而不是「我卡住了」 */
+          let dm = 0
+          try {
+            const p1 = b.entity?.position
+            if (p0 && p1) dm = Math.hypot(p1.x - p0.x, p1.z - p0.z)
+          } catch { /* 忽略 */ }
+          /* 🔴 2026-10-29（用户：「它现在是没有动」）：`moveTo` 回来说“到了”**不代表真挪了** ——
+           * 目标点算错时它挪 0.2 格就判到达，人被记成“接近成功”，然后原地等到预算烧完。
+           * 挪不到 0.6 格一律记一次失败，不许把“原地踏步”算成一次成功的接近。 */
+          mem.approachFails = dm < 0.6 ? (mem.approachFails ?? 0) + 1 : 0
+          mem.approachMoved = Math.round(((mem.approachMoved ?? 0) + dm) * 10) / 10
           mem.repositions++
           mem.lastInRange = null
           actions.push('approach')

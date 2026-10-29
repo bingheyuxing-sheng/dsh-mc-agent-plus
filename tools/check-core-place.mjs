@@ -209,10 +209,18 @@ section('⑦ 原地搭高（垫脚）—— 必须先离地再放')
   // `placeBlock` 只在离地时成功 —— 照抄服务端的真实行为。
   const makeBot = ({ alwaysRefuse = false } = {}) => {
     const calls = []
+    /* 🔴 2026-10-29：`placeWhileJumping()` 现在会**回头看世界**确认方块真出现
+     *   （用户：「竖井放置必须确认方块真的出现」），所以假 bot 也得有 `blockAt` 和
+     *   "放完那格真的变了"的行为 —— 否则永远判 pending。 */
+    const placedCells = new Set()
     const bot = {
       _air: false,
       _jump: false,
       entity: { position: { x: 0.5, y: 20, z: 0.5 } },
+      blockAt (p) {
+        const k = `${Math.floor(Number(p?.x))},${Math.floor(Number(p?.y))},${Math.floor(Number(p?.z))}`
+        return { name: placedCells.has(k) ? 'cobblestone' : 'air', boundingBox: placedCells.has(k) ? 'block' : 'empty' }
+      },
       setControlState (k, v) {
         if (k !== 'jump') return
         calls.push(`jump:${v}`)
@@ -220,11 +228,14 @@ section('⑦ 原地搭高（垫脚）—— 必须先离地再放')
         if (v) setTimeout(() => { if (this._jump) { this._air = true; this.entity.position.y = 20.3 } }, 30)
         else { this._air = false; this.entity.position.y = 20 }
       },
-      async placeBlock () {
+      async placeBlock (r, face) {
         calls.push(this._air ? 'place:air' : 'place:ground')
         if (alwaysRefuse || !this._air) {
           throw new Error('Server refused to place cobblestone at (0,20,0): the block is still air')
         }
+        const base = r?.position ?? r
+        const k = `${Math.floor(Number(base.x) + Number(face.x))},${Math.floor(Number(base.y) + Number(face.y))},${Math.floor(Number(base.z) + Number(face.z))}`
+        placedCells.add(k)   // 服务端放上了 ⇒ 世界真的变
       },
       lookAt: async () => {},
     }
@@ -509,6 +520,54 @@ section('⑨ 传送门旁边不放方块（用户 2026-10-25 实机：会在框�
     const r = await placeBlock(self, { x: 0, y: 20, z: 0, name: 'cobblestone' }, ctx)
     ok(r.placed === 'cobblestone' && calls.includes('place'), '只认传送门方块名，框架不算门', JSON.stringify({ placed: r.placed }))
   }
+}
+
+/* ── ⑤ 放置后必须回头确认方块真的出现（用户 2026-10-29）── */
+/* 「要区分三种情况：服务器尚未确认、放置请求被拒绝、方块实际已经出现但客户端没及时收到结果」。 */
+{
+  const { confirmPlaced, isPlaceRefused, placeConfirmText } = await import('../src/place.mjs')
+  const mk = (names) => {
+    let i = 0
+    return {
+      blockAt: () => ({ name: names[Math.min(i++, names.length - 1)] }),
+    }
+  }
+
+  /* ① 世界已经出现 ⇒ appeared（哪怕回包丢了也算成功） */
+  {
+    const c = await confirmPlaced(mk(['cobblestone']), { x: 0, y: 20, z: 0 }, { name: 'cobblestone', waitMs: 200 })
+    ok(c.state === 'appeared' && c.got === 'cobblestone', '方块真出现了 ⇒ appeared（回包慢也算成功）', JSON.stringify(c))
+  }
+  /* ② 一直空 ⇒ pending（说清等了多久、那格现在是什么） */
+  {
+    const c = await confirmPlaced(mk(['air']), { x: 0, y: 20, z: 0 }, { name: 'cobblestone', waitMs: 200, stepMs: 50 })
+    ok(c.state === 'pending' && c.got === 'air', '一直没出现 ⇒ pending（不是"失败"，是"没确认"）', JSON.stringify(c))
+    ok(/还没确认/.test(placeConfirmText(c)), 'pending 的文案说清"服务端还没确认、方块也没出现"', placeConfirmText(c))
+  }
+  /* ③ 那格原本就是 water ⇒ 不许当成"放上了" */
+  {
+    const c = await confirmPlaced(mk(['water']), { x: 0, y: 20, z: 0 }, { before: 'water', waitMs: 150, stepMs: 50 })
+    ok(c.state === 'pending', '🔴 原本就是水/草的可替换格：没变过就不算放上（以前会误报成功）', JSON.stringify(c))
+    const c2 = await confirmPlaced(mk(['stone']), { x: 0, y: 20, z: 0 }, { before: 'water', waitMs: 150 })
+    ok(c2.state === 'appeared', '真变了（水 → 石头）⇒ appeared', JSON.stringify(c2))
+  }
+  /* ④ 期望名字对不上 ⇒ 不算 */
+  {
+    const c = await confirmPlaced(mk(['dirt']), { x: 0, y: 20, z: 0 }, { name: 'cobblestone', waitMs: 150, stepMs: 50 })
+    ok(c.state === 'pending', '放的是圆石、那格是泥土 ⇒ 不算放上', JSON.stringify(c))
+  }
+  /* ⑤ 拒绝的识别 + 文案三态 */
+  ok(isPlaceRefused(new Error('Server refused to place cobblestone at (0,20,0): the block is still air')), '识别 "Server refused to place"')
+  ok(!isPlaceRefused(new Error('放方块 2500ms 没回包（服务端没理）')), '没回包 ≠ 拒绝（要分开判）')
+  ok(/服务端明确拒绝/.test(placeConfirmText({ state: 'refused', waitedMs: 10, got: 'air' })), 'refused 的文案说"明确拒绝"')
+  ok(/已确认出现/.test(placeConfirmText({ state: 'appeared', waitedMs: 10, got: 'cobblestone' })), 'appeared 的文案说"已确认出现"')
+
+  /* ⑥ 源码：跳放那条路回包成功也要复核；拒绝要继续重试而不是一次就罢手 */
+  const ps = await (await import('node:fs/promises')).readFile(new URL('../src/place.mjs', import.meta.url), 'utf8')
+  ok(/await confirmPlaced\(b, target, \{ name: want, before, waitMs: 600 \}\)/.test(ps), '跳放：回包成功之后还复核一次世界（幽灵方块）')
+  ok(/await confirmPlaced\(b, target, \{ name: want, before, waitMs: 900 \}\)/.test(ps), '跳放：没回包时先看世界再判失败')
+  ok(/if \(isPlaceRefused\(e\)\)/.test(ps), '明确拒绝单独记账（state:"refused"）')
+  ok(!/throw new Error\(`服务端明确拒绝放置/.test(ps), '明确拒绝也继续重试剩下的次数（不是一次就放弃）')
 }
 
 console.log(`\n${fail === 0 ? '✓ 全部通过' : '✗ 有失败'}：pass=${pass} fail=${fail}`)

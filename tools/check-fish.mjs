@@ -63,7 +63,10 @@ console.log('── 2. 有竿但抛出去没有浮标（前方不是水）')
   ok(r.reason === 'no-bobber', 'reason=no-bobber')
   ok(/水/.test(r.message), '提示里说不是水')
   ok(b.activated === 1, '只抛了一次')
-  ok(Date.now() - t0 >= 1400, '等满了浮标出现的窗口（1.5s）')
+  /* 🔴 2026-10-29（预算收口）：窗口现在受 `timeoutMs` 约束 —— timeoutMs=300 时
+   *    只等 150ms 就收手（旧行为是死等满 1.5 秒，越过调用方给的时间）。 */
+  ok(Date.now() - t0 >= 120, '等满了本次允许的浮标窗口（不再提前放弃）')
+  ok(Date.now() - t0 < 1400, '不会死等 1.5 秒（timeoutMs=300 时窗口被压短）')
 }
 
 console.log('── 3. 浮标明显下沉 ⇒ 咬钩、收竿')

@@ -60,7 +60,9 @@ export async function fishOnce (b, { timeoutMs = 8000 } = {}) {
   if (!bob) {
     await b.activateItem()
     const t = Date.now()
-    while (!bob && Date.now() - t < SPAWN_WAIT_MS) {
+    /* 🔴 2026-10-29：等浮标出现也要受本次 timeoutMs 约束（本函数没有 `self`，用入参当上限） */
+    const waitSpawn = Math.max(150, Math.min(SPAWN_WAIT_MS, Number(timeoutMs) - 300))
+    while (!bob && Date.now() - t < waitSpawn) {
       await sleep(POLL_MS)
       bob = findBobber(b)
     }

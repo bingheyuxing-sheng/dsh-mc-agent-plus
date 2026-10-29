@@ -21,6 +21,7 @@
 import vec3pkg from 'vec3'
 import { placeEntityItem } from './place.mjs'
 import { inWaterNow } from './world-observer.mjs'
+import { needLeft, insufficientText } from './budget.mjs'
 
 const Vec3 = vec3pkg
 
@@ -137,7 +138,18 @@ export async function driveBoat (self, target, { arrive = 2, budget = 9_000, pol
   const trace = []
   let lastTrace = -1e9
 
-  while (Date.now() - t0 < Math.max(150, Number(budget) || 9_000)) {
+  /* 🔴 2026-10-29：以前是 `max(150, budget || 9000)` —— 完全不看本轮剩余，开船把整轮吃光。
+   *    现在剩余不够就**拒绝启动**。 */
+  const nbRide = needLeft(self, 800, Number(budget) || 9_000)
+  if (!nbRide.ok) {
+    return {
+      arrived: false, moved: 0, ms: 0, vehicle: name, remaining: num(distTo(p0)),
+      reason: 'INSUFFICIENT_BUDGET', requiredMs: nbRide.requiredMs, remainingMs: nbRide.remainingMs,
+      hint: insufficientText(nbRide, '把船开过去'),
+    }
+  }
+  const rideMs = nbRide.budgetMs
+  while (Date.now() - t0 < rideMs) {
     const p = posOf()
     if (!p || !vehicleOf(b)) break                       // 被撞下来 / 船没了
     const d = distTo(p)
@@ -248,7 +260,8 @@ export async function dismountVehicle (self, { wait = 1_500 } = {}, ctx = {}) {
     return { ok: false, reason: 'not-riding', hint: '现在没骑在任何东西上（船 / 矿车 / 坐骑都能用 mode:"dismount" 下）。' }
   }
   const t0 = Date.now()
-  const budget = Math.max(400, Number(wait) || 1_500)
+  /* 🔴 2026-10-29：下船是**收尾动作** —— 不拒绝，但也不许越过本轮截止时间 */
+  const budget = Math.max(120, Math.min(Number(wait) || 1_500, Math.max(0, self.msLeft() - 300)))
   try { b.moveVehicle?.(0, 0) } catch {}          // 先松油门，别一下船它就漂走
   const waitOut = async (ms) => {
     const t = Date.now()

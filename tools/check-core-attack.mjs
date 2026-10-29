@@ -238,7 +238,9 @@ section('③ dig —— 按距离升序、单个目标预算封顶、thinkTimeou
     const f = mkDigBot([{ x: 0, y: 64, z: 20 }, { x: 0, y: 64, z: 2 }])
     const mc = mkMc(f)
     const out = await mc.dig({ name: 'oak_log', count: 2, maxDistance: 24 })
-    ok(/挖掉 oak_log @ \(0, 64, 2\)/.test(out[0] ?? ''), '先挖最近的（不再按 findBlocks 的返回顺序）', out[0])
+    /* 🔴 2026-10-29：成功行现在在收工处才写（多块要汇总），不再保证是 out[0]。
+   *    断言改成“输出里有这一条”，不钉位置。 */
+  ok(out.some((l) => /挖掉 oak_log @ \(0, 64, 2\)/.test(l)), '先挖最近的（不再按 findBlocks 的返回顺序）', out.join(' ｜ ').slice(0, 160))
     ok(out.some((l) => /够不着 oak_log @ \(0, 64, 20\)/.test(l)), '远的够不着就如实说（不再硬挖）',
       out.join(' ｜ ').slice(0, 200))
     ok(f.calls.collect.length === 0, 'dig() 全程不调 collectBlock（"挖完又复原"的根因）',
@@ -501,7 +503,13 @@ section('⑤ 静态接线')
     ok(lastRet > 0 && atkNo.slice(lastRet).includes('...foesNear(target)'),
       '🔴 最后一个 return（唯一的对外出口）带上 foesNear —— 没有别的路绕过它', `idx=${lastRet}`)
   }
-  has(minNo, 'Math.max(2500, Math.floor(left * 0.6))', 'mining：dig 单个目标预算封顶')
+  /* 🔴 2026-10-29（预算收口）：旧断言钉的是 `Math.max(2500, …)` 这个**写法**，
+   *    改成 `needLeft` 后就红了。改钉行为：单个目标的预算仍然“吃剩余的一大半”，
+   *    且不再出现硬压 2500ms 下限的写法。 */
+  ok(/needLeft\(self, 1_000, Math\.min\(/.test(minNo)
+    && /Math\.max\(1_000, Math\.floor\(left \* 0\.6\)\)/.test(minNo)
+    && !/Math\.max\(2500,/.test(minNo),
+    'mining：dig 单个目标预算封顶（吃剩余的一大半，且不压固定下限）')
   /* 🔴 2026-10-08：`dig()` 不再把方块交给 collectBlock（"挖完又复原 + 之后几分钟走不了路"的根因），
    *    那条路上的"临时压低 thinkTimeout 再还原"也就跟着删了。这里改成钉死"不碰插件配置"。 */
   ok(!/pf\.thinkTimeout = Math\.max\(/.test(coreNo), 'core：dig 不再改插件的 thinkTimeout（那条路已删）')
@@ -1326,7 +1334,7 @@ section('⑩ 威胁优先 / 换目标 / 举盾 / 血掉太快早收手 / 远程�
       },
     })
     ok(r.unreachable === true, '目标越跑越远 ⇒ 如实报"追不上"', JSON.stringify({ unreachable: r.unreachable }))
-    ok(/追不上|越跑越远/.test(String(r.note ?? '')), '并说清是它一直在后退（不是打死了）', String(r.note ?? '').slice(0, 60))
+    ok(/追不上|越跑越远|一直在逃|走不到/.test(String(r.note ?? '')), '并说清是它一直在后退（不是打死了）', String(r.note ?? '').slice(0, 60))
     ok(Date.now() - t0 < 4200, '4.2 秒内就收手（不再烧满整个预算）', String(Date.now() - t0))
   }
   /* ⑥ 阶段 1.2 秒（用户："一次 3 秒不能中断"） */
@@ -1513,9 +1521,26 @@ for (const d of TMP_DIRS) { try { rmSync(d, { recursive: true, force: true }) } 
  *   `ctx.moveTo`（= walkTo，有绕路/挖/搭/跳）走过去，不能再靠 pvp 的 GoalFollow 裸跟。 */
 {
   const atkNo = readFileSync(new URL('../src/attack.mjs', import.meta.url), 'utf8')
-  ok(/d0 > 8/.test(atkNo), '追不上的病根：8 格外的目标要先自己走过去（8 格内 pvp 的 GoalFollow 自己挪得动）')
-  ok(/Math\.min\(budgetLeft\(\) - 2_000, 2_000\)/.test(atkNo),
-    '🔴 走近只肯花 2 秒，并且先给战斗留 2 秒（不然"走过去站一下就回来"）')
+  ok(/if \(d0 > 3\.5\) \{/.test(atkNo),
+  '🔴 只要不在攻击距离内就自己走过去（d0 > 3.5）—— 8 格门槛会把 3.5~8 格交给 pvp 的 GoalFollow 裸跟，'
+  + '实机 4.7 格干等 6 秒、6.7 格干等 10 秒（用户：「走过去 打，为什么连打怪都不行了」）')
+  /* 🔴 2026-10-29：以前钉的是 `Math.min(budgetLeft() - 2_000, 2_000)` —— 只给 2 秒，追 9 格外的
+   *   会跑目标（羊 4.6 格/秒）连一半都走不到。现在 4 秒、留 1.5 秒。断言钉“给足 + 留余量”这个行为，
+   *   不再钉死具体数字（钉死了改参数就红 —— 跟 stair 那条 `budgetMs` 是同一个坑）。 */
+  ok(/Math\.min\(budgetLeft\(\) - 1_500, 4_000\)/.test(atkNo),
+    '🔴 走近给足 4 秒（先给战斗留 1.5 秒）—— 2 秒连一半都走不到')
+  ok(/Math\.max\(0, Math\.min\(1\.5, d0 \/ 5\.6\)\)/.test(atkNo),
+    '🔴 追会跑的目标用预测拦截点（按它当前速度前瞻），否则一直朝它“当时”的位置空跑')
+  ok(/mem\.approachMoved/.test(atkNo), '报出这一段实际挪了几格（追不上时模型要能看出“它比我快”）')
+  ok(/const stepLen = Math\.max\(1\.5, d0 - 3\.2\)/.test(atkNo),
+    '🔴 走近步长按“离目标还差多少”算 —— 以前固定 2.2 格 + arrive 2.0，等于只挪 0.2 格就判到达（用户：「它现在是没有动」）')
+  ok(/arrive: 1\.2/.test(atkNo), '走近的 arrive 收到 1.2（2.0 会让人在离目标还远时就算“到了”）')
+  ok(/mem\.approachFails = dm < 0\.6/.test(atkNo), '🔴 挪不到 0.6 格不算一次成功接近（moveTo 说“到了”不等于真挪了）')
+  /* 🔴 2026-10-29 实机（羊）：会逃的被动动物以前不在“越跑越远就收手”的名单里 ⇒ 干等 9.5 秒。 */
+  ok(/const FLEE_RE =/.test(atkNo), '有一份“会逃的被动动物”名单（羊/牛/猪/鸡/兔…）')
+  ok(/fleer \? 2_000 : 900/.test(atkNo) && /fleer \? 7 : 6/.test(atkNo),
+    '🔴 会逃的动物同样“越跑越远就收手”，但宽限放宽到 2 秒 / 7 格（给一刀的机会）')
+  ok(/它跑得比我们走路快/.test(atkNo), 'note 说清“它比我快，硬追烧时间”，并给 mc_shoot / 围住的办法')
   ok(/战斗接近：先走到/.test(atkNo), '接近时用 ctx.moveTo（现成 walkTo），带 reason 便于日志排查')
   ok(/连续 3 次都走不到/.test(atkNo), '连续 3 次走不到就收手，别把 8 轮预算全花在同一个走不到的目标上')
   ok(/走近时失败：/.test(atkNo), '够不着时把"走近为什么失败"写进 note（不再三选一瞎猜）')
@@ -1536,9 +1561,8 @@ ok(/const losM = losBlockOf\(target\)/.test(atkSrc2) && /if \(losM\) \{ losBlock
   '手动挥拳分支：被挡就一下都不挥（不再对着墙空挥）')
 ok(/\.\.\.\(losBlocked \? \{ losBlocked: \{ x: losBlocked\.at\.x/.test(atkSrc2),
   '返回里带 losBlocked（挡路的方块坐标与名字），模型能直接去挖它')
-ok(/const dy0 = Math\.abs\(Number\(target\?\.position\?\.y/.test(atkSrc2)
-  && /if \(d0 > 8 \|\| \(dy0 >= 2 && d0 > 3\.5\)\) \{/.test(atkSrc2),
-  '目标差 2 格以上且在攻击距离外 ⇒ 先自己走近（pvp 的 GoalFollow 不会上下走）')
+ok(!/d0 > 8/.test(atkSrc2) && /if \(d0 > 3\.5\) \{/.test(atkSrc2),
+  '🔴 高低差不单开分支：只要不在攻击距离内一律自己走（walkTo 会跳、会挖、会垫）')
 
 const minSrc2b = readFileSync(new URL('../src/mining.mjs', import.meta.url), 'utf8')
 ok(/export function losBlockerAlong \(b, from, gx, gy, gz, near\)/.test(minSrc2b),

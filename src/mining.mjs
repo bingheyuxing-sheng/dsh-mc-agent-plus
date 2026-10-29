@@ -25,9 +25,9 @@ import { isAir, isLiquid, isSolidBlock, isPassable } from './block-names.mjs'
 import { heldText, canHarvestNow, canBreakNow, toolKinds, countOf, durWarnText } from './inventory.mjs'
 import { digMsFor } from './dig-speed.mjs'
 import { blockReachOf, slowDigWhy, stateNameOf, dropHint, dropListOf } from './world-observer.mjs'
-import { waitForPickup } from './pickup.mjs'
+import { PICKUP_GRACE_MS, waitForPickup } from './pickup.mjs'
 import { classifyRestore, restoreLocalBlock } from './server-break.mjs'
-import { callBudget, callSecText } from './budget.mjs'
+import { callBudget, callSecText, needLeft, insufficientText } from './budget.mjs'
 import { dangerNow, dangerText, dangerNotice, healthOf, noticeKey } from './danger.mjs'
 
 /* 「挖到刚好够合成就不挖了」—— 收工时补一句（用户 2026-10-13 报的毛病）。
@@ -515,7 +515,14 @@ export async function digStair (self, {
       notes.push(`🕳 前方脚下是空的（矿洞），往前走会掉 ${cur.y - standY} 格到 y=${standY}`)
     }
     /* 每步走路预算跟着剩余时间走（以前固定 3 秒，最后一步必然越过总预算 ⇒ 被误判成卡住） */
-    const stepBudget = Math.max(600, Math.min(STAIR_WALK_MS, budgetMs - (Date.now() - t0)))
+    /* 🔴 2026-10-29：走下一步的时间不够就收工 —— 以前硬压的 600ms 下限会越过本轮截止时间 */
+    const nbStep = needLeft(self, 600, Math.min(STAIR_WALK_MS, budgetMs - (Date.now() - t0)))
+    if (!nbStep.ok) {
+      reason = 'budget'
+      notes.push(`⏱ ${insufficientText(nbStep, '走下一步')}`)
+      break
+    }
+    const stepBudget = nbStep.budgetMs
 
     let w = null
     try {
@@ -546,12 +553,29 @@ export async function digStair (self, {
       /* 🔴 时间到被砍断 ≠ 卡住。剩余时间不够再走一步时如实报 budget；
        *   说成"卡住"会让模型去 mc_observe / 换方向，把本来接着叫一次就能挖完的活丢掉。 */
       if (budgetMs - (Date.now() - t0) < STAIR_MIN_STEP_MS) { reason = 'budget'; break }
+      /* 🔴 2026-10-29 实机（18,66,2 → 18,67,1：脚位 air、头顶 air、自己头顶 air，挖开了却上不去）：
+       *   两次 walkTo 都没成时，别再干等 A* —— 直接照"一格台阶"用 movement 的上台阶原语硬跳一次。
+       *   `stepUp` 不走 A*（只做"转向 → 起跳 → 叠 forward"），A* 判定过严时它就是那条活路。
+       *   动态 import：避免 mining ↔ movement 的静态循环依赖。 */
+      try {
+        const mv = await import('./movement.mjs')
+        await mv.stepUp(b, new Vec3(fx, standY, fz), { allowDig: false })
+      } catch (e) { notes.push(`⚠ 硬跳也没成：${e?.message ?? e}`) }
+      now = b.entity.position.floored()
+      cur = now
+      if (now.x === fx && now.z === fz && Math.abs(now.y - standY) <= 1) continue
+      /* 已经到目标高度了就别报卡住：`y` 到了就算这一趟干完了（用户 2026-10-29：「它挖到地表了，然后就报了」） */
+      if (up ? now.y >= ty : now.y <= ty) { reason = 'done'; break }
       reason = 'stuck'
-      /* 真卡住要自带诊断：卡在哪、要去的那格是什么、自己头顶通不通 —— 省掉一趟 mc_observe */
+      /* 真卡住要自带诊断：卡在哪、目标格上下通不通、自己头顶两格、寻路自己怎么说 —— 省掉一趟 mc_observe。
+       *   以前只报"脚位/头顶 + 自己头顶一格"，于是出现过「自己头顶是 air」却写「多半是头顶堵着」的自相矛盾。 */
       const atName = blkAt(fx, standY, fz)?.name ?? '未加载'
       const headName = blkAt(fx, standY + 1, fz)?.name ?? '未加载'
-      const myHead = blkAt(cur.x, cur.y + 1, cur.z)?.name ?? '空气'
-      notes.push(`⛔ 卡在 ${cur.x},${cur.y},${cur.z}：要去的 ${fx},${standY},${fz} 脚位是 ${atName}、头顶是 ${headName}，自己头顶是 ${myHead}`)
+      const floorName = blkAt(fx, standY - 1, fz)?.name ?? '未加载'
+      const myHead1 = blkAt(cur.x, cur.y + 1, cur.z)?.name ?? '空气'
+      const myHead2 = blkAt(cur.x, cur.y + 2, cur.z)?.name ?? '空气'
+      const wWhy = w?.reason ?? w?.why ?? null
+      notes.push(`⛔ 卡在 ${cur.x},${cur.y},${cur.z}：要去的 ${fx},${standY},${fz} 脚位是 ${atName}、头顶是 ${headName}、脚下是 ${floorName}；自己头顶是 ${myHead1}/${myHead2}${wWhy ? `；寻路说 ${wWhy}` : ''}`)
       break
     }
     /* 平台已去掉：每步都是下降步 */
@@ -576,7 +600,7 @@ export async function digStair (self, {
      *    5 格（y 75→70、70→65）也照样这么报，模型以为整轮白干。按"到底有没有推进"分开说。 */
     stuck: climbed !== 0
       ? `⛔ 最后一步没走成，但这一轮已经从 y=${start.y} 走到 y=${now.y}（推进 ${Math.abs(climbed)} 格）—— 再叫一次 \`mc_dig {mode:"stair", y:${ty}}\` 接着挖，挖好的不会白挖。`
-      : `⛔ 一步都没走动（还停在 y=${now.y}）—— 多半是自己头顶还堵着（跳不起来），先 \`mc_observe\` 看一眼，别原地重叫。`,
+      : `⛔ 一步都没走动（还停在 y=${now.y}）—— 下面那行是当时各方块的真实情况（脚位/头顶/脚下/自己头顶两格/寻路的原因），照它决定下一步：缺台阶面就换方向、头顶堵着就先清、别原地重叫。`,
     unloaded: '⏳ 前面的区块还没加载完 —— 等一下再叫。',
   }[reason] ?? ''
   const hint = reason === 'done' ? '' : `
@@ -726,6 +750,10 @@ export async function dig (self, {
    *    再按"眼睛→方块中心"复核，够得着才 `bot.dig()`，而且**认服务端的破坏回包**；
    *    掉落物由 `#grabDrops` 捡（原来靠 collectBlock 顺手捡）。 */
   let okCount = 0   // 这一轮挖到几个（下面那条兜底路径也要用，所以放在块外）
+  /* 🔴 2026-10-29（用户给的输出规范：挖掘"将逐项流水改为汇总"）：
+   *   成功块不再逐个 push 一行，先收在这里，收工时合并成一行（单块仍按原样写，行为断言不受影响）。
+   *   失败行照旧逐条 push —— 失败原因和方块名是模型下一步要用的，不能汇总掉。 */
+  const okLog = []
   let budgetCut = false   // 是不是"时间用完了"提前收工的（那条路自己会说"还有 N 个没挖"）
   /* 🔴 2026-10-17（用户报"工具排队执行、延迟很大"）：一次调用是**原子**的。
    *    实机那次：12 个 break 挖竖井 → 骷髅跟下来一路射 → AI 要等 10 秒过完才知道
@@ -741,7 +769,52 @@ export async function dig (self, {
     ctx.beginMove()
     let seen = 0
     const reachMax = b.game?.gameMode === 'creative' ? 5.0 : 4.5
-    for (const target of targets) {
+    /* 🔴 2026-10-29（用户：「mc_dig coal_ore 挖几块后会开始挖其他地方的矿，但最近的并没有挖完」）：
+     *   以前候选是**一次性**扫出来的（`findBlocks(count:n)`），挖掉一块之后**不重扫** ——
+     *   于是矿脉被挖开、旁边露出新矿时，它还在按旧名单去挖远处那几块。
+     *   现在每挖到一块就**重扫一次**，按“够得着 > 同一层 > 距离”重排，近的永远排前面。 */
+    const queue = targets.slice()
+    const tried = new Set()
+    /* 🔴 2026-10-29（用户：「这个等挖矿结束后最后检查」）：
+     *   掉落物吸附**不再逐块等** —— 整轮挖完统一检查一次（见循环后的 `lastDig` 那块）。
+     *   这里只记最后一次挖的位置，供那次检查当"该看哪儿"的参照。 */
+    let lastDig = null
+    const cellKeyOf = (blk) => {
+      const q = blk?.position ?? blk ?? {}
+      return `${q.x},${q.y},${q.z}`
+    }
+    /* 🔴 2026-10-29（用户：「挖矿和之前比也加了延迟，挖石头没这个感觉」）：
+     *   每挖一块就 `findBlocks` 一次，半径一开就是几十格 ⇒ 每块都多几十毫秒的扫描，
+     *   一整片矿挖下来就是明显的"变慢"；挖石头走的是单块/隧道，所以没这感觉。
+     *   减负两条：
+     *   ① **队首还在脚边（≤3.5 格）就不扫** —— 这正是"先把这一片挖完"要的效果，
+     *     连续挖同一片矿脉时一次扫描都不用；
+     *   ② 真要扫时只扫**近处**（`DIG_RESCAN_RADIUS`），远处那几块本来也不该插队。 */
+    const DIG_RESCAN_RADIUS = 12
+    const queueNear = () => {
+      const first = queue[0]
+      if (!first) return false
+      try { return distOf(first) <= 3.5 } catch { return false }
+    }
+    const rescan = (wantName) => {
+      const rest = n - okCount
+      if (rest <= 0 || !wantName || typeof b.findBlocks !== 'function') return
+      const found = b.findBlocks({
+        matching: (blk) => blk?.name === wantName,
+        maxDistance: Math.min(maxDistance, DIG_RESCAN_RADIUS),
+        count: Math.max(4, rest * 2),
+      }).map((q) => b.blockAt(new Vec3(q.x, q.y, q.z)))
+        .filter((blk) => blk && blk.name === wantName && !tried.has(cellKeyOf(blk)))
+      if (!found.length) return
+      found.sort((a, c) => (tierOf(a) - tierOf(c)) || (distOf(a) - distOf(c)))
+      queue.length = 0
+      queue.push(...found)
+    }
+    while (queue.length > 0 && okCount < n) {
+      if (okCount > 0 && !queueNear()) rescan(name)
+      const target = queue.shift()
+      if (!target) break
+      tried.add(cellKeyOf(target))
       seen++
       /* 挨打了 / 有怪贴脸 ⇒ **立刻**把控制权还回去（这个目标没挖）。放在预算检查**之前**：
        * 还剩 8 秒也不该继续挖 —— 怪已经站到脸上了。 */
@@ -752,14 +825,14 @@ export async function dig (self, {
          *    而险情本身由反射层（`mc_auto`）的叫醒去处理。这里只留一句话。
          *    想恢复旧行为（立刻停手）把 config.stopOnDanger 设成 true。 */
         if (stopOnDanger) {
-          out.push(`⚠️ ${dangerText(danger)} —— 先别挖了（挖到 ${okCount}/${targets.length}），`
+          out.push(`⚠️ ${dangerText(danger)} —— 先别挖了（挖到 ${okCount}/${n}），`
             + '`mc_attack` 打掉它，或者 `mc_move` 躲开；安全了再叫一次 mc_dig')
           break
         }
         const k = noticeKey(danger)
         if (!noticed.has(k)) {
           noticed.add(k)
-          out.push(`${dangerNotice(danger)}（挖到 ${okCount}/${targets.length}）`)
+          out.push(`${dangerNotice(danger)}（挖到 ${okCount}/${n}）`)
         }
       }
       // 🔴 单次调用 ≤11 秒：到点就带着已经挖到的结果返回，剩下的下次再叫
@@ -769,15 +842,23 @@ export async function dig (self, {
           ? `—— 这次调用**自己没分到时间**（外层只剩 ${callLeftMs}ms），**一个都没挖**。`
             + '**这不等于那些方块还在**：先 `mc_scan` / `mc_map` 复核一下到底挖掉没有，'
             + '确认真没挖再单独叫一次 mc_dig（**别塞在 mc_task 里** —— 外层时间早被前面的步骤吃掉了）。'
-          : `—— 这一轮的 ${callSecText()}用完了（挖到 ${okCount}/${targets.length}），`
-            + `还有 ${targets.length - seen + 1} 个没挖：再叫一次 mc_dig 接着挖`)
+          : `—— 这一轮的 ${callSecText()}用完了（挖到 ${okCount}/${n}），`
+            + `还有 ${Math.max(0, n - okCount)} 个没挖：再叫一次 mc_dig 接着挖`)
         budgetCut = true
         break
       }
       // 🔴 别让**一个**够不着的目标吃掉整轮：单个目标最多给"剩余时间的一大半"，
       //    剩下的时间留给后面的目标 + 兜底原地挖（2026-10-08 实机反馈）。
-      const budget = Math.max(300, Math.min(
-        callBudget(self.cfg.collectBudgetMs), left, Math.max(2500, Math.floor(left * 0.6))))
+      /* 🔴 2026-10-29：单个目标的最小有效时间是 1 秒（挖一块 + 回读确认），
+       *    不够就整轮收工 —— 别用 `Math.max(300, …)` 硬压出预算来。 */
+      const nbGo = needLeft(self, 1_000, Math.min(
+        callBudget(self.cfg.collectBudgetMs), Math.max(1_000, Math.floor(left * 0.6))))
+      if (!nbGo.ok) {
+        out.push(insufficientText(nbGo, '走到这个方块旁边'))
+        budgetCut = true
+        break
+      }
+      const budget = nbGo.budgetMs
       const p = target.position.clone()
       const nm = target.name
       /* 够不着 → **先自己走过去**（以前这一步交给 collectBlock，而它只要"看得见"就算到）。
@@ -838,15 +919,9 @@ export async function dig (self, {
             continue
           }
           okCount++
+          lastDig = p
           if (task) self.tasks.progress(task.taskId, { add: 1 })
-          out.push(`走过去的时候顺手挖掉了 ${nm} @ ${p} → 现在 ${fresh.name}`)
-          const got = await ctx.grabDrops(b)
-          if (got > 0) out.push(`　（顺手捡回 ${got} 个掉落物）`)
-          else {
-            const hint = dropHint(b)
-            const where = dropsWhereText(b)
-            if (hint) out.push(`　（${hint}${where ? '：' + where : ''}）`)
-          }
+          okLog.push({ nm, p, how: '顺手', now: fresh.name })
           continue
         }
         if (blockReachOf(b, fresh) > reachMax) {
@@ -925,11 +1000,9 @@ export async function dig (self, {
             /* 🔴 审计①：`bot.dig()` 的 resolve 来自**客户端预测**（digging.js:143-159 自己
              *    `_updateBlockState(pos, 0)` 又自己接住）⇒ 服务端拒了也照样"成功"。
              *    只有服务端发的破坏包才算真挖掉。 */
-            if (!watch.watching) out.push(`挖掉 ${nm} @ ${p}（原地，不用走过去）→ 现在 ${now}`)
-            else if (confirmed) {
-              out.push(`挖掉 ${nm} @ ${p}（原地，不用走过去）→ 现在 ${now}（服务端已确认`
-                + `${rest?.kind === 'liquid' ? '：液体立刻涌了进来，这次破坏是成功的' : ''}）`)
-            } else {
+            if (!watch.watching) okLog.push({ nm, p, how: '原地', now })
+            else if (confirmed) okLog.push({ nm, p, how: '原地', now, confirmed: true, liquid: rest?.kind === 'liquid' })
+            else {
               /* 🔴 2026-10-23 同上（`breakBlock` 那条路）：本地 air 是 `digging.js` 自己写上去的，
                *    服务端静默拒绝时这一格会变成“本地空气 / 服务端实心”的幽灵空位 —— 寻路会往那儿走。 */
               const back = restoreLocalBlock(b, p, Number(fresh?.stateId))
@@ -939,27 +1012,10 @@ export async function dig (self, {
                 + (back ? '（我已经把本地那一格改回原样，免得寻路把它当成空洞）' : '')
                 + DESYNC_HINT)
             }
-            /* 🔴 原地挖绕过了 collectBlock（它平时挖完还会把掉落物捡回来）⇒ 得自己去捡，
-             *    否则"挖到 3 根原木、背包里只有 1 根"（2026-10-08 实机）。
-             * 🔴 2026-10-24 用户（「可不可以不马上捡，过一段时间没吸到再去拿」）：**先等自动吸附** ——
-             *    掉在脚边的会自己飞进背包，等不到再走过去拿。以前每挖一格都立刻跑过去，
-             *    表现成"挖一个、动一下"，可那一步多半是白走。 */
-            const flew = await waitForPickup(self, b, { at: p }).catch(() => 0)
-            if (flew > 0) out.push(`　（等了一下，${flew} 个掉落物自己飞进背包）`)
-            /* 🔴 2026-10-25 用户：「为什么现在超过两格还是会去自动捡很远的掉落物」——
-             *   以前这里无条件 `grabDrops(b)`（默认半径 8）⇒ 等吸附没等到，就一路走过去把
-             *   8 格内的都捡了，表现成「挖一个、跑一趟」。现在只捡**脚边 2.5 格内**的；
-             *   更远的**不替它决定**，只在结果里报「地上还有 N 个」（dropHint），要捡就自己 `mc_move`。 */
-            const got = await ctx.grabDrops(b, { radius: 2.5 })
-            if (got > 0) out.push(`　（顺手捡回 ${got} 个掉落物）`)
-            else if (flew <= 0) {
-              /* 一个都没捡到（够不着 / 卡住 / 背包满）⇒ 点一句"东西还在地上"。
-               * why：用户 2026-10-08 原话"挖完方块或者打完动物以后老是忘记走过去拾取" ——
-               * 捡东西是**决策**，插件替不了，但结果里必须让它知道这活还没完。 */
-              const hint = dropHint(b)
-              const where = dropsWhereText(b)
-              if (hint) out.push(`　（${hint}${where ? '：' + where : ''}）`)
-            }
+            /* 掉落物**不在这里捡**（用户 2026-10-29：「这个等挖矿结束后最后检查」）——
+             * 原地挖绕过了 collectBlock，东西会掉在刚挖那一格附近；整轮挖完统一收一次，
+             * 比每块都等吸附/跑一趟快得多。 */
+            lastDig = p
           } else out.push(`没挖成 ${nm} @ ${p}（原地挖完了，但那里**还是 ${now}**）`
             + ' —— 服务端没认这次破坏（失步 / 领地保护 / 工具不对）：先 `mc_scan` 复核。'
             + DESYNC_HINT)
@@ -982,6 +1038,48 @@ export async function dig (self, {
      * 够不着就如实说，让模型自己 `mc_move` 过去再挖。 */
     /* 「这条矿脉还没挖干净」—— 收工前补一句（`veinHint` 的判据见本文件开头）。
      * 时间用完那条路自己会说"还有 N 个没挖"，不重复。 */
+    /* 成功行渲染：1 块按原样写；多块合并成一行汇总（用户给的输出规范：“将逐项流水改为汇总”）。
+     * 放在掉落物处理之前 —— 掉落物那句是“收尾补充”，读起来应该跟在挖掘结果后面。 */
+    if (okLog.length === 1) {
+      const o = okLog[0]
+      out.push(o.how === '顺手'
+        ? `走过去的时候顺手挖掉了 ${o.nm} @ ${o.p} → 现在 ${o.now}`
+        : `挖掉 ${o.nm} @ ${o.p}（原地，不用走过去）→ 现在 ${o.now}`
+          + (o.confirmed ? `（服务端已确认${o.liquid ? '：液体立刻涌了进来，这次破坏是成功的' : ''}）` : ''))
+    } else if (okLog.length > 1) {
+      const byName = new Map()
+      for (const o of okLog) byName.set(o.nm, (byName.get(o.nm) ?? 0) + 1)
+      const sum = [...byName].map(([n2, c]) => `${n2}×${c}`).join('、')
+      const confN = okLog.filter((o) => o.confirmed).length
+      out.push(`⛏ 挖掉 ${okLog.length} 块：${sum}（最后一块 @ ${okLog[okLog.length - 1].p}`
+        + `${confN ? `，服务端已确认 ${confN}/${okLog.length}` : ''}）`)
+    }
+    /* 🔴 2026-10-29（用户：「这个等挖矿结束后最后检查」）：
+     *   掉落物统一在**挖完之后**处理一次：先给一次吸附机会（东西就掉在刚挖的位置附近），
+     *   没吸到的再捡脚边 2.5 格内的，剩下的如实报"地上还有 N 个"。
+     *   时间不够（收尾只剩不到 0.5 秒）就只报不捡 —— 别把返回文本挤掉。 */
+    if (okCount > 0) {
+      const enough = leftOf() > 500
+      const flew = enough
+        ? await waitForPickup(self, b, { at: lastDig ?? undefined, graceMs: Math.min(PICKUP_GRACE_MS, 600) }).catch(() => 0)
+        : 0
+      const got = enough ? await ctx.grabDrops(b, { radius: 2.5 }).catch(() => 0) : 0
+      const parts = []
+      if (flew > 0) parts.push(`${flew} 个自己飞进背包`)
+      if (got > 0) parts.push(`顺手捡回 ${got} 个`)
+      if (parts.length) {
+        out.push(`　（掉落物：${parts.join('、')}）`)
+      } else if (!enough) {
+        out.push('　（时间不够了，掉落物还在地上 —— 再叫一次 mc_dig 或 `mc_move` 过去会顺手捡）')
+      } else {
+        /* 一个都没捡到（够不着 / 卡住 / 背包满）⇒ 点一句"东西还在地上"。
+         * why：用户 2026-10-08 原话"挖完方块或者打完动物以后老是忘记走过去拾取" ——
+         * 捡东西是**决策**，插件替不了，但结果里必须让它知道这活还没完。 */
+        const hint = dropHint(b)
+        const where = dropsWhereText(b)
+        if (hint) out.push(`　（${hint}${where ? '：' + where : ''}）`)
+      }
+    }
     if (okCount > 0 && !budgetCut) {
       const h = veinHint(b, targets[0]?.name ?? name)
       if (h) out.push(h)
@@ -992,8 +1090,8 @@ export async function dig (self, {
      * 和"挖得好好的"一模一样，只能靠自己 `mc_inventory` 去查（通常不会查）。 */
     const wear = durWarnText(b)
     if (wear) out.push(`⚠️ 工具：${wear}`)
-    ctx.taskSettle(task, out, okCount, targets.length)
-    ctx.verdictLine(out, okCount, targets.length)
+  ctx.taskSettle(task, out, okCount, n)
+  ctx.verdictLine(out, okCount, n)
     return ctx.withHeld(out, b, held0)
   }
 }
@@ -1148,27 +1246,47 @@ export async function canSeeBlockOf (b, p, { reachMax = 4.5 } = {}) {
 const NO_CLEAR_BLOCK = /chest|barrel|furnace|smoker|hopper|dispenser|dropper|shulker_box|brewing_stand|beacon|enchanting_table|anvil|lectern|crafter|decorated_pot|jukebox/
 const UNBREAKABLE_BLOCK = /bedrock|barrier|command_block|structure_block|jigsaw|end_portal|light$|moving_piston|reinforced_deepslate/
 
+const SIGHT_DIG_IN_MAX = 6
+
+/**
+ * 目标整块嵌在岩层里（前后左右四面都实心）时，挑「朝我最近、又挖得动」的那一面。
+ * 为什么按距离挑：挖掉离眼睛最近的那面，开口就在我这一侧，挖开一格往往就露出来了；
+ * 挑错面等于从背后拆墙，白挖。
+ */
+function faceTowardEye (b, p, at, reachMax) {
+  const eye = b?.entity?.position
+  if (!eye || !p) return null
+  const gx = Math.floor(p.x); const gy = Math.floor(p.y); const gz = Math.floor(p.z)
+  const dirs = [[0, -1], [0, 1], [-1, 0], [1, 0]]
+  let best = null
+  for (const [dx, dz] of dirs) {
+    const x = gx + dx; const z = gz + dz
+    const blk = at(x, gy, z)
+    if (!blk) continue
+    if (blk.boundingBox !== 'block') continue
+    if (isLiquid(blk.name)) continue
+    if (UNBREAKABLE_BLOCK.test(blk.name) || blk.hardness === -1 || blk.hardness === Infinity) continue
+    if (NO_CLEAR_BLOCK.test(blk.name)) continue
+    if (blockReachOf(b, blk) > reachMax) continue
+    const d = Math.hypot(eye.x - (x + 0.5), eye.y - (gy + 0.5), eye.z - (z + 0.5))
+    if (!best || d < best.d) best = { x, y: gy, z, d }
+  }
+  return best
+}
+
 export async function clearSightTo (self, b, p, { reachMax = 4.5, ctx = {}, noClear = false } = {}) {
   const cleared = []
   if (noClear) return { ok: false, why: 'noClear', cleared }
   const at = (x, y, z) => { try { return b.blockAt(new Vec3(x, y, z)) } catch { return null } }
-  for (let guard = 0; guard < 12; guard++) {
-    const see = await canSeeBlockOf(b, p, { reachMax })
-    if (!see || see.ok !== false) return { ok: true, cleared }
-    /* 四面全被实心包着：那不是"夹着方块"，是把目标埋死了 —— 硬清等于把周围全拆开，停手。 */
-    if (see.los !== true) return { ok: false, why: 'surrounded', cleared, blocker: see.blocker, at: see.at }
-    const key = `${see.at.x},${see.at.y},${see.at.z}`
-    if (cleared.some((c) => c.key === key)) {
-      return { ok: false, why: 'stuck', cleared, blocker: see.blocker, at: see.at }
-    }
-    const blk = at(see.at.x, see.at.y, see.at.z)
-    if (!blk) return { ok: false, why: 'unloaded', cleared, blocker: see.blocker, at: see.at }
-    if (isLiquid(blk.name)) return { ok: false, why: 'liquid', cleared, blocker: blk.name, at: see.at }
+  let dugIn = 0
+  /* 挖一格（清障 / 挖进去 共用一条：等待落地 → 换工具 → 挖 → 等两 tick） */
+  const digCell = async (blk, cell) => {
+    if (isLiquid(blk.name)) return { ok: false, why: 'liquid', blocker: blk.name, at: cell }
     if (UNBREAKABLE_BLOCK.test(blk.name) || blk.hardness === -1 || blk.hardness === Infinity) {
-      return { ok: false, why: 'hard', cleared, blocker: blk.name, at: see.at }
+      return { ok: false, why: 'hard', blocker: blk.name, at: cell }
     }
-    if (NO_CLEAR_BLOCK.test(blk.name)) return { ok: false, why: 'container', cleared, blocker: blk.name, at: see.at }
-    if (blockReachOf(b, blk) > reachMax) return { ok: false, why: 'far', cleared, blocker: blk.name, at: see.at }
+    if (NO_CLEAR_BLOCK.test(blk.name)) return { ok: false, why: 'container', blocker: blk.name, at: cell }
+    if (blockReachOf(b, blk) > reachMax) return { ok: false, why: 'far', blocker: blk.name, at: cell }
     try {
       if (typeof ctx.waitGrounded === 'function') {
         await ctx.waitGrounded(b, Math.min(1_200, Math.max(0, self.callLeft() - 800)))
@@ -1178,14 +1296,40 @@ export async function clearSightTo (self, b, p, { reachMax = 4.5, ctx = {}, noCl
       if (typeof ctx.t === 'function') await ctx.t(job, 'digClear', `挖开挡路的 ${blk.name}`)
       else await job
     } catch {
-      return { ok: false, why: 'fail', cleared, blocker: blk.name, at: see.at }
+      return { ok: false, why: 'fail', blocker: blk.name, at: cell }
     }
-    cleared.push({ key, name: blk.name, x: see.at.x, y: see.at.y, z: see.at.z })
-    /* 等世界更新两 tick 再量：`dig` 回来时客户端往往还是"预测态"。 */
+    cleared.push({ key: `${cell.x},${cell.y},${cell.z}`, name: blk.name, x: cell.x, y: cell.y, z: cell.z })
     try { if (typeof b.waitForTicks === 'function') await b.waitForTicks(2) } catch { /* 假 bot 没有 */ }
-    if (typeof self.log === 'function') self.log(`🧹 挖开挡路的 ${blk.name}（${see.at.x},${see.at.y},${see.at.z}）`)
+    if (typeof self.log === 'function') self.log(`🧹 挖开挡路的 ${blk.name}（${cell.x},${cell.y},${cell.z}）`)
+    return { ok: true }
   }
-  return { ok: false, why: 'loop', cleared }
+  for (let guard = 0; guard < 20; guard++) {
+    const see = await canSeeBlockOf(b, p, { reachMax })
+    if (!see || see.ok !== false) return { ok: true, cleared, dugIn }
+    /* 四面全被实心包着（`see.los` 没置位）：目标整块嵌在岩层里，不是"连线上夹了一块"。
+     * 2026-10-29 用户：「为什么没有直接挖过去」—— 那就从**朝我这一面**开个口挖进去，
+     * 挖开后再量。限度 `SIGHT_DIG_IN_MAX`：够得到就挖得动，但不许演变成拆整片岩层。 */
+    const buried = see.los !== true
+    let cell = see.at
+    if (buried) {
+      if (dugIn >= SIGHT_DIG_IN_MAX) {
+        return { ok: false, why: 'buried', cleared, blocker: see.blocker, at: see.at, dugIn }
+      }
+      const face = faceTowardEye(b, p, at, reachMax)
+      if (!face) return { ok: false, why: 'surrounded', cleared, blocker: see.blocker, at: see.at, dugIn }
+      cell = face
+    }
+    const key = `${cell.x},${cell.y},${cell.z}`
+    if (cleared.some((c) => c.key === key)) {
+      return { ok: false, why: 'stuck', cleared, blocker: see.blocker, at: cell, dugIn }
+    }
+    const blk = at(cell.x, cell.y, cell.z)
+    if (!blk) return { ok: false, why: 'unloaded', cleared, blocker: see.blocker, at: cell, dugIn }
+    const r = await digCell(blk, cell)
+    if (!r.ok) return { ...r, cleared, dugIn }
+    if (buried) dugIn++
+  }
+  return { ok: false, why: 'loop', cleared, dugIn }
 }
 
 /** 清障没成功时给模型的那句话（按 `why` 分岔，别让 AI 猜）。`see` 是最后一次量到的视线结果。 */
@@ -1199,9 +1343,13 @@ export function clearFailText (r, see, target = '目标') {
   switch (r?.why) {
     case 'noClear':
       return `视线被挡着，这一趟带了 noClear —— 按你说的不动手，${target} 没挖`
+    case 'buried':
+      return `${target} 整块嵌在岩层里（前后左右四面都是实心，最靠外的是 **${who}**${where}）`
+        + `—— 我从朝我这一面挖进去 ${r?.dugIn ?? 0} 格，还是没露出来${done}。`
+        + '再叫一次我会接着往里挖；或者 `mc_move` 绕到另一侧'
     case 'surrounded':
-      return `前后左右四面都被实心方块包着（**${who}**${where} 那一面最靠外）—— 这是把 ${target} 埋死了，`
-        + '硬挖等于把周围全拆开，我停手了。换个站位（`mc_move`）再叫我'
+      return `前后左右四面都是实心方块（**${who}**${where}），而且那一面我挖不动（液体 / 容器 / 基岩 / 够不着）`
+        + `—— ${target} 没挖。换个站位（\`mc_move\`）或从别的角度过去`
     case 'liquid':
       return `挡路的是液体 **${who}**${where} —— 挖开它立刻灌进来会把通道淹了，我没挖${done}`
     case 'hard':

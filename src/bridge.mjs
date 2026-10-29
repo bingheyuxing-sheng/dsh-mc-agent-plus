@@ -31,6 +31,7 @@ import { sleep } from './async-util.mjs'
 import { isAir, isLiquid, canPlaceInto, isSolidBlock, isTreeBlock } from './block-names.mjs'
 import { pickPlaceItem } from './place-items.mjs'
 import { heldText } from './inventory.mjs'
+import { needLeft, insufficientText } from './budget.mjs'
 
 /** 单次最多铺几格（一格的往返 ≈ 1.5 秒，16 格正好塞进一次调用） */
 export const BRIDGE_MAX = 16
@@ -411,7 +412,12 @@ async function bridgeAcrossInner (self, { dir, count = 1, name = null, minHealth
     const stepTo = { x: deck.x, y: deck.y + 1, z: deck.z }
     let moveErr = null
     try {
-      const mv = await self.walkTo(stepTo, { arrive: BRIDGE_STEP_ARRIVE, budget: Math.min(BRIDGE_STEP_MS, Math.max(800, deadline - Date.now() - 300)) })
+      /* 🔴 2026-10-29：这一格走不过去就别硬挤（不再 `max(800, …)` 硬压） */
+      const nbStep = needLeft(self, 800, Math.min(BRIDGE_STEP_MS, Math.max(0, deadline - Date.now() - 300)))
+      if (!nbStep.ok) {
+        return stop(`铺好了 (${at})，但这一轮不够走过去（${insufficientText(nbStep, '走到下一块')}）——停在原地`, { stepTarget: stepTo })
+      }
+      const mv = await self.walkTo(stepTo, { arrive: BRIDGE_STEP_ARRIVE, budget: nbStep.budgetMs })
       if (mv && mv.arrived === false) moveErr = mv.reason || '没走到'
     } catch (e) { moveErr = e?.message ?? '走路报错' }
     if (moveErr) {

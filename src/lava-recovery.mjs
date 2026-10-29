@@ -1,5 +1,5 @@
 /**
- * 岩浆自救：泡在岩浆里、四面八方都是岩浆时的那一套动作。
+ * 岩浆脱困：泡在岩浆里、四面八方都是岩浆时的那一套动作。
  *
  * 🔴 2026-10-27 实机（用户："现在掉在岩浆里动不了"）—— 原来的行为是**什么都不做**：
  *   · `walkToOnce` 只有"在水里"的分支（`inWaterNow`），岩浆落到 else 走 A*；
@@ -179,7 +179,7 @@ export async function lavaEscape (self, { floatMs = LAVA_FLOAT_MS, swimMs = LAVA
     const swimBudget = Math.max(0, Math.min(Number(swimMs) || 0, left1 - 500))
     const deadline = Date.now() + swimBudget
     while (Date.now() < deadline) {
-      if (self._moveGen !== gen) return { ...out, escaped: false, stuck: false, reason: 'preempted', moved: distFrom(), hint: '被另一次移动接管了，岩浆自救中断。' }
+      if (self._moveGen !== gen) return { ...out, escaped: false, stuck: false, reason: 'preempted', moved: distFrom(), hint: '被另一次移动接管了，岩浆脱困中断。' }
       /* 已经上岸（脚下不是岩浆，且真站在地上）就收工 */
       if (!inLavaNow(b) && b?.entity?.onGround === true) break
       try { b.lookAt(aim, true) } catch { /* 假 bot */ }

@@ -131,7 +131,8 @@ section('10. 往上挖：自己头顶也要清（跳跃空间）+ 走失败要�
   ok(/const w2 = await self\.walkTo/.test(mvSrc), '第一次没走过去会再走一次（不是一步就 stuck）')
   ok(/if \(!ok && budgetMs - \(Date\.now\(\) - t0\) >= STAIR_MIN_STEP_MS\)/.test(mvSrc),
     '重试也看剩余时间（不硬吃满预算，2026-10-27）')
-  ok(/头顶还堵着（跳不起来）/.test(mvSrc), 'stuck 的提示点明"头顶还堵着"')
+  ok(/脚下是 \$\{floorName\}/.test(mvSrc) && /自己头顶是 \$\{myHead1\}\/\$\{myHead2\}/.test(mvSrc),
+    '真卡住时报出目标格脚下/头顶 + 自己头顶两格（2026-10-29：以前只说"头顶堵着"，出现过自相矛盾）')
 }
 
 section('11. 结果文案不能说反话：y 75→70 别报"卡住"、别出现"挖了 23 步、0 块方块"')
@@ -163,16 +164,24 @@ section('12. 每步预算跟着剩余时间走（时间到 ≠ 卡住）+ 前方
   ok(STAIR_DROP_OK === 3, '前方矿洞最多往下 3 格（不摔伤）')
   ok(/if \(budgetMs - \(Date\.now\(\) - t0\) < STAIR_MIN_STEP_MS\) \{ reason = 'budget'; break \}/.test(mvSrc),
     '循环开头：剩余不够一步 ⇒ budget（不再只看"开始前已超"）')
-  ok(/const stepBudget = Math\.max\(600, Math\.min\(STAIR_WALK_MS, budgetMs - \(Date\.now\(\) - t0\)\)\)/.test(mvSrc),
-    '每步走路预算 = min(1.5 秒, 剩余)')
+  /* 🔴 2026-10-29（预算收口）：这条以前钉的是 `Math.max(600, …)` 这个**写法**，
+   *    所以改成 `needLeft`时它就红了。改钉行为：预算由 needLeft 算、且不再压 600 下限。 */
+  ok(/const nbStep = needLeft\(self, 600, Math\.min\(STAIR_WALK_MS, budgetMs - \(Date\.now\(\) - t0\)\)\)/.test(mvSrc)
+    && !/Math\.max\(600,/.test(mvSrc),
+    '每步走路预算 = needLeft(600, min(1.5 秒, 剩余))（剩余不够就收工，不压下限）')
   ok((mvSrc.match(/budget: stepBudget/g) ?? []).length === 2, '两处 walkTo（首走 + 重试）都用 stepBudget（键名必须是 budget —— 写 budgetMs 会被静默丢掉）')
   ok(/budgetMs: STAIR_STEP_MS/.test(mvSrc) === false, '不再有固定 3 秒的 walkTo')
   ok(/时间到被砍断 ≠ 卡住/.test(mvSrc), '注释写清了为什么：时间到不许报卡住')
-  ok(/< STAIR_MIN_STEP_MS\) \{ reason = 'budget'; break \}\s*\r?\n\s*reason = 'stuck'/.test(mvSrc),
+  ok(/< STAIR_MIN_STEP_MS\) \{ reason = 'budget'; break \}/.test(mvSrc)
+    && mvSrc.lastIndexOf("reason = 'budget'") < mvSrc.lastIndexOf("reason = 'stuck'"),
     'stuck 之前先判一次预算（顺序不能反）')
   ok(/卡在 \$\{cur\.x\},\$\{cur\.y\},\$\{cur\.z\}：要去的/.test(mvSrc),
     '真卡住时把坐标/脚位/头顶写出来（省一趟 mc_observe）')
   ok(/const hollowAhead = !up && isAir\(floor\.name\)/.test(mvSrc), '前方脚下空：只有往下挖才量落差')
+  ok(/mv\.stepUp\(b, new Vec3\(fx, standY, fz\)/.test(mvSrc) && /await import\('\.\/movement\.mjs'\)/.test(mvSrc),
+    '两次 walkTo 都没成 ⇒ 用 stepUp 硬跳一次（不走 A*，动态 import 避开循环依赖）')
+  ok(/if \(up \? now\.y >= ty : now\.y <= ty\) \{ reason = 'done'; break \}/.test(mvSrc),
+    '已经到目标高度就报 done，不报卡住（2026-10-29「它挖到地表了，然后就报了」）')
   ok(/if \(up && isAir\(floor\.name\)\) \{ reason = 'no-floor'; break \}/.test(mvSrc),
     '往上挖时前方没台阶面照旧停（不把上升挖成坠落）')
   ok(/这次 \$\{Math\.round\(budgetMs \/ 1000\)\} 秒/.test(mvSrc), '预算文案写实际分到几秒，不再写死 10 秒')

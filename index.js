@@ -28,9 +28,11 @@ import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
 import { resolve, sep, join, isAbsolute, dirname, basename } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
+import { briefOf } from './src/brief.mjs'
 import { McBot, lossless, logLine, logDebug, logOnce, logLevel, libraryInfo, CALL_MS, callBudget, redactPath } from './src/core.mjs'
 import { defineTool, toolDefKind, loosenNumberParams, coerceNumberArgs } from './src/tool-def.mjs'
 import { inWaterNow } from './src/world-observer.mjs'
+import { briefMoveOf, briefMoveTextOf } from './src/movement.mjs'
 /* 路线图第 ⑥ 条：把每个动作的结局说清（已确认成功 / 动作失败 / 结果未知）。纯函数，不碰游戏状态。 */
 import { outcomeOf, verdictText } from './src/task-runner.mjs'
 import { runText } from './src/task-exec.mjs'
@@ -2742,9 +2744,17 @@ export function apply(ctx, rawConfig) {
    *
    * ⚠️ 定义必须排在 `compactJson` 之后（它是 const 箭头函数，提前引用会踩 TDZ，插件直接加载失败）。
    */
+  /* 🔴 2026-10-29（用户给的输出规范）：兜底从"有 text 用 text / 否则整对象"改成走 `briefOf` ——
+   *   ① 多行流水超 8 行就折叠明细（**留下所有失败/进度行**）；
+   *   ② 成功结果删掉现场快照（`around`/`entities`）与诊断中间量；
+   *   ③ 失败/部分完成一律保留诊断（`blockedAhead`/`hint`/`remaining`/`reason`）。
+   *   执行结果与验证逻辑一个字没动，只改模型看到的东西。 */
   const text = (value, render) => ({
     schema: { type: 'object', properties: {}, additionalProperties: true },
-    render: (args, value2) => [{ type: 'text', text: render ? render(args, value2) : String(value2?.text ?? compactJson(value2)) }],
+    render: (args, value2) => [{
+      type: 'text',
+      text: render ? render(args, value2) : briefOf(value2, { json: compactJson }),
+    }],
   })
   /** 保留两位小数（省 token：`-3.366740127096657` → `-3.37`；不是数字就原样返回） */
   const round2 = (n) => (Number.isFinite(Number(n)) ? Math.round(Number(n) * 100) / 100 : n)
@@ -4129,7 +4139,7 @@ export function apply(ctx, rawConfig) {
       allowTower: { type: 'boolean', description: '允许垫 1×1 柱往上爬（默认不许，容易摔死）' },
       intent: { type: 'string', description: 'near（默认）/ stand / interact / same-level' },
     },
-    output: text(undefined, (a, v) => String(v?.text ?? compactJson(v))),
+    output: text(),
     timeoutMs: CALL_MS + 1_000,
     async execute(args, exec) {
       const sess = getSession(exec)
@@ -4170,17 +4180,28 @@ export function apply(ctx, rawConfig) {
       const creative = sess.bot.bot?.game?.gameMode === 'creative'
       const use = mode || (creative ? 'fly' : 'walk')
       // 🔴 2026-10-08 审计⑤：fly 以前不传 budgetMs —— 写 budgetMs:2000 也照样跑满 10 秒
+      /* 🔴 2026-10-29（用户：「mc_move 的输出单独做一次精简」）：模型只看三形态
+       *   `progress` / `arrived` / `blocked`；寻路细节（roadInfo/moveInfo/fellInfo/dugBlocks/
+       *   shaft/briefBlocks/逐级 planTried…）**只进本地日志**，不进模型上下文。 */
+      const finish = (res) => {
+        const brief = briefMoveOf(res, sess.bot.bot?.entity?.position ?? null)
+        /* 明细落日志：出问题时翻日志能看到全部字段（原来这些都在返回里）。 */
+        try {
+          logLine(`mc_move 明细 target=${JSON.stringify(target)} args=${JSON.stringify(args)} → ${JSON.stringify(res)}`)
+        } catch { /* 日志写不进去不影响结果 */ }
+        return { ...brief, text: briefMoveTextOf(brief) }
+      }
       if (use === 'fly') {
         if (wantsXZ) throw new Error('fly 是三维直飞，必须给 y（xz:true 只对 walk 有效）')
-        return { ...withOutcome(await sess.bot.flyTo(target.x, target.y, target.z, { budget: callBudget(args.budgetMs) }), { expect: 'moved' }), ...aroundOf(sess) }
+        return finish(withOutcome(await sess.bot.flyTo(target.x, target.y, target.z, { budget: callBudget(args.budgetMs) }), { expect: 'moved' }))
       }
       if (use === 'boat') {
         if (wantsXZ) throw new Error('boat 要有终点高度，必须给 y（xz:true 只对 walk 有效）')
-        return { ...withOutcome(await sess.bot.driveBoat(target, { arrive: args.intent === 'stand' ? 1.2 : 2, budget: callBudget(args.budgetMs) }), { expect: 'moved' }), ...aroundOf(sess) }
+        return finish(withOutcome(await sess.bot.driveBoat(target, { arrive: args.intent === 'stand' ? 1.2 : 2, budget: callBudget(args.budgetMs) }), { expect: 'moved' }))
       }
       if (use !== 'walk') throw new Error(`未知 mode："${use}"（可用 walk / fly / jump / boat）`)
       /* 2026-10-25：走不通就自动改成「挖穿挡路的方块」再走一次（显式 `noDig:false` 除外）。 */
-      return { ...withOutcome(await walkWithAutoDig(sess, target, { noDig, noTower: args.allowTower !== true, intent: intentArgOf(args.intent), waterRecover: typeof args.waterRecover === 'boolean' ? args.waterRecover : undefined, xz: wantsXZ }, args.budgetMs, noDig === true), { expect: 'moved' }), ...aroundOf(sess) }
+      return finish(withOutcome(await walkWithAutoDig(sess, target, { noDig, noTower: args.allowTower !== true, intent: intentArgOf(args.intent), waterRecover: typeof args.waterRecover === 'boolean' ? args.waterRecover : undefined, xz: wantsXZ }, args.budgetMs, noDig === true), { expect: 'moved' }))
     },
   }))
 
@@ -4233,7 +4254,7 @@ export function apply(ctx, rawConfig) {
       samples: { type: 'string', description: 'look+track：summary（默认）/ raw（附原始点序列）' },
       useItem: { type: 'boolean', description: 'look：等新实体前先用手上的东西（扔眼睛）—— 比先 useitem 再 look 更准，中间不漏' },
     },
-    output: text(undefined, (a, v) => String(v?.text ?? compactJson(v))),
+    output: text(),
     timeoutMs: CALL_MS + 1_000,
     async execute(args, exec) {
       const sess = getSession(exec)
@@ -4379,7 +4400,7 @@ export function apply(ctx, rawConfig) {
       lead: { type: 'boolean', description: '移动目标的提前量（默认开）' },
       force: { type: 'boolean', description: '弹道被方块挡着也硬射（默认不射）' },
     },
-    output: text(undefined, (a, v) => String(v?.text ?? compactJson(v))),
+    output: text(),
     timeoutMs: CALL_MS + 1_000,
     async execute(args, exec) {
       const sess = getSession(exec)
@@ -4402,7 +4423,7 @@ export function apply(ctx, rawConfig) {
       kite: { type: 'boolean', description: '放风筝：近战怪打一下退一步' },
       stand: { type: 'boolean', description: '站桩：一步不挪，只打 4.5 格内的（默认 false）' },
     },
-    output: text(undefined, (a, v) => String(v?.text ?? compactJson(v))),
+    output: text(),
     timeoutMs: CALL_MS + 1_000,
     async execute(args, exec) {
       const sess = getSession(exec)
@@ -4420,7 +4441,7 @@ export function apply(ctx, rawConfig) {
       /* ⚠️ `for` 是 JS 保留字，解构时必须写 `args.for`，不能 `const { for } = args` */
       for: { type: 'string', description: '查哪趟：nether（默认）/ end' },
     },
-    output: text(undefined, (a, v) => String(v?.text ?? compactJson(v))),
+    output: text(),
     timeoutMs: CALL_MS + 1_000,
     async execute(args, exec) {
       const sess = getSession(exec)
@@ -4448,7 +4469,7 @@ export function apply(ctx, rawConfig) {
       y: { type: 'number', description: '方块坐标 y（整数格）' },
       z: { type: 'number', description: '方块坐标 z（整数格）' },
     },
-    output: text(undefined, (a, v) => String(v?.text ?? compactJson(v))),
+    output: text(),
     timeoutMs: CALL_MS + 1_000,
     async execute(args, exec) {
       const sess = getSession(exec)
@@ -4483,7 +4504,7 @@ export function apply(ctx, rawConfig) {
       radius: { type: 'number', description: '找村民的范围（默认 32，最大 64）' },
       budgetMs: { type: 'number', description: '走过去的时间（默认整轮 10 秒）' },
     },
-    output: text(undefined, (a, v) => String(v?.text ?? compactJson(v))),
+    output: text(),
     timeoutMs: CALL_MS + 1_000,
     async execute(args, exec) {
       const sess = getSession(exec)

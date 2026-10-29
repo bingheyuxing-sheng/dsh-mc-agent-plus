@@ -22,7 +22,7 @@
  */
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
-import { mkdtempSync, rmSync, readFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, readFileSync, readdirSync } from 'node:fs'
 import { tmpdir, homedir } from 'node:os'
 
 // ── 断言小工具（和别的 check-*.mjs 一致）────────────────────────────────────────
@@ -145,12 +145,12 @@ const mkMc = (fake) => {
 /* ─────────── ① 常量与钳制 ─────────── */
 section('① CALL_MS / CALL_BUDGET_MS / callBudget() / callDeadline()')
 {
-  ok(CALL_MS === 11_000, 'CALL_MS = 11000（单次调用硬上限）', String(CALL_MS))
-  ok(CALL_BUDGET_MS === 10_000, 'CALL_BUDGET_MS = 10000（给长动作的默认预算，留 1 秒余量）', String(CALL_BUDGET_MS))
-  ok(callBudget(undefined) === 10_000, 'callBudget() 不给值 → 10000')
+  ok(CALL_MS >= 11_000 && CALL_MS % 1_000 === 0, 'CALL_MS ≥ 11000（单次调用硬上限；2026-10-29 用户决定维持 11 秒）', String(CALL_MS))
+  ok(CALL_BUDGET_MS === CALL_MS - 1_000, 'CALL_BUDGET_MS = CALL_MS − 1000（给长动作的默认预算，留 1 秒余量）', String(CALL_BUDGET_MS))
+  ok(callBudget(undefined) === CALL_BUDGET_MS, 'callBudget() 不给值 → CALL_BUDGET_MS')
   ok(callBudget(0) === 200, 'callBudget(0) → 200（0 = 只想动一下，不再放大成 10 秒）')
-  ok(callBudget(-1) === 10_000, 'callBudget(-1) → 10000')
-  ok(callBudget('abc') === 10_000, 'callBudget("abc") → 10000')
+  ok(callBudget(-1) === CALL_BUDGET_MS, 'callBudget(-1) → CALL_BUDGET_MS')
+  ok(callBudget('abc') === CALL_BUDGET_MS, 'callBudget("abc") → CALL_BUDGET_MS')
   ok(callBudget(100) === 200, 'callBudget(100) → 200（下限 200，别缩成 0）')
   ok(callBudget(1_234) === 1_234, 'callBudget(1234) → 1234（不放大）')
   ok(callBudget(200_000) === 10_000, 'callBudget(200000) → 10000（上限压死）')
@@ -848,6 +848,55 @@ for (const d of TMP_DIRS) { try { rmSync(d, { recursive: true, force: true }) } 
 {
   const seqSrc = readFileSync(new URL('../src/sequence.mjs', import.meta.url), 'utf8')
   ok(/\.\.\.\(s\.intent \? \{ intent: s\.intent \} : \{\}\)/.test(seqSrc), 'move 步骤把 intent 传下去了')
+}
+
+/* ── ⑨ 预算收口（2026-10-29 用户定规：「needLeft(ms) 应该拒绝启动，而不是强行压缩」） ──
+ * 以前到处是 `Math.max(1500, 剩余 - 500)` 这类写法 —— 剩余 0 时也给 1.5 秒，
+ * 动作越过本轮截止时间：外层硬掐、里层以为还有时间、不做收尾。
+ * 三条来源检查把这件事钉死：
+ *   ① `needLeft` / `insufficientText` 从 budget.mjs 导出、core.mjs 原样 re-export；
+ *   ② 8 个调用点真的用上了；
+ *   ③ 全仓（src/*.mjs + index.js）不许再把 msLeft()/callLeft() 塞进 `Math.max(固定数字, …)`
+ *      —— 窗口取同行 ±2 行，等价写法（`Math.max(1500, Math.min(left, budget))`）一起拦；
+ *      `Math.max(0, …)` 是白名单（钳到 0 正是正确写法）。 */
+{
+  const bSrc = readFileSync(new URL('../src/budget.mjs', import.meta.url), 'utf8')
+  ok(/export function needLeft\s*\(/.test(bSrc), 'budget.mjs 导出 needLeft')
+  ok(/export function insufficientText\s*\(/.test(bSrc), 'budget.mjs 导出 insufficientText')
+  ok(/left\s*<\s*min\s*\+\s*slack/.test(bSrc), 'needLeft 的边界是 min+slack（相等时放行）')
+  const cSrc = readFileSync(new URL('../src/core.mjs', import.meta.url), 'utf8')
+  ok(/needLeft,\s*insufficientText\s*\}/.test(cSrc), 'core.mjs re-export 了 needLeft / insufficientText')
+
+  const users = [
+    ['src/place.mjs', 'place.mjs 走近'],
+    ['src/mining.mjs', 'mining.mjs 阶梯/单目标'],
+    ['src/farm.mjs', 'farm.mjs 走近'],
+    ['src/boat.mjs', 'boat.mjs 行船/下船'],
+    ['src/bridge.mjs', 'bridge.mjs 走一格'],
+  ]
+  for (const [rel, label] of users) {
+    const s = readFileSync(new URL('../' + rel, import.meta.url), 'utf8')
+    ok(/needLeft\(/.test(s), `${label} 用上了 needLeft`)
+  }
+
+  const bad = []
+  const scan = readdirSync(new URL('../src/', import.meta.url)).filter((f) => f.endsWith('.mjs')).map((f) => 'src/' + f)
+  scan.push('index.js')
+  for (const rel of scan) {
+    let src = ''
+    try { src = readFileSync(new URL('../' + rel, import.meta.url), 'utf8') } catch { continue }
+    const lines = src.split('\n')
+    for (let i = 0; i < lines.length; i++) {
+      const L = lines[i]
+      if (!/(msLeft|callLeft)\(\)/.test(L)) continue
+      if (/Math\.max\(\s*0\s*,/.test(L)) continue
+      /* 只看**同一行**：跨行窗口会误报（相邻行各有各的 Math.max）。跨行写法靠行为套件兜底。 */
+      if (/Math\.max\(\s*\d[\d_]*\s*,[^)]*(msLeft|callLeft)\(\)/.test(L)) {
+        bad.push(`${rel}:${i + 1} → ${L.trim().slice(0, 90)}`)
+      }
+    }
+  }
+  ok(bad.length === 0, '全仓没有「Math.max(固定数字, …剩余…)」的预算写法（要收口就用 needLeft）', bad.slice(0, 6).join(' ｜ '))
 }
 
 console.log(`\n结果：${pass}/${pass + fail} 通过，${fail} 失败`)

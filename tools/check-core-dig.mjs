@@ -331,7 +331,7 @@ section('⑥ 够得着就原地挖 —— 复核过才算挖掉，掉落物要�
   ok(outA.some((l) => /挖掉 oak_log/.test(l) && /原地/.test(l)), '够得着就走"原地挖"这条路', jA.slice(0, 90))
   ok(a.picked.length === 1 && a.picked[0] === a.drop, '挖完把掉落物交给 collectBlock 捡回来', `picked=${a.picked.length}`)
   ok(!a.picked.includes(a.cow), '非掉落物（牛）不许交给 collectBlock（几乎每个实体都有 displayName）', `picked=${a.picked.length}`)
-  ok(outA.some((l) => /顺手捡回 1 个掉落物/.test(l)), '如实报捡回了几个', jA.slice(0, 120))
+  ok(outA.some((l) => /掉落物：.*顺手捡回 1 个/.test(l)), '如实报捡回了几个', jA.slice(0, 120))
 
   /* 挖到了但**一个都没捡到**（走不过去 / 捡不动）⇒ 必须点一句"东西还在地上"。
    * 用户 2026-10-08 原话："挖完方块…老是忘记走过去拾取" —— 捡不捡是决策，但结果里得让它知道。 */
@@ -438,6 +438,40 @@ section('⑧ 只给坐标时 count 不生效（否则第二格会去挖"空气"�
     '🔴 给了 pos 时 n 强制成 1（count 不再去找空气）')
   ok(!/const want = name \?\?/.test(src),
     '🔴 不再用"pos 那格的方块名"当第二个目标（那格已经挖空了）')
+
+  /* 🔴 2026-10-29（用户：「mc_dig coal_ore 挖几块后开始挖其他地方的矿，最近的并没挖完」）：
+   *   候选不能只扫一次。挖掉一块会把旁边的矿露出来，
+   *   必须重扫才能“先把这一片挖完”。 */
+  ok(/const queue = targets\.slice\(\)/.test(src) && /const rescan = \(wantName\) =>/.test(src),
+    '🔴 dig 用可动队列 + rescan（不再一次扫完就固定）')
+  /* 🔴 2026-10-29（用户：「这个等挖矿结束后最后检查」）：掉落物等待**不在块内**，
+   *   整轮挖完统一收一次。 */
+  ok(!/waitForPickup\(self, b, \{ at: p \}\)/.test(src) && !/graceMs: pickupGrace/.test(src),
+    '🔴 循环里不再逐块等掉落物吸附')
+  /* 🔴 2026-10-29（用户的输出规范）：挖成功不再逐块写一行。 */
+  ok(/const okLog = \[\]/.test(src) && /⛏ 挖掉 \$\{okLog\.length\} 块/.test(src),
+    '🔴 多块成功合并成一行汇总（按名字计数）')
+  ok(/byName\.set\(o\.nm, \(byName\.get\(o\.nm\) \?\? 0\) \+ 1\)/.test(src),
+    '汇总按方块名计数（coal_ore×3 这样）')
+  ok(!/out\.push\(`挖掉 \$\{nm\} @ \$\{p\}（原地/.test(src),
+    '单块那条改到收工处统一写（不在挖的循环里直接 push）')
+  ok(/let lastDig = null/.test(src) && /waitForPickup\(self, b, \{ at: lastDig \?\? undefined/.test(src),
+    '整轮结束统一检查一次（参照最后一次挖掘点）')
+  ok(/const enough = leftOf\(\) > 500/.test(src),
+    '时间不够就只报不捡（别把返回文本挤掉）')
+  ok(/import \{ PICKUP_GRACE_MS, waitForPickup \} from '\.\/pickup\.mjs'/.test(src),
+    '常量从 pickup.mjs 引，不写字面量')
+  ok(/if \(okCount > 0 && !queueNear\(\)\) rescan\(name\)/.test(src),
+    '🔴 队首还在脚边就不重扫（连续挖同一片不付扫描开销）')
+  ok(/maxDistance: Math\.min\(maxDistance, DIG_RESCAN_RADIUS\)/.test(src)
+    && /const DIG_RESCAN_RADIUS = 12/.test(src),
+    '重扫只扫近处（12 格内），远处那几块不插队')
+  ok(/found\.sort\(\(a, c\) => \(tierOf\(a\) - tierOf\(c\)\) \|\| \(distOf\(a\) - distOf\(c\)\)\)/.test(src),
+    '重扫后仍按“够得着 > 同一层 > 距离”排序')
+  ok(/tried\.has\(cellKeyOf\(blk\)\)/.test(src) && /tried\.add\(cellKeyOf\(target\)\)/.test(src),
+    '重扫会排除已处理过的坐标（不反复围着同一块转）')
+  ok(!/for \(const target of targets\)/.test(src),
+    '不再用固定数组 for-循环遍历候选（那样中途没法重排）')
 }
 
 /* ─────────── 收尾 ─────────── */

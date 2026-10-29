@@ -738,5 +738,13 @@ ok(/\.filter\(\(c\) => c\.err <= tol\)\.sort\(\(x, y\) => Math\.abs\(x\.deg\) - 
 ok(/const maxDeg = dist0 <= 12 \? 60 : 85/.test(shootSrc) && /if \(!upNeeded && c\.deg > maxDeg\) continue/.test(shootSrc),
   '近距离（≤12 格）不用 >60° 的仰角解（"往天上射"的根源），远靶才放宽到 85°')
 
+/* 🔴 2026-10-29（用户给的输出规范，阶段 2）：射箭结果要有一句人话，不能把 shots 全部字段摆出去。 */
+{
+  const S = (await import('node:fs/promises')).readFile
+  const src = await S(new URL('../src/shoot.mjs', import.meta.url), 'utf8')
+  ok(/text: shootTextOf\(\{/.test(src), '🔴 结果里带 text（不再整包压 JSON）')
+  ok(/function shootTextOf/.test(src) && /s\.aimError > 1/.test(src), '正常发只计数，只有被挡/高抛/偏差>1 才逐条')
+  ok(/shots\.filter|shots \?\? \[\]/.test(src) || /\(r\.shots \?\? \[\]\)/.test(src), 'shots 字段本身保留（调试还要看）')
+}
 console.log(`\n${fail ? '❌' : '✅'} ${pass} 通过 / ${fail} 失败`)
 process.exit(fail ? 1 : 0)
