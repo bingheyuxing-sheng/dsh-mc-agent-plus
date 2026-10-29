@@ -25,12 +25,51 @@ import { pickPlaceItem, isFullBlockItem } from './place-items.mjs'
 import { heldText } from './inventory.mjs'
 import { standableY, portalAt } from './movement.mjs'
 import { CALL_BUDGET_MS, needLeft, insufficientText } from './budget.mjs'
+import { noteDesync, desyncHealNote } from './desync-guard.mjs'
 
 /* 🔴 2026-10-23 实机（同一段时间里一条 `mc_move` 挂了 208 秒）：`b.placeBlock` 要等服务端
  *    把方块放进去才 settle，服务端不理（拒绝/失步/延迟）就**永不 settle** ——
  *    “跳起来再放”这条原地搭高的路上一样能挂死，而它不在任何预算闸门里。
  *    这里给每次放置一个上限：到点算这次没放上，由外层 `tries` 再试。 */
 export const PLACE_TIMEOUT_MS = 2_500
+
+/* 🔴 2026-10-29 DSH 补丁（从 local-0.4.3 `2f73fcd` 移植"火把姿势"）：附着类方块（火把/按钮/拉杆…）
+ *    能不能放上，服务端只认"对着哪个相邻面、瞄在面上哪个高度"。旧版把这件事列成候选逐个试、记住
+ *    成功的姿势；0.6.38 的 `placeRef` 只取第一个相邻面 + 瞄中心，姿势不对就整条失败、AI 只能盲换坐标。
+ *    名单与顺序原样搬运（旧文件 `git show 2f73fcd:src/place.mjs`）。 */
+export const ATTACH_RE = /^(torch|soul_torch|redstone_torch|.*_torch$|lantern|soul_lantern|ladder|end_rod|lever|tripwire_hook|carpet|vine|seagrass|kelp|.*_sign$|.*_banner$|.*_button$|.*_pressure_plate$|.*_head$|.*_skull$)/
+
+/* 相邻六面的顺序（和 `placeRef` 一致：先下、再上、再水平）—— 候选面按这个顺序枚举，
+ * 保证"没有记忆时第一次尝试"就是 0.6.38 的老行为（第一相邻面 + 瞄中心）。 */
+const NEIGHBORS = [[0, -1, 0], [0, 1, 0], [1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1]]
+const ATTACH_AIM = 0.25   // 附着类的第二种瞄高：面中心往上 1/4 格
+const NUDGE_AIM = 0.28    // 被拒微调时换的俯仰偏移（往下 / 往上）
+/* 🔴 2026-10-29 DSH 补丁（移植"被拒重试"）：微调就这两下，各**一次**，别无限试。 */
+const NUDGES = [{ key: 'back', aim: -NUDGE_AIM }, { key: 'right', aim: NUDGE_AIM }]
+
+/* 🔴 2026-10-29 DSH 补丁（旧版同款 `rayHitOf`，0.6.38 没搬过来）：报错时说出
+ *    "准星实际打到了哪一格" —— 光说"被拒"模型只能瞎猜，报出实际打中的格子它才知道该挪哪。
+ *    从眼睛沿当前 yaw/pitch 每 0.2 格采样，第一个实心方块就是答案；读不到/6 格内没有 ⇒ null。 */
+export function rayHitOf (b, maxCells = 6) {
+  try {
+    const p = b?.entity?.position
+    if (!p) return null
+    const yaw = Number(b.entity.yaw ?? 0); const pitch = Number(b.entity.pitch ?? 0)
+    const cp = Math.cos(pitch)
+    const dir = new Vec3(-Math.sin(yaw) * cp, Math.sin(pitch), -Math.cos(yaw) * cp)
+    const eye = new Vec3(p.x, p.y + (b.entity.eyeHeight ?? 1.62), p.z)
+    let prev = null
+    for (let t = 0.2; t <= maxCells; t += 0.2) {
+      const c = eye.plus(dir.scale(t)).floored()
+      const k = `${c.x},${c.y},${c.z}`
+      if (k === prev) continue
+      prev = k
+      const blk = b.blockAt(c)
+      if (blk && blk.boundingBox === 'block') return { x: c.x, y: c.y, z: c.z, name: blk.name }
+    }
+    return null
+  } catch { return null }
+}
 
 /**
  * 在目标周围找一块**能站的地面**当落脚点（"走过去放"用）。找不到返回 `null`。
@@ -63,7 +102,7 @@ function approachSpot (b, pos) {
 /** 找一个能对着放的相邻实体方块 */
 export function placeRef (self, pos) {
   const b = self.requireBot()
-  for (const [dx, dy, dz] of [[0, -1, 0], [0, 1, 0], [1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1]]) {
+  for (const [dx, dy, dz] of NEIGHBORS) {
     const nb = b.blockAt(new Vec3(pos.x + dx, pos.y + dy, pos.z + dz))
     if (nb && nb.boundingBox === 'block') return { ref: nb, face: { x: -dx, y: -dy, z: -dz } }
   }
@@ -143,6 +182,93 @@ export function placeConfirmText (c) {
   if (c.state === 'appeared') return `方块已确认出现（${c.got}，${c.waitedMs}ms）`
   if (c.state === 'refused') return `服务端明确拒绝放置（${at}）`
   return `发了 ${c.waitedMs}ms 服务端还没确认、方块也没出现（${at}）`
+}
+
+/* 🔴 2026-10-29 DSH 补丁（移植"火把姿势"第二步）：下面一小组只干一件事 ——
+ *   把"对着哪个面、瞄多高"列成候选逐个试。第一项**必须**等于 0.6.38 的现行为
+ *   （`placeRef` 的第一个相邻面 + 瞄中心），失败后才按旧版顺序补其余候选。 */
+const nameAt = (b, p) => { try { return p ? (b.blockAt(p, false)?.name ?? null) : null } catch { return null } }
+/** 成功要认**变体**（火把贴墙变 `wall_torch`），别只认字面。 */
+const sameItem = (b, target, name) => Boolean(name)
+  && String(nameAt(b, target) ?? '').replace(/wall_/g, '') === String(name).replace(/wall_/g, '')
+const postureKey = (a) => `${a.face.x},${a.face.y},${a.face.z}@${a.aim}`
+
+/** 排候选：普通方块只有一条；附着类补其余相邻面 × 两种瞄高，上次成功的姿势排最前。 */
+function placePostures (self, b, pos, ref, name) {
+  const base = { ref: ref.ref, face: ref.face, aim: 0 }
+  if (!ATTACH_RE.test(String(name ?? ''))) return [base]
+  const faces = []
+  for (const [dx, dy, dz] of NEIGHBORS) {
+    const nb = b.blockAt(pos.offset(dx, dy, dz))
+    if (nb && nb.boundingBox === 'block') faces.push({ ref: nb, face: { x: -dx, y: -dy, z: -dz } })
+  }
+  const plan = []
+  for (const c of (faces.length ? faces : [base]).slice(0, 4)) plan.push({ ...c, aim: 0 }, { ...c, aim: ATTACH_AIM })
+  const pref = self?._attachPosture?.[name]
+  const i = plan.findIndex((a) => postureKey(a) === pref)
+  if (i > 0) plan.unshift(plan.splice(i, 1)[0])
+  return plan.slice(0, 6)
+}
+
+/* 🔴 2026-10-29 DSH 补丁（移植"被拒重试"第一步）：试**一个**姿势，不抛 ——
+ *   拒绝 / 没回包都折成 `refused` + 世界复核三态；每试一次都有 PLACE_TIMEOUT_MS 上限。 */
+async function tryPosture (b, ctx, a, name) {
+  const target = placeTargetOf(a.ref, a.face)
+  const before = nameAt(b, target)
+  await ctx.t(b.lookAt(a.ref.position.offset(0.5, 0.5 + a.aim, 0.5), true), 'lookAt', '看向放置面')
+  let err = null
+  try {
+    await ctx.t(Promise.race([
+      Promise.resolve(b.placeBlock(a.ref, new Vec3(a.face.x, a.face.y, a.face.z))),
+      sleep(PLACE_TIMEOUT_MS).then(() => { throw new Error(`放方块 ${PLACE_TIMEOUT_MS}ms 没回包（服务端没理）`) }),
+    ]), 'place', '放置方块')
+  } catch (e) { err = e }
+  const confirm = await confirmPlaced(b, target, { name, before, waitMs: err ? 900 : 700 })
+  const refused = Boolean(err) && isPlaceRefused(err)
+  try { b.__placeConfirm = refused ? { ...confirm, state: 'refused' } : confirm } catch { /* 记账失败不影响结果 */ }
+  return { ok: sameItem(b, target, name) || confirm.state === 'appeared', err, confirm, refused, posture: a }
+}
+
+/** 微调一次：轻点后退/侧移 140ms，再换俯仰角瞄一次（各**只做一次**，上限在调用方）。 */
+async function nudgeOnce (b, ctx, ref, name, n) {
+  try { b.setControlState(n.key, true); await sleep(140); b.setControlState(n.key, false) } catch {}
+  await sleep(80)
+  return await tryPosture(b, ctx, { ref: ref.ref, face: ref.face, aim: n.aim }, name)
+}
+
+/* 🔴 2026-10-29 DSH 补丁（移植"被拒重试"第二步）：候选姿势挨个试（旧版顺序，最多 6 个），
+ *   还不行再"后退 / 侧移 + 换俯仰"各重试**一次**（附着类不微调 —— 它靠候选姿势）。
+ *   每次都有 PLACE_TIMEOUT_MS + `ctx.t` 的预算闸门兜底，不会无限重试。 */
+async function placeWithRetries (self, b, ctx, pos, ref, name) {
+  const attach = ATTACH_RE.test(String(name ?? ''))
+  const plan = placePostures(self, b, pos, ref, name)
+  let got = await tryPosture(b, ctx, plan[0], name)
+  for (const a of plan.slice(1)) {
+    if (got.ok) break
+    got = await tryPosture(b, ctx, a, name)
+  }
+  if (!got.ok && !attach) {
+    for (const n of NUDGES) {
+      if (got.ok) break
+      got = await nudgeOnce(b, ctx, ref, name, n)
+    }
+  }
+  if (got.ok && attach) { try { (self._attachPosture ??= {})[name] = postureKey(got.posture) } catch {} }
+  return got
+}
+
+/* 🔴 2026-10-29 DSH 补丁（移植"被拒重试"第三步）：失败文案要能照着做 ——
+ *   带上准星**实际打中**的那一格（旧版 `rayHitOf`），并说清自动重试已经做过哪些。 */
+function placeFailText (b, pos, got, attach) {
+  const ray = rayHitOf(b)
+  const rayText = ray ? `我的准星实际打在 **(${ray.x},${ray.y},${ray.z}) 的 ${ray.name}** 上（不是目标格）——` : ''
+  if (got?.refused) {
+    return `服务端拒了在 (${pos.x},${pos.y},${pos.z}) 的这次放置（太远 / 目标格被占 / 手上有别的 / 失步）——`
+      + (attach ? '依附面和瞄点高度已经自动换着试过几轮还是不行。' : '站位和俯仰已经自动微调重试过两轮还是不行。')
+      + rayText + '先用 `mc_move` 靠近或**换一个点位**，别对着同一个点位反复试，**也别当成放成功了**。'
+  }
+  return `在 (${pos.x},${pos.y},${pos.z}) 放完没确认：${placeConfirmText(got?.confirm)}。`
+    + rayText + '**别当成放成功了**（回包成功也可能是幽灵方块）—— 等一会儿再复核，或换点位。'
 }
 
 export async function placeWhileJumping (b, refBlock, face, { tries = 3 } = {}) {
@@ -376,17 +502,20 @@ export async function placeBlock (self, { x, y, z, name = null } = {}, ctx = {})
   const isOwnCell = Boolean(feetNow)
     && pos.x === feetNow.x && pos.z === feetNow.z
     && (pos.y === feetNow.y || pos.y === feetNow.y + 1)
+  /* 🔴 2026-10-29 DSH 补丁（移植"火把姿势"+"被拒重试"）：第一次仍是 0.6.38 的老行为
+   *   （`placeRef` 的第一个相邻面 + 瞄中心，原始尝试**不删**）；不行再按旧版顺序换候选面/瞄高
+   *   （附着类优先用上次成功的姿势），普通方块最后再"后退 / 侧移 + 换俯仰"各重试一次。
+   *   失败文案带上"准星实际打中的是哪格"，别再让模型盲猜。 */
+  const attach = ATTACH_RE.test(item.name)
   try {
     if (isOwnCell) await ctx.t(placeWhileJumping(b, ref.ref, ref.face), 'place', '跳起来放到自己脚下')
     else {
-      await ctx.t(b.placeBlock(ref.ref, new Vec3(ref.face.x, ref.face.y, ref.face.z)), 'place', '放置方块')
-      /* 🔴 用户 2026-10-29：回包成功 ≠ 方块真出现（幽灵方块 / 回包丢）。回头看一眼世界。 */
-      const c = await confirmPlaced(b, placeTargetOf(ref.ref, ref.face), { name: b.heldItem?.name ?? null, waitMs: 700 })
-      try { b.__placeConfirm = c } catch { /* 同上 */ }
-      if (c.state !== 'appeared') {
-        try { self.log(`🧱 放置未确认：${placeConfirmText(c)}`) } catch { /* 同上 */ }
-        throw new Error(`在 (${pos.x},${pos.y},${pos.z}) 放完没确认：${placeConfirmText(c)}。`
-          + '**别当成放成功了**（回包成功也可能是幽灵方块）—— 等一会儿再复核，或换点位。')
+      const got = await placeWithRetries(self, b, ctx, pos, ref, item.name)
+      if (!got.ok) {
+        try { self.log(`🧱 放置未确认：${placeConfirmText(got.confirm)}`) } catch { /* 同上 */ }
+        /* 放完复核不过（含明确被拒）也算失步的一种 —— 攒 3 次触发自愈重连（2f73fcd 移植）。 */
+        const heal = noteDesync(self, `放置复核不过 ${pos.x},${pos.y},${pos.z}`)
+        throw new Error(placeFailText(b, pos, got, attach) + desyncHealNote(heal))
       }
     }
   } catch (e) {
@@ -394,11 +523,14 @@ export async function placeBlock (self, { x, y, z, name = null } = {}, ctx = {})
      *    以前原样冒泡给模型。翻译成它能用的话。 */
     const m = String(e?.message ?? '')
     if (/Server refused to place/i.test(m)) {
+      /* 服务端明确拒放置 = 失步信号之一（2f73fcd 移植）。 */
+      const heal = noteDesync(self, `放置被拒 ${pos.x},${pos.y},${pos.z}`)
       throw new Error(`服务端拒了在 (${pos.x},${pos.y},${pos.z}) 的这次放置（太远 / 目标格被占 / 手上有别的 / 失步）——`
         + (isOwnCell
           ? '**那一格是我自己身体占着的**（脚下/齐腰），已经试过"跳起来放"也没成 —— '
             + '先 `mc_move` 挪开一格、或者把**下面那一格**填上再站上去。别对着同一个点位反复试。'
-          : '先用 `mc_move` 靠近或**换一个点位**，别对着同一个点位反复试，**也别当成放成功了**。'))
+          : '先用 `mc_move` 靠近或**换一个点位**，别对着同一个点位反复试，**也别当成放成功了**。')
+        + desyncHealNote(heal))
     }
     throw e
   }

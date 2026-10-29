@@ -4,7 +4,8 @@
  *
  * 验的是：
  *   ① 认出"不是 git 仓库"就切 `mode:'copy'`，别直接报死；
- *   ② 远端顺序是 **Gitee → GitHub**（匿名可拉，GitHub 在那边可能超时）；
+ *   ② 更新源**可配**（`updateRemotes`，config.mjs）：默认自己 fork 优先、上游 GitHub 兜底，
+ *      已死的 gitee 源（401）不再默认；网络类 git 禁交互凭据弹窗，错误带 netHint 提示；
  *   ③ 覆盖（`cpSync`）**跳过** `.git` 与 `node_modules` —— 仓库元数据和宿主装的依赖都不能动；
  *   ④ 顺序必须是"先整份备份 → 再覆盖 → 最后写装过哪个提交的标记"，任何一步都不许颠倒；
  *   ⑤ 落后几个提交靠标记里的提交号在浅 clone 里数（这里真起一个 git 仓库实测一遍）；
@@ -46,16 +47,23 @@ ok(/const fillCopyUpdate = async \(data\) =>/.test(idx), 'fillCopyUpdate 存在'
 ok(/const applyUpdateCopy = async \(info\) =>/.test(idx), 'applyUpdateCopy 存在')
 ok(/if \(info\.mode === 'copy'\) return await applyUpdateCopy\(info\)/.test(idx), 'applyUpdate 按 mode 分流')
 
-/* ─────────────── ② 远端顺序 ─────────────── */
-section('② 远端顺序：Gitee 优先、GitHub 兜底')
+/* ─────────────── ② 更新源：配置驱动、自己 fork 优先 ─────────────── */
+section('② 更新源：updateRemotes 可配、自己 fork 优先、上游兜底')
 {
-  const m = idx.match(/const UPDATE_REMOTES = \[([\s\S]*?)\]/)
-  ok(m !== null, '有 UPDATE_REMOTES 数组')
+  const cfg = readFileSync(new URL('src/config.mjs', root), 'utf8')
+  ok(/const updateRemotesOf = \(\) => pluginConfig\.updateRemotes/.test(idx), 'cloneLatest 走 updateRemotesOf()（配置驱动）')
+  const m = cfg.match(/updateRemotes: \[([\s\S]*?)\]/)
+  ok(m !== null, 'config.mjs 有 DEFAULT_CONFIG.updateRemotes')
   const urls = m ? [...m[1].matchAll(/'([^']+)'/g)].map((x) => x[1]) : []
   ok(urls.length >= 2, `至少两个源（实际 ${urls.length}）`, urls.join(', '))
-  ok(urls[0]?.includes('gitee.com'), '第一个是 gitee', urls[0])
-  ok(urls.some((u) => u.includes('github.com')), '包含 github 兜底')
+  ok(urls[0]?.includes('bingheyuxing-sheng/dsh-mc-agent-plus'), '第一个是自己的 fork', urls[0])
+  ok(urls.some((u) => u.includes('github.com/blueziii/dsh-mc-agent')), '包含上游 GitHub 兜底')
+  ok(!urls.some((u) => u.includes('gitee.com/bluezi')), '已死的 gitee 源（401）不再默认')
   ok(!urls.some((u) => u.includes('@')), '远端地址里**不带令牌**', urls.join(', '))
+  ok(/get updateRemotes \(\)/.test(cfg) && /top === 'updateRemotes'/.test(cfg), 'config.mjs 有 getter + setter 校验')
+  ok(/credential\.interactive=false/.test(idx) && /GIT_TERMINAL_PROMPT: '0'/.test(idx), '网络 git 禁交互凭据（不再挂到超时）')
+  ok(/\['origin', 'gitee'\]/.test(idx), 'git 模式源优先级 origin 在前')
+  ok(/netHint/.test(idx), '网络类失败带 netHint 提示（配代理/换源）')
 }
 
 /* ─────────────── ③ 覆盖跳过 .git / node_modules ─────────────── */

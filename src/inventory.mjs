@@ -259,6 +259,43 @@ export function durWarnText (b, opts = {}) {
   return bad.length ? badDurText(bad) : null
 }
 
+/* ─────────── 长挖耐久门槛（🔴 2026-10-29 DSH 补丁：从 local-0.4.3 / 2f73fcd 搬回）───────────
+ * 为什么搬回：0.6.38 只在**收工时报**耐久（`durWarnText`），没有门槛 —— 工具断了才知道。
+ * 2026-10-26 一天三起同型事故：拿着快断的镐开长挖，挖到一半爆在坑里（断镐困 y63 / 镐全断
+ * 从 y29 往上爬 / 空手困竖井）。判据照旧：快断（<10%）先换备用，没有备用就别开工。
+ * 本模块照旧只读不写：换工具由 mining.mjs 用返回的 `swapTo` 去做。 */
+/** 长挖（≥4 块 / 阶梯）允许的最低剩余耐久比例 */
+export const DUR_DIG_MIN = 0.1
+
+/**
+ * 长挖的耐久门槛。返回：
+ *   · `{ ok: true }` —— 手上这把还好（或手上根本不是会磨损的东西，`equipFor` 自会处理）；
+ *   · `{ swapTo, heldName, heldPct, sparePct }` —— 背包里有把**明显更耐用**的同族工具，先换它；
+ *   · `{ refuse }` —— 快断又没有备用 ⇒ 一句人话，长挖别开工。
+ */
+export function longDigDurGate (b) {
+  const held = b?.heldItem
+  const d = durabilityOf(held)
+  if (!d || d.pct > DUR_DIG_MIN) return { ok: true }
+  const fam = /_pickaxe$/.test(String(held?.name ?? '')) ? /_pickaxe$/ : /_(pickaxe|axe|shovel)$/
+  let best = null
+  try {
+    for (const it of b.inventory.items()) {
+      if (it === held || !fam.test(String(it?.name ?? ''))) continue
+      const sd = durabilityOf(it)
+      if (sd && sd.pct > d.pct + 0.05 && (!best || sd.pct > best.sd.pct)) best = { it, sd }
+    }
+  } catch { best = null }
+  const heldPct = Math.round(d.pct * 100)
+  if (best) return { swapTo: best.it, heldName: held.name, heldPct, sparePct: Math.round(best.sd.pct * 100) }
+  return {
+    refuse: `手上 ${held.name} 只剩 ${d.left}/${d.max}（${heldPct}%）耐久，背包里也没有更耐用的备用工具 —— `
+      + '**长挖不开工**：工具挖到一半爆掉会把人困在坑里（2026-10-26 一天三起这形状的故障）。'
+      + '先 `mc_craft` 一把备用（木镐 = 3 木板 + 2 木棍；有铁就 `iron_pickaxe`），'
+      + '或改小批量分次挖（`count` ≤ 3 不开长挖）。',
+  }
+}
+
 /** 装备栏一行字（`头 空 · 身 铁胸甲x1 · 耐久 200/240 · 腿 空 · 脚 空 · 副手 空`） */
 export function equipmentText (b) {
   const eq = equipmentOf(b)
@@ -591,8 +628,18 @@ export async function clearInventory (b, ctx = {}) {
   }
 }
 
-/** 丢弃手上的物品（`name` 给了就先换上那个） */
-export async function tossItem (b, { name = null, count = 1 } = {}, ctx = {}) {
+/**
+ * 丢弃手上的物品（`name` 给了就先换上那个）。
+ *
+ * 🔴 2026-10-26 优化清单②（P0：往队友脚边扔镐连丢 5+ 次全"被方块吃掉"，12:32–12:35）：
+ *   给 `who`（玩家名）走**队友交接**流程：
+ *   ① 寻路到 TA 同层相邻（≤3 格）；② 校验 TA 脚下/身前的格子是 air（不是就明说）；
+ *   ③ 瞄准 TA 的身体再丢（`toss` 底层是"沿朝向扔出"，不瞄就是随机方向）；
+ *   ④ 丢出后 2 秒轮询 **item entity 快照**（`b.entities` 来自服务端 spawn_entity 包，
+ *      不是客户端预测）确认落点并回报坐标；看不到落点就明确建议**改用箱子交接**。
+ *   `ctx.self` = McBot（走 `walkTo` 用）；没给 self 时 `who` 直接报错（自检走无 who 的路）。
+ */
+export async function tossItem (b, { name = null, count = 1, who = null } = {}, ctx = {}) {
   const t = ctx.t ?? ((p) => p)
   let item = b.heldItem
   if (name) {
@@ -603,18 +650,88 @@ export async function tossItem (b, { name = null, count = 1 } = {}, ctx = {}) {
   }
   if (!item) throw new Error('手上没东西可丢')
   const n = Math.min(Math.max(Number(count) || 1, 1), item.count)
+
+  /* ── 队友交接（优化清单②）── */
+  let mate = null
+  if (who) {
+    const s = ctx.self
+    if (typeof s?.walkTo !== 'function') throw new Error('toss 的 who 需要会话上下文（walkTo）—— 从 mc_act 调，别直接调这里')
+    const key = String(who).toLowerCase()
+    const plName = Object.keys(b.players ?? {}).find((k) => k.toLowerCase() === key) ?? String(who)
+    const ent = b.players?.[plName]?.entity
+      ?? Object.values(b.entities ?? {}).find((e) => e?.username?.toLowerCase?.() === key)
+    if (!ent?.position) {
+      const online = Object.keys(b.players ?? {}).filter((k) => k !== b.username)
+      throw new Error(`找不到玩家 ${who}（在线：${online.join('、') || '没别人'}）—— 交接前先确认 TA 在服里、离得不远（区块加载得到）`)
+    }
+    const feet = ent.position.floored()
+    /* 目标格必须是 air：TA 站的那格和头顶一格 —— 读回来是实心就说明**本地和那边对不上**
+     * （或者 TA 卡进方块了），这时扔过去必被"吃掉"，先说清楚。 */
+    const cellAt = (p) => { try { return b.blockAt(p) } catch { return null } }
+    const feetBlk = cellAt(feet); const headBlk = cellAt(feet.offset(0, 1, 0))
+    const solid = (bl) => Boolean(bl) && !/air/.test(String(bl.name ?? '')) && !/water|lava|flowing/.test(String(bl.name ?? ''))
+    if (solid(feetBlk) || solid(headBlk)) {
+      throw new Error(`${plName} 脚下那格我读到的是 ${feetBlk?.name ?? '?'}（实心）—— 扔过去会被方块吃掉。`
+        + '让 TA 挪到空地上，或者**改用箱子交接**（走到 TA 旁边 mc_chest 放个箱子）。')
+    }
+    /* 寻路到同层相邻：目标给 TA 的格子，intent near + arrive 2.5 ⇒ 走到旁边 2–3 格为止 */
+    const w = await s.walkTo({ x: feet.x, y: feet.y, z: feet.z }, { arrive: 2.5, intent: 'near', budgetMs: 6_000 })
+    if (w && w.arrived === false) {
+      throw new Error(`走到 ${plName} 旁边失败（${w.reason ?? '没走到'}）—— 东西先别扔：扔远了就是"被方块吃掉"。`
+        + '先 mc_move 靠近，或改用箱子交接。')
+    }
+    /* 朝 TA 的身体扔：aimAt 直接写 yaw/pitch（bot.lookAt 站着不动会挂，见 camera.mjs），
+     * 停 450ms 让物理循环把朝向发出去（和 useitem 一个节奏）。 */
+    try {
+      const { aimAt } = await import('./camera.mjs')
+      aimAt(b, { x: ent.position.x, y: ent.position.y + 1, z: ent.position.z })
+    } catch { /* 瞄不上也要丢 */ }
+    await sleep(450)
+    mate = { plName, feet, before: new Set(Object.keys(b.entities ?? {}).map(String)) }
+  }
+
   const snap = invSnap(b)
   await t(Promise.resolve(b.toss(item.type, null, n)), 'toss', `丢弃 ${item.name}`)
   /* 🔴 2026-10-08 审计：`bot.toss` 底层是 `transfer()`（clickWindow + 等窗口回包），resolve 只说明
    *    "服务端回包了" —— 到底掉出去几个要按**背包数量差**说，别把"想丢几个"当结果。 */
   const lost = (snap.get(item.name) ?? 0) - (invSnap(b).get(item.name) ?? 0)
-  return {
+  const out = {
     tossed: `${item.name}x${n}`,
     /* 🟡 2026-10-15 审计（报告 C 第 1 条）：`tossed` 永远是 `"名字xN"` 字符串（少丢时只加 `note`），
      *   所以调用方拿 `tossed !== false` 判成功是**恒真**的。这里补一个如实的结果位。 */
     ok: lost === n,
     ...(lost === n ? {} : { note: `背包里只少了 ${Math.max(0, lost)} 个（想丢 ${n} 个）—— 东西可能还在地上或没丢出去，用 mc_inventory 看一眼` }),
   }
+  if (mate) {
+    out.to = mate.plName
+    /* 2 秒轮询 item entity（服务端快照）：新出现的、名字对得上的掉落物在哪。 */
+    let landed = null
+    const t0 = Date.now()
+    while (Date.now() - t0 < 2000 && !landed) {
+      for (const [id, e] of Object.entries(b.entities ?? {})) {
+        if (mate.before.has(id)) continue
+        if (String(e?.kind ?? e?.name ?? '') !== 'item' && String(e?.name ?? '') !== 'item') continue
+        let nm = null
+        try { nm = b.getDroppedItem?.(e)?.name ?? null } catch { nm = null }
+        if (nm && nm !== item.name) continue
+        const p = e?.position
+        if (!p) continue
+        landed = { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z) }
+        break
+      }
+      if (!landed) await sleep(100)
+    }
+    if (landed) {
+      out.landedAt = landed
+      out.note = `✅ 扔到了 ${mate.plName} 脚边 (${landed.x},${landed.y},${landed.z}) —— 让 TA 走过去捡（站上去 1–2 秒就进背包）。`
+    } else if (lost > 0) {
+      out.note = `东西扔出去了（背包少了 ${lost} 个），但 2 秒内**没看到掉落物实体** —— `
+        + '多半被方块吃掉或瞬间消失了。别再原地重扔：改用**箱子交接**（走到 TA 旁边 mc_chest 放个箱子，把东西存进去）。'
+    } else {
+      out.note = `没确认扔出去（背包没少）。改用**箱子交接**：走到 ${mate.plName} 旁边 mc_chest 放个箱子再存进去。`
+    }
+  }
+  return out
 }
 
 /* ─────────── 第三十二刀：动手前换工具（原来 core 的私有 `#equipFor`） ─────────── */

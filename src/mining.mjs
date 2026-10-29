@@ -22,13 +22,14 @@ const Vec3 = vec3pkg.Vec3 ?? vec3pkg
 
 import { sleep, DESYNC_HINT } from './async-util.mjs'
 import { isAir, isLiquid, isSolidBlock, isPassable } from './block-names.mjs'
-import { heldText, canHarvestNow, canBreakNow, toolKinds, countOf, durWarnText } from './inventory.mjs'
+import { heldText, canHarvestNow, canBreakNow, toolKinds, countOf, durWarnText, longDigDurGate } from './inventory.mjs'
 import { digMsFor } from './dig-speed.mjs'
 import { blockReachOf, slowDigWhy, stateNameOf, dropHint, dropListOf } from './world-observer.mjs'
 import { PICKUP_GRACE_MS, waitForPickup } from './pickup.mjs'
 import { classifyRestore, restoreLocalBlock } from './server-break.mjs'
-import { callBudget, callSecText, needLeft, insufficientText } from './budget.mjs'
+import { CALL_MS, callBudget, callSecText, needLeft, insufficientText } from './budget.mjs'
 import { dangerNow, dangerText, dangerNotice, healthOf, noticeKey } from './danger.mjs'
+import { noteDesync, desyncHealNote } from './desync-guard.mjs'
 
 /* 「挖到刚好够合成就不挖了」—— 收工时补一句（用户 2026-10-13 报的毛病）。
  *
@@ -265,29 +266,35 @@ export async function breakBlock (self, { x, y, z, allowDangerous = false, noCle
     /* 服务端包里的状态 id 是**权威**的（本地 `blockAt` 可能还没应用上这个包，会读成 air）⇒ 优先用它。 */
     const back = rest.name ?? stateNameOf(b, watch.restored()) ?? b.blockAt(pos)?.name ?? '别的方块'
     self.log(`⚠️ 服务端把 ${name} 复原了（${pos.x},${pos.y},${pos.z}）—— 这次破坏没被认`)
+    const heal = noteDesync(self, `服务端复原 ${pos.x},${pos.y},${pos.z}`)
     return {
       broken: false, restored: true, at: { x: pos.x, y: pos.y, z: pos.z }, now: back,
+      ...(heal.healing ? { desyncHeal: true } : {}),
       held, reach: Math.round(blockReachOf(b, blk) * 100) / 100,
       ...(t.changed ? { tool: `${t.heldBefore} → ${t.held}` } : {}),
       ...(digMs != null ? { digMs } : {}),
       note: `服务端把这块**改回了 ${back}**（复原）—— 这次破坏服务端没认（多半是我离得远，或客户端区块旧了）。`
         + '先 `mc_move` 走到它旁边（3 格以内）再叫一次。'
         + slowDigWhy(b)
-        + DESYNC_HINT,
+        + DESYNC_HINT
+        + desyncHealNote(heal),
     }
   }
   if (rest?.kind === 'other') {
     await sleep(150)
     const back = rest.name ?? '别的方块'
     self.log(`⚠️ 服务端说 ${pos.x},${pos.y},${pos.z} 是 ${back}，和我以为的 ${name} 不一样 —— 客户端区块旧了？`)
+    const heal = noteDesync(self, `服务端说这格是 ${back}`)
     return {
       broken: false, restored: true, desync: true, at: { x: pos.x, y: pos.y, z: pos.z }, now: back,
+      ...(heal.healing ? { desyncHeal: true } : {}),
       held, reach: Math.round(blockReachOf(b, blk) * 100) / 100,
       ...(t.changed ? { tool: `${t.heldBefore} → ${t.held}` } : {}),
       ...(digMs != null ? { digMs } : {}),
       note: `服务端说这一格是 **${back}**，和我这边看到的 **${name}** 不一样（客户端区块旧了）—— 这次破坏没被认。`
         + '先 `mc_scan` 复核一眼，别照着旧方块继续动手。'
-        + DESYNC_HINT,
+        + DESYNC_HINT
+        + desyncHealNote(heal),
     }
   }
   /* 真挖掉了 ⇒ 掉落物就在脚边。用户 2026-10-08 原话："挖完方块…老是忘记走过去拾取"。
@@ -296,6 +303,8 @@ export async function breakBlock (self, { x, y, z, allowDangerous = false, noCle
    *    把本地那一格改回去。否则这一格会变成“本地空气 / 服务端实心”的幽灵空位，
    *    寻路和地图都以为那儿通了（实机表现：得换目标或绕一下才走得动）。 */
   const rolledBack = (localGone && confirmed === false) ? restoreLocalBlock(b, pos, Number(blk?.stateId)) : false
+  /* 本地都得回滚了 ⇒ 服务端一声不响，这也是失步的一种（攒 3 次触发自愈重连）。 */
+  const healRoll = rolledBack ? noteDesync(self, `本地回滚 ${pos.x},${pos.y},${pos.z}`) : null
   const pickup = localGone ? dropHint(b) : null
   /* 🔴 和 mc_attack 一个口径：只说"地上还有东西"不够，**在哪**才是能不能捡的依据
    *   （2026-10-22 下界连丢两根烈焰棒就是栽在这上面）。捡不捡仍由 AI 决定。 */
@@ -306,6 +315,7 @@ export async function breakBlock (self, { x, y, z, allowDangerous = false, noCle
   return {
     broken: rolledBack ? false : (localGone ? name : false),
     ...(rolledBack ? { localRestored: true } : {}),
+    ...(healRoll?.healing ? { desyncHeal: true } : {}),
     ...(clearedSight.length ? { cleared: clearedSight } : {}),
     confirmed,
     at: { x: pos.x, y: pos.y, z: pos.z },
@@ -331,7 +341,8 @@ export async function breakBlock (self, { x, y, z, allowDangerous = false, noCle
         + '（领地保护 / 权限 / 反作弊 / 太远），客户端这边却把方块写成空气了。'
         + '用 `mc_scan` 或 `mc_observe` 再确认一下，**别在空气上盖房、别走进你以为挖穿的墙**。'
         + (rolledBack ? '（我已经把本地那一格改回原样，免得寻路把它当成空洞）' : '')
-        + DESYNC_HINT,
+        + DESYNC_HINT
+        + desyncHealNote(healRoll),
     } : {}),
     ...(localGone ? {} : {
       /* 🔴 审计 F2：这句必须让"预算用完"能被**文本**认出来（`timeout`/`budget` 规则），
@@ -381,6 +392,102 @@ export const STAIR_MIN_STEP_MS = 1_200
  *   以前一律 `reason = 'no-floor'` 整趟放弃（实机 31/115 = 27%，用户只能原地重叫、方向不变又撞同一堵）。 */
 export const STAIR_DROP_OK = 3
 
+/* 🔴 2026-10-29 DSH 补丁：stair 续跑（从 local-0.4.3 / 2f73fcd 搬回）。
+ * 旧版优化清单⑥：长楼梯不再靠模型一遍遍「再叫一次」—— 一段以 budget 收口时，插件自己在
+ * 后台接下一段（每段仍 ≤11 秒），直到到目标 y / 撞上真障碍 / 超过整模式上限（5 分钟）/ 被叫停。
+ * 与旧版的差别（新版有调度器 / 中断信号）：
+ *   · 每段起跑前查 `actionScheduler()` 有没有别的动作在跑，有就让路（不跟并发动作抢同一个 bot）；
+ *   · 每段起跑前查 `self.stopped` / `self.online` / `abortSignal.aborted`（用户点停止就不再接段）；
+ *   · 计时器一律 `unref()`，收工 / 取消时 `clearTimeout` —— 不给进程留"僵尸定时器"；
+ *   · 导出 `cancelStairRun()` 给下一轮接线（断线 / mc_stop 时可直接取消）。 */
+export const STAIR_RUN_MAX_MS = 5 * 60_000
+export const STAIR_CONT_GAP_MS = 300
+
+/** 只清计时器、不动统计（"手动重叫"时让后台那条让位，两条不抢同一个 bot）。 */
+function clearStairTimer (self) {
+  const st = self?._stairRun
+  if (!st?.timer) return
+  try { clearTimeout(st.timer) } catch { /* 忽略 */ }
+  st.timer = null
+}
+
+/** 收掉自动续跑的状态（报一声"续挖结束"，让日志/事件里能看到）。 */
+function finishStairRun (self, reason, summary) {
+  const st = self?._stairRun
+  if (!st?.startedAt) return
+  clearStairTimer(self)
+  const wasRunning = st.segments > 0
+  self._stairRun = { segments: 0, startedAt: 0, timer: null }
+  if (!wasRunning) return
+  try { self.log(`🪜 阶梯自动续挖收工（${reason}）${summary ? `：${summary}` : ''}`) } catch { /* 忽略 */ }
+  try { self.emit('stair-done', { reason, summary, at: Date.now() }) } catch { /* 忽略 */ }
+}
+
+/** 还能不能接着跑：没被下线 / 没断线 / 这一轮没被用户中断。 */
+const stairAliveOf = (self) => Boolean(self) && !self.stopped && Boolean(self.online) && !self.abortSignal?.aborted
+
+/** 有没有别的动作正占着 bot（有就这一拍让路，别跟并发动作抢）。 */
+function stairBusyOf (self) {
+  try {
+    const sch = self.actionScheduler?.()
+    return Boolean(sch && typeof sch.list === 'function' && sch.list().length)
+  } catch { return false }
+}
+
+/** 排下一段自动续跑。返回 true = 会自动接着挖（调用方据此改文案）。 */
+function scheduleStairContinue (self, params, ctx, gapMs = STAIR_CONT_GAP_MS) {
+  if (typeof setTimeout !== 'function' || typeof self?.setCallDeadline !== 'function') return false
+  if (!stairAliveOf(self)) return false
+  const st = (self._stairRun ??= { segments: 0, startedAt: 0, timer: null })
+  if (!st.startedAt) { st.startedAt = Date.now(); st.segments = 0 }
+  if (Date.now() - st.startedAt > STAIR_RUN_MAX_MS) { finishStairRun(self, 'timeout', `超过 ${Math.round(STAIR_RUN_MAX_MS / 60_000)} 分钟`); return false }
+  if (st.timer) return true                       // 已经排上了，别双跑
+  st.segments++
+  st.timer = setTimeout(() => {
+    st.timer = null
+    stairTick(self, params, ctx).catch(() => finishStairRun(self, 'error', ''))
+  }, gapMs)
+  try { st.timer.unref?.() } catch { /* 忽略 */ }
+  return true
+}
+
+/** 续跑的一拍：活着 + 没人占 bot 才真的跑下一段（否则让路，3 秒后再看）。 */
+async function stairTick (self, params, ctx) {
+  if (!stairAliveOf(self)) { finishStairRun(self, 'stopped', ''); return }
+  if (stairBusyOf(self)) { scheduleStairContinue(self, params, ctx, 3_000); return }
+  try { self.setCallDeadline(CALL_MS) } catch { /* 没这个方法就算了 */ }
+  try {
+    await digStair(self, { ...params, fromContinue: true }, ctx)
+  } catch (e) { finishStairRun(self, 'error', String(e?.message ?? e)) }
+}
+
+/** 外部取消（下一轮接线用：断线 / mc_stop / 切任务时调它，别让后台那条接着挖）。 */
+export function cancelStairRun (self, reason = 'cancelled') {
+  const st = self?._stairRun
+  if (!st?.startedAt) return false
+  finishStairRun(self, reason, '')
+  return true
+}
+
+/**
+ * 长挖开工前的耐久门槛（🔴 2026-10-29 DSH 补丁，从 local-0.4.3 / 2f73fcd 搬回）。
+ * 快断又有备用 ⇒ 先换（`swapTo`）；快断又没有 ⇒ `refused`，调用方动手前直接拒绝。
+ * 换工具要发包，所以走 `ctx.t`（本轮预算闸门）；假 bot 没有 `equip` 就照旧开工。
+ */
+async function longDigGate (self, b, ctx) {
+  if (b?.game?.gameMode === 'creative' || typeof b?.equip !== 'function') return { refused: false }
+  const g = longDigDurGate(b)
+  if (g.refuse) return { refused: true, note: g.refuse }
+  if (!g.swapTo) return { refused: false }
+  try {
+    await ctx?.t?.(b.equip(g.swapTo, 'hand'), 'equip', '长挖前换备用工具')
+    return { refused: false, note: `🔧 长挖开工前换了工具：${g.heldName}（只剩 ${g.heldPct}%）→ ${g.swapTo.name}（${g.sparePct}%）` }
+  } catch {
+    /* 换不上就照旧开工：收工时的 `durWarnText` 还会再提醒一次。 */
+    return { refused: false, note: `⚠️ 想换备用 ${g.swapTo.name} 没换成（${g.heldName} 只剩 ${g.heldPct}%）—— 工具断了就 mc_inventory 看一眼` }
+  }
+}
+
 /** 朝哪挖：给了目标 x/z 用主轴；给了 dir（"x+"/"x-"/"z+"/"z-"）直接用；都没给按当前朝向 */
 export function stairDirOf (b, { pos = null, dir = null } = {}) {
   const p = b?.entity?.position
@@ -426,8 +533,12 @@ export function stairDropOf (blkAt, fx, fy, fz, { maxDrop = STAIR_DROP_OK } = {}
 
 export async function digStair (self, {
   pos = null, dir = null, targetY = null, maxSteps = STAIR_MAX_STEPS, budgetMs = 10_000,
+  autoContinue = true, fromContinue = false,
 } = {}, ctx = {}) {
   const b = self.requireBot()
+  /* 🔴 2026-10-29 DSH 补丁：模型又手动叫了一次 stair ⇒ 先收掉后台那条续跑的计时器，
+   *   免得两条一起抢同一个 bot；同一趟的 5 分钟上限照样沿用（不重置 startedAt）。 */
+  if (!fromContinue) clearStairTimer(self)
   const start = b.entity.position.floored()
   /* 🔴 2026-10-25 实机 bug（Bluezi 报「我给了 y50 也给了 dir z+ 还是这句」）：
    *   说明里写"x/z 可选"，但 index.js 只在 x/y/z **三个都有**时才组 pos ⇒ 只给 y 时
@@ -443,11 +554,19 @@ export async function digStair (self, {
   const d = stairDirOf(b, { pos, dir })
   if (!d) throw new Error('算不出往哪挖：给 x/z（朝那个点挖）或 dir（"x+" / "x-" / "z+" / "z-"）。')
   if (up ? start.y >= ty : start.y <= ty) {
+    finishStairRun(self, 'done', '')
     return [`🪜 我已经在 y=${start.y}，目标 y=${ty} —— 不用挖了（换个目标 y 才有活干）。`]
+  }
+  /* 🔴 2026-10-29 DSH 补丁：阶梯天然是长挖（每步 3 格）—— 快断又没备用就动手前拒绝，
+   *   别让镐在第几步爆掉把人困在坑里。 */
+  const gate = await longDigGate(self, b, ctx)
+  if (gate.refused) {
+    finishStairRun(self, 'refused', '')
+    return [`🪜 阶梯没开工：${gate.note}`]
   }
 
   const t0 = Date.now()
-  const notes = []
+  const notes = gate.note ? [gate.note] : []
   let cur = start.clone()
   let dug = 0; let steps = 0
   let reason = 'budget'
@@ -591,7 +710,7 @@ export async function digStair (self, {
     ? `挖了 ${steps} 步、${dug} 块方块，从 y=${start.y} 到 y=${now.y}`
     : `走了 ${steps} 步（没挖方块，沿已有通道），从 y=${start.y} 到 y=${now.y}`
   const climbed = now.y - start.y
-  const tail = {
+  let tail = {
     done: '✅ 到目标高度了。',
     budget: `⏱ 这一轮分到的时间用完了（这次 ${Math.round(budgetMs / 1000)} 秒）—— 再叫一次 \`mc_dig {mode:"stair", y:${ty}}\` 接着挖（已经挖好的不会白挖）。`,
     liquid: '🌊 前面是水/岩浆，不往那边挖了 —— 换个方向（`dir:"x-"` 之类）或者先绕开。',
@@ -605,6 +724,18 @@ export async function digStair (self, {
   }[reason] ?? ''
   const hint = reason === 'done' ? '' : `
 还剩 ${Math.max(0, left)} 格到 y=${ty}。`
+  /* 🔴 2026-10-29 DSH 补丁：这一段是"时间用完"而不是"挖完了/挖不动了" ⇒ 插件自己接着跑下一段，
+   *   别让 AI 一遍遍重叫（每段仍 ≤11 秒，红线没动）。真障碍/到目标 ⇒ 收掉续跑状态。 */
+  if (reason === 'budget') {
+    if (autoContinue && scheduleStairContinue(self, { pos, dir, targetY: ty, maxSteps, budgetMs, autoContinue: true }, ctx)) {
+      tail = `⏱ 这一轮分到的时间用完了（这次 ${Math.round(budgetMs / 1000)} 秒）—— **我会自己接着挖**（每段仍 ≤11 秒），`
+        + `到 y=${ty} 或撞上真障碍才停；你不用一遍遍重叫，想停下就 \`mc_stop\`。`
+    } else {
+      finishStairRun(self, reason, '')
+    }
+  } else {
+    finishStairRun(self, reason, `🪜 阶梯：${body}。${hint}（${tail}）`)
+  }
   return [`🪜 阶梯：${body}。${hint}`, tail, ...notes].filter(Boolean)
 }
 
@@ -635,6 +766,15 @@ export async function dig (self, {
   if (fluid && isLiquid(fluid)) {
     throw new Error(`${fluid} 是流体，挖不掉 —— 想从水里出来：直接 mc_move 朝岸边走`
       + '（游泳时会自己按住 jump 浮在水面，不会沉）；不知道岸在哪就先 mc_scan 找最近的干燥方块。')
+  }
+  /* 🔴 2026-10-29 DSH 补丁（耐久门槛，从 local-0.4.3 / 2f73fcd 搬回）：长挖（≥4 块）不许拿着
+   *   快断的工具开工 —— 背包里有更耐用的备用就先换；没有就**动手前拒绝**，给可执行的下一步。
+   *   2026-10-26 一天三起同型事故：断镐困 y63 / 镐全断从 y29 往上爬 / 空手困竖井。
+   *   短挖（几下就完）照旧：n ≤ 3 完全不进这道门。 */
+  if (name && n >= 4) {
+    const gate = await longDigGate(self, b, ctx)
+    if (gate.refused) return [gate.note]
+    if (gate.note) out.push(gate.note)
   }
   // 先把要挖的方块列出来（collectBlock 要一份目标清单，它自己会走过去 + 捡掉落物）
   /* 📋 任务记账（用户 2026-10-08 路线图第 ②③ 条）：**一次要挖 4 个以上 = 一件"活儿"**。

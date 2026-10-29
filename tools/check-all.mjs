@@ -29,6 +29,7 @@ const ORDER = [
   'check-core-swim.mjs', 'check-core-map.mjs', 'check-core-inventory.mjs', 'check-core-equip.mjs', 'check-armor-compare.mjs', 'check-core-evidence.mjs',
   'check-call-budget.mjs', 'check-sequence.mjs', 'check-tool-args.mjs', 'check-token-budget.mjs', 'check-async-util.mjs', 'check-worker-pool.mjs', 'check-mc-pathfinder.mjs',
   'check-danger.mjs',
+  'check-desync-guard.mjs',
   'check-action-scheduler.mjs', 'check-perf-monitor.mjs', 'check-move-progress.mjs', 'check-bridge.mjs', 'check-terrain.mjs','check-chunk-model.mjs', 
   'check-water-navigation.mjs', 'check-water-recovery.mjs', 'check-task-epoch.mjs', 'check-msa.mjs', 'check-connection-stale.mjs',
   'check-mc-craft.mjs', 'check-mc-furnace.mjs', 'check-mc-chest.mjs', 'check-mc-trade.mjs', 'check-mc-farm.mjs', 'check-generic-names.mjs', 'check-mc-blueprint.mjs',

@@ -1846,13 +1846,17 @@ export function apply(ctx, rawConfig) {
     /* ── 更新（「MC设置 → 更新」页，用户 2026-10-20）─────────────────────────────
      * 🔴 这个插件是 `link:<源码目录>` 装的（npm 上没有包），所以「新版本」**只可能来自 git 远端**：
      *   比对本地 HEAD 与 `<remote>/<branch>`，落后的提交 + `CHANGELOG.md` 新增的那几行 = "新版加了什么"。
-     *   源优先级：**gitee → origin**（用户：优先用 gitee，github 兜底）。结果缓存 10 分钟，
+     *   源优先级：**origin → gitee**（origin 是自己 fork 的远端，最先；其余按 `updateRemotes` 配置顺序）。结果缓存 10 分钟，
      *   红点靠 `GET /api/mc/update` 轮询，别每次开页面都真去 fetch。 */
     /* 下面三个在**插件作用域**（不是每个请求里）—— 见 §「更新」那段开头的说明 */
 
     /** 跑一条 git 命令（不弹窗、带超时）。返回 `{ code, out, err }`，**永不抛**。 */
     const gitRun = async (args, timeoutMs = 20000, cwd = PLUGIN_ROOT) => {
       const { spawn } = await import('node:child_process')
+      // 网络类子命令（clone/fetch/pull/ls-remote/push）禁掉 git 的交互式凭据弹窗：
+      // 无终端环境里弹窗永远答不了，git 会一直挂着直到超时——401/私有源直接失败退出，由 netHint 给提示。
+      const net = /^(clone|fetch|pull|ls-remote|push)$/.test(String(args?.[0] ?? ''))
+      const full = net ? ['-c', 'credential.interactive=false', ...args] : args
       return await new Promise((resolvePromise) => {
         let out = ''
         let err = ''
@@ -1860,7 +1864,7 @@ export function apply(ctx, rawConfig) {
         const fin = (r) => { if (!settled) { settled = true; resolvePromise(r) } }
         let child
         try {
-          child = spawn('git', args, { cwd, windowsHide: true })
+          child = spawn('git', full, { cwd, windowsHide: true, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } })
         } catch (e) {
           return fin({ code: -1, out: '', err: `起不了 git：${e?.message ?? e}` })
         }
@@ -1888,11 +1892,16 @@ export function apply(ctx, rawConfig) {
      * 用户 2026-10-20 在 Windows 服务器上遇到的：插件是**整份复制**进宿主 `node_modules` 的，
      * 那份目录自己没 `.git` ⇒ 没有远端可比、也没法拉。做法改成：
      * 临时 `git clone --depth 30` 一份 → 比版本/提交 → 要更新就**先整份备份**再覆盖。
-     * 🔴 覆盖只动代码与文档：`.git` / `node_modules` 一律不碰（依赖是宿主装的，动它会炸）。 */
-    const UPDATE_REMOTES = [
-      'https://gitee.com/bluezi/dsh-mc-agent.git',
-      'https://github.com/blueziii/dsh-mc-agent.git',
-    ]
+     * 🔴 覆盖只动代码与文档：`.git` / `node_modules` 一律不碰（依赖是宿主装的，动它会炸）。
+     * 更新源可配（`updateRemotes`，按顺序试）：默认**自己的 fork 优先、上游兜底**；
+     * 旧版默认里的 gitee 源仓库已 401 不存在，且在前会白白拖慢每次更新检查，故移除。 */
+    /** 更新源列表（`src\config.mjs` 的 `updateRemotes` 配置项，getter 已做 URL 校验与默认回落）。 */
+    const updateRemotesOf = () => pluginConfig.updateRemotes
+    /** 网络类 git 错误的统一提示（超时/解析不了/401…）——直连 GitHub 常常抽风，别让人干瞪眼。 */
+    const netHint = (msg) => /timed out|Could not resolve|unable to access|Connection reset|Failed to connect|Recv failure|401|authentication|terminal prompts disabled/i.test(String(msg ?? ''))
+      ? ' —— 直连 GitHub 常常超时/被拒：网络要代理就给 git 配代理（`git config --global http.proxy http://127.0.0.1:端口`），'
+        + '或在配置里改 `updateRemotes` 换成能到的源（镜像/内网 git 都行）。'
+      : ''
     const INSTALL_MARK = '.dsh-mc-agent-install.json'
 
     const stampNow = () => {
@@ -1923,12 +1932,12 @@ export function apply(ctx, rawConfig) {
       }
       return lines.slice(start, end).join('\n').trim().slice(0, 4000)
     }
-    /** 临时 clone 一份最新代码（gitee 优先，github 兜底）。失败返回 `{dir:null, errors}`。 */
+    /** 临时 clone 一份最新代码（按 `updateRemotes` 顺序试：默认自己 fork 优先、上游兜底）。失败返回 `{dir:null, errors}`。 */
     const cloneLatest = async () => {
       const base = mkdtempSync(join(tmpdir(), 'dsh-mc-agent-up-'))
       const dir = join(base, 'repo')
       const errors = []
-      for (const url of UPDATE_REMOTES) {
+      for (const url of updateRemotesOf()) {
         const r = await gitRun(['clone', '--depth', '30', '--quiet', url, dir], 120000, base)
         if (r.code === 0) return { base, dir, url, errors }
         errors.push(`${url}: ${(r.err || r.out || `exit ${r.code}`).trim().slice(0, 200)}`)
@@ -1967,7 +1976,7 @@ export function apply(ctx, rawConfig) {
       const clone = await cloneLatest()
       if (!clone.dir) {
         data.ready = false
-        data.reason = `插件目录不是 git 仓库（复制安装），而且拉不到远端代码：${clone.errors.join('；').slice(0, 400)}`
+        data.reason = `插件目录不是 git 仓库（复制安装），而且拉不到远端代码：${clone.errors.join('；').slice(0, 400)}${netHint(clone.errors.join(' '))}`
         return
       }
       try {
@@ -2020,7 +2029,7 @@ export function apply(ctx, rawConfig) {
     /** 复制安装时真去覆盖：先备份，再覆盖，最后写"这次装的是哪个提交"的标记。 */
     const applyUpdateCopy = async (info) => {
       const clone = await cloneLatest()
-      if (!clone.dir) return { ok: false, error: `拉不到远端代码：${clone.errors.join('；').slice(0, 600)}` }
+      if (!clone.dir) return { ok: false, error: `拉不到远端代码：${clone.errors.join('；').slice(0, 600)}${netHint(clone.errors.join(' '))}` }
       try {
         const pkg = readJsonFile(join(clone.dir, 'package.json')) ?? {}
         if (pkg.name !== 'dsh-mc-agent') return { ok: false, error: `拉到的仓库不是 dsh-mc-agent（name=${pkg.name ?? '?'}），没敢覆盖。` }
@@ -2116,7 +2125,7 @@ export function apply(ctx, rawConfig) {
 
       const rm = await gitRun(['remote'], 8000)
       data.remotes = String(rm.out).split(/\r?\n/).map((x) => x.trim()).filter(Boolean)
-      data.source = ['gitee', 'origin'].find((x) => data.remotes.includes(x)) ?? data.remotes[0] ?? null
+      data.source = ['origin', 'gitee'].find((x) => data.remotes.includes(x)) ?? data.remotes[0] ?? null
       if (!data.source) {
         data.ready = false
         data.reason = '这个仓库一个远端都没配（`git remote` 是空的），不知道去哪找新版本。'
@@ -2126,7 +2135,7 @@ export function apply(ctx, rawConfig) {
       const fetched = await gitRun(['fetch', data.source, '--prune', '--quiet'], 30000)
       if (fetched.code !== 0) {
         data.ready = false
-        data.reason = `拉不到 ${data.source}：${(fetched.err || fetched.out || '').trim().slice(0, 300) || `exit ${fetched.code}`}`
+        data.reason = `拉不到 ${data.source}：${(fetched.err || fetched.out || '').trim().slice(0, 300) || `exit ${fetched.code}`}${netHint(fetched.err || fetched.out)}`
         return remember()
       }
 
@@ -4299,17 +4308,16 @@ export function apply(ctx, rawConfig) {
       + '· use 用方块/实体(who)：门/按钮/拉杆/喂动物；都不给=用手上的\n'
       + '· useitem 用手上的东西：扔眼睛/雪球；**带 x/y/z 会先瞄准、停 450ms 再用**（舀水/骨粉/补种都带坐标）\n'
       + '· equip 装备(name)：护甲自动穿、盾进副手\n'
-      + '· toss 丢弃(name,count)\n'
+      + '· toss 丢弃(name,count)；who=走到 TA 身边扔给队友（报落点）\n'
       + '· jump 原地跳（爬台阶/脱困）\n'
       + '· sleep 睡最近的床（夜里或雷雨才行；白天会直接告诉你别白跑）\n'
       + '· wake 起床（躺着时才有用）\n'
       + '· farm 耕地+播种（给 x/y/z 就那一格，不给就在周围找土；上面熟了的先收）\n'
-      + '· boat 放船并坐上去：自动找周围 2–4 格内**能放船的水面**（水 + 上方空气），对准水面放、\n'
-      + '  放下后复核船底是水，默认上船（board:false 只放），给 x/y/z 就在那附近找\n'
+      + '· boat 放船并坐上去：自动找 2–4 格内的可放船水面，对准放、复核船底是水，默认上船（board:false 只放；可给 x/y/z）\n'
       + '· dismount 从船/矿车/坐骑上下来（开船用 mc_move boat）',
     parameters: {
       mode: { type: 'string', description: '见上面各 mode（默认 look）' },
-      who: { type: 'string', description: '玩家/实体名（look/toward/use）' },
+      who: { type: 'string', description: '玩家/实体名（look/toward/use/toss）' },
       x: { type: 'number', description: '要动的那一块的方块坐标 x（整数格）' },
       y: { type: 'number', description: '要动的那一块的方块坐标 y（整数格）' },
       z: { type: 'number', description: '要动的那一块的方块坐标 z（整数格）' },
@@ -4371,7 +4379,7 @@ export function apply(ctx, rawConfig) {
         case 'useitem': return withOutcome({ mode, ...(await bot.useItem(args)) })
         case 'fish':    return withOutcome({ mode, ...(await fishOnce(bot.requireBot())) })
         case 'equip':   return withOutcome({ mode, ...(await bot.equip({ name: args.name, to: args.to })) })
-        case 'toss':    return withOutcome({ mode, ...(await bot.tossItem({ name: args.name, count: args.count })) })
+        case 'toss':    return withOutcome({ mode, ...(await bot.tossItem({ name: args.name, count: args.count, who: args.who })) })
         /* 用户 2026-10-20：「还有下船」—— 上船一直有（`use`→`activateEntity`），下来没有：
          * `bot.dismount()` 只发包不确认，实现在 `src/boat.mjs`（发完轮询 `bot.vehicle`）。 */
         /* 2026-10-23 一档第 4 条（用户「1档和2档做一下」）：睡觉 / 起床 / 耕地播种。

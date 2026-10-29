@@ -924,9 +924,9 @@ export class McBot extends EventEmitter {
     return await shoot(this.requireBot(), opts, { t: (p, k, l) => this.#t(p, k, l), callLeft: () => this.callLeft(), log: (m) => this.logDebug(m) })
   }
 
-  /** 丢弃手上的物品（`name` 给了就先换上那个）—— 实现在 `src\inventory.mjs`（`tossItem`） */
+  /** 丢弃手上的物品（`name` 给了就先换上那个）；`who` = 走到 TA 旁边瞄身体扔给队友（实现在 `src\inventory.mjs`）。 */
   async tossItem (opts = {}) {
-    return await tossItem(this.requireBot(), opts, { t: (p, k, l) => this.#t(p, k, l) })
+    return await tossItem(this.requireBot(), opts, { t: (p, k, l) => this.#t(p, k, l), self: this })
   }
 
   /* ───────────── 序列执行（需求 5：世界交互往往要连串调用）───────────── */

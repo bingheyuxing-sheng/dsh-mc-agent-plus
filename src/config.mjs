@@ -188,6 +188,14 @@ export const DEFAULT_CONFIG = {
   chatLogDays: 7,
   /** 开 DSH 时查一次更新（默认开；只有显式 false 才关）。见 `src/update.mjs` 无关，逻辑在 index.js 的启动钩子 */
   updateCheckOnStart: true,
+  /**
+   * 更新源 URL 列表（按顺序试；`mc_config` 可改）。默认**自己的 fork 优先、上游兜底**；
+   * 旧版默认里的 gitee 源仓库已 401 不存在，且在前会白白拖慢每次更新检查，故移除。
+   */
+  updateRemotes: [
+    'https://github.com/bingheyuxing-sheng/dsh-mc-agent-plus.git',
+    'https://github.com/blueziii/dsh-mc-agent.git',
+  ],
   /** 文件分享的 base（如 `https://dsh.example.com`，可带路径前缀）；空 = 还没配 */
   expressBase: '',
 
@@ -735,6 +743,12 @@ export class PluginConfig {
   get updateCheckOnStart () {
     return this.get('updateCheckOnStart') !== false
   }
+  /** 更新源列表（非空 http(s) URL 数组，按顺序试；坏值/空 = 回落默认） */
+  get updateRemotes () {
+    const v = this.get('updateRemotes')
+    const list = Array.isArray(v) ? v.map((x) => String(x ?? '').trim()).filter((x) => /^https?:\/\/\S+/.test(x)) : []
+    return list.length ? list : DEFAULT_CONFIG.updateRemotes
+  }
   /** 文件分享的 base（归一化：去尾斜杠；非法/空 = `''`） */
   get expressBase () {
     return normalizeExpressBase(this.get('expressBase')) ?? ''
@@ -848,6 +862,12 @@ function validate (top, rest, value) {
   if (top === 'localWorldName') {
     if (typeof value !== 'string') throw new Error('localWorldName 必须是字符串（本地存档名；空 = 用 localhost:端口 当世界）')
     if (value.trim().length > 64) throw new Error('localWorldName 太长（≤64 字符）')
+    return
+  }
+  if (top === 'updateRemotes') {
+    if (!Array.isArray(value) || !value.length || value.some((x) => typeof x !== 'string' || !/^https?:\/\/\S+/.test(x.trim()))) {
+      throw new Error('updateRemotes 必须是**非空的 http(s) URL 数组**（更新源，按顺序试；默认自己 fork 优先、上游兜底）')
+    }
     return
   }
   if (top === 'allowAllCommands' || top === 'ensureMcPreset' || top === 'expressEnabled' || top === 'memoryPerSession' || top === 'stopOnDanger' || top === 'chatLog' || top === 'updateCheckOnStart') {

@@ -630,7 +630,13 @@ export class Watchdog {
       + lines.join('\n')
       + '\n（看门狗提醒；要完整事件用 mc_events）'
 
-    this.#inject(body, allReasons.join('+'))
+    /* 🔴 2026-10-26 优化清单③：notice 的 summary 是模型常看到的**折叠一行** —— 以前
+     *   只写 `MC 看门狗：${kind}`，事件原文只在正文里，summary 模式下等于丢信息。
+     *   单条事件 summary 带原文（≤220 字）；合并刷屏才用摘要行（≤120）。 */
+    const summary = items.length === 1
+      ? `【MC 看门狗｜${allReasons.map((r) => LABEL[r] ?? r).join(' + ')}】${items[0].text}`.slice(0, 220)
+      : `MC 看门狗：${allReasons.join('+')}（${items.length} 条合并，全文见正文/mc_events）`.slice(0, 120)
+    this.#inject(body, allReasons.join('+'), summary)
     this.lastWakeAt = now
     this.lastWakeKind = allReasons.join('+')
     this._followedUp = false
@@ -646,7 +652,7 @@ export class Watchdog {
    *   · source 是 `{kind:'plugin', form:'notice'}` → 宿主渲染成折叠的一行摘要，不是用户消息
    * 兜底才用 `sessionController.prompt`（那条必然是用户来源）。
    */
-  #inject (text, kind) {
+  #inject (text, kind, summary = null) {
     // 🔴 模式闸门：会话已经不是 MC 模式了 → **绝不注入**（见 constructor 里 gate 的说明）。
     //    失败开放（gate 抛错时按"允许"处理）：宁可偶尔多注入一次，也别把真 MC 会话叫不醒。
     if (typeof this.gate === 'function') {
@@ -693,7 +699,8 @@ export class Watchdog {
           source: {
             kind: 'plugin:dsh-mc-agent',
             form: 'notice',
-            summary: `MC 看门狗：${kind}`.slice(0, 120),
+            /* 🔴 2026-10-26：summary 带原文（调用方给了就用），别让折叠一行只剩"MC 看门狗：xxx"。 */
+            summary: String(summary ?? `MC 看门狗：${kind}`).slice(0, 220),
           },
         })
         agent.steer(message)
