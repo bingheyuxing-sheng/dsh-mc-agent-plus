@@ -85,6 +85,10 @@ window.__ModuleLoader__.load({
 [data-mc-dot][data-mc-warn]{background:var(--dsw-alias-state-warn-primary);}
 [data-mc-text]{color:var(--dsw-alias-label-secondary);}
 [data-mc-sub]{color:var(--dsw-alias-label-tertiary);max-width:24ch;overflow:hidden;text-overflow:ellipsis;}
+/* 2026-10-29：状态条上的「本对话用的账户」—— 一个小胶囊，别抢"在游戏中"的视觉 */
+[data-mc-acct]{display:inline-flex;align-items:center;height:18px;padding:0 7px;border-radius:999px;
+  background:var(--dsw-alias-bg-layer-1,rgba(128,128,128,.12));color:var(--dsw-alias-label-secondary);
+  font-size:11px;max-width:18ch;overflow:hidden;text-overflow:ellipsis;}
 [data-mc-btn]{display:inline-flex;align-items:center;justify-content:center;height:22px;padding:0 9px;
   border:0;border-radius:999px;background:transparent;cursor:pointer;font-size:12px;line-height:1;
   color:var(--dsw-alias-label-secondary);font-family:inherit;}
@@ -614,8 +618,11 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       //    不能因为 online=false 就整个消失（用户会以为插件把状态忘了、AI 也以为还在游戏里）。
       const reconnecting = !online && state.reconnecting === true
       const label = online ? '在游戏中' : (reconnecting ? '重连中…' : '未上线')
+      /* 2026-10-29 用户：这条状态要能看出"本对话用的是哪个账户"（`/api/mc/status` 的 account） */
+      const acct = state.account && state.account.name ? state.account : null
+      const acctTypeLabel = acct ? ((ACCT_TYPE[acct.type] ?? {}).label ?? acct.type ?? '') : ''
       const tip0 = online
-        ? `${address ? address + '：' : ''}在游戏中${stale ? `（有 ${timeouts} 次操作超时，可能已失步）` : ''}`
+        ? `${address ? address + '：' : ''}在游戏中${acct ? `（账户 ${acct.name}${acctTypeLabel ? ` · ${acctTypeLabel}` : ''}）` : ''}${stale ? `（有 ${timeouts} 次操作超时，可能已失步）` : ''}`
         : (reconnecting
           ? `连接断了${address ? '（' + address + '）' : ''}，插件正在自动重连…`
           : (address ? `已连接 ${address} 但角色不在线` : '已连接但角色不在线'))
@@ -637,6 +644,7 @@ select[data-wc-in]{appearance:none;padding-right:22px;
         React.createElement('span', { 'data-mc-dot': '', ...(online && !stale ? {} : { 'data-mc-warn': '' }) }),
         React.createElement('span', { 'data-mc-text': '' }, pollBad ? '状态读不到' : label),
         address ? React.createElement('span', { 'data-mc-sub': '', title: address }, shown) : null,
+        acct ? React.createElement('span', { 'data-mc-acct': '', title: `本对话用的账户：${acct.name}${acctTypeLabel ? `（${acctTypeLabel}）` : ''}` }, acct.name) : null,
         stopErr ? React.createElement('span', { 'data-mc-sub': '', title: stopErr }, '停止失败') : null,
         React.createElement('button', {
           type: 'button', 'data-mc-btn': '', 'data-mc-danger': '',

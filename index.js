@@ -2445,8 +2445,16 @@ export function apply(ctx, rawConfig) {
         || Boolean(sess.bot.reconnecting || sess.bot.reconnectPending)
         || Boolean(sess.watchdog?.armed)
       if (!active) return sendJson(res, 200, { ok: true, active: false })
+      /* 🔴 2026-10-29 用户：状态条要能看出"这个对话用的是哪个账户"（截图红框那一条）。
+       *    本会话选定的账户 = `sess.selectedAccount`（mc_connect 时落的 innerID）；读不到就 null。 */
+      let account = null
+      try {
+        const inner = sess.selectedAccount ?? null
+        const a = inner ? accounts.resolve(inner) : null
+        if (a) { const v = accounts.view(a); account = { name: v.name, type: v.type, innerID: v.innerID } }
+      } catch { /* 账户库读不出来就不显示，不影响状态条 */ }
       return sendJson(res, 200, {
-        ok: true, active: true, sessionId,
+        ok: true, active: true, sessionId, account,
         ...sess.bot.status(), ...sess.modeView(),
         lastTimeout: sess.bot.lastTimeout ?? null,
         timeouts: sess.bot.stats?.timeouts ?? 0,
