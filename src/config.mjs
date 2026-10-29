@@ -191,6 +191,21 @@ export const DEFAULT_CONFIG = {
   /** 文件分享的 base（如 `https://dsh.example.com`，可带路径前缀）；空 = 还没配 */
   expressBase: '',
 
+  /* ── 2026-10-29 优化第二弹（队伍体验）：开关，false 即关 ── */
+  /** 队伍观战页：在线时每 10s 往 `.express/team/` 写自己的状态快照并重渲 team.html（src/spectate.mjs）。 */
+  spectate: true,
+  /** 事件公屏播报：死亡（60s 冷却）/ 任务完成（src/spectate.mjs 的 wireBroadcasts）。 */
+  broadcastEvents: true,
+  /** true（默认）= 地址是本机（127.x / localhost / 本机网卡 IP）且端口没开 ⇒ 自动跑启动脚本。 */
+  localServerAutoStart: true,
+  /**
+   * 本地服务端启动脚本（绝对路径）。**空 = 自动找** `<工作区>/server/start-server.bat`
+   * （也认 start-server.sh / start.bat / start.sh）；都找不到就只提示、不启动。
+   */
+  localServerScript: '',
+  /** 「连接」时最多等端口就绪多少秒（默认 25；再久前端像卡死，剩下的交给 AI 自己重试） */
+  localServerWaitSec: 25,
+
 }
 
 /**

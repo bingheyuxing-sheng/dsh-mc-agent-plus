@@ -9,6 +9,36 @@
 > 现改名为 `dsh-mc-agent`（包名、插件 id、环境变量前缀 `DSH_MC_AGENT_`、记忆/日志目录 `$DSH_HOME\dsh-mc-agent\` 全部跟着改）。
 > **下面历史条目里的旧名与旧路径是当时的样子，保持原样。**
 
+## [0.6.39] - 2026-10-29
+
+### 👥 任务板有了属主：不再互相捡活（`mc_task` 派活/认领/看板）
+
+- **现象**：多个会话共用一份 `tasks.json`，但任务没有"这是谁的活"—— 谁上线都可能把别人的活捡起来接着做
+  （2026-10-26：DeepSeek2 上线就问"手上这个挖泥土的活是干嘛的来着？"）；而且任务文件**读一次就缓存**，
+  队友派的活根本看不见、自己记账还会把别人刚写的盖掉。
+- **现在**：① 每件任务带属主（bot 名），`auto`/`resume` 只接自己的或无主的，接无主任务顺手认领；
+  ② `mc_task` 新增 `board`（全队谁在做哪件）/ `claim`（认领）/ `assign`（派活给队友）；
+  ③ 任务文件改成**按签名（mtime+大小）过期重读**，队友的任务与派活立刻可见，后到者不再覆盖先到者。
+
+### 📺 队伍观战页 + 事件公屏播报
+
+- **观战页**：在线的 bot 每 10 秒往 `.express/team/` 写自己的状态快照（位置/血量/饱食/手上的活），
+  并重渲一个自包含的 `team.html`（深色卡片墙，失联 5 分钟标灰）。要关掉：`mc_admin_config` 设 `spectate false`。
+- **播报**：死亡（60 秒冷却）和任务完成会自动在公屏说一句。要关掉：`mc_admin_config` 设 `broadcastEvents false`。
+
+### 🖱️ 「连接到MC」：本机服务端自动拉起 + 账户在线标记
+
+- **连本机忘了开服**：`mc_connect` 直接 ECONNREFUSED。现在点「连接」时，地址是本机
+  （`127.x` / `localhost` / 本机网卡 IP）而端口没开就**自动拉起** `<工作区>/server/start-server.bat`，
+  等端口就绪（默认 25 秒）再让 AI 去连；远程服一律不碰。配置：
+  `localServerAutoStart` / `localServerScript` / `localServerWaitSec`。
+- **踩到的坑（已修）**：Windows 上 `detached:true + shell:true` 拉 `.bat` **静默失败**（spawn 正常返回、
+  无报错，但 cmd 没执行脚本、端口一直不开）。改成 **Windows 不 detached**（只 `unref`），实测 5 秒起服。
+- **「（离线）」是账户类型不是状态**：下拉里 `DeepSeek（离线）` 让人以为没连上；现在类型写「离线账户」，
+  真在游戏里的账户额外标绿色 **`· 游戏中`**（来自 `/api/mc/sessions` 的 `accountInnerId + online`）。
+- **历史地址只收真地址**：整句提示词（`[system] Connect to the Minecraft server…`）和 `127.0.0.125565`
+  这类拼错的一律不收，读盘时把旧脏条目清掉。
+
 ## [0.6.38] - 2026-10-29
 
 ### 🧗 往上走也是正常功能（和往下走对称）

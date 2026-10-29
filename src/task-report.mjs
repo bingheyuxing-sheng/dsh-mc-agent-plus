@@ -108,13 +108,24 @@ export function taskStart (self, { kind = 'task', goal = null, item = null, tota
   return taskBrief(t)
 }
 
+/** 默认操作对象 = **自己**最近一件活跃任务（2026-10-29：五个会话共享 tasks.json，
+ *  `current()` 不分谁的，会捡到别人的活 —— 见 task-runner 构造器注释）。
+ *  脚本/mock 没有 mine() 时退回 current()。 */
+function ownCurrentId (self) {
+  try {
+    const mine = self.tasks.mine?.({ limit: 1 })
+    if (Array.isArray(mine)) return mine[0]?.taskId ?? null
+  } catch { /* mock 不全就退回旧行为 */ }
+  return ownCurrentId(self) ?? null
+}
+
 export function taskList (self, { limit = 10, all = false } = {}) {
   return self.tasks.list({ limit, all }).map((t) => ({ ...taskBrief(t), line: taskLine(t) }))
 }
 
 /** 单个任务的明细（含最近几条历史）—— `mc_task {action:"get"}` */
 export function taskGet (self, { taskId = null } = {}) {
-  const id = taskId ?? self.tasks.current()?.taskId
+  const id = taskId ?? ownCurrentId(self)
   if (!id) return null
   const t = self.tasks.get(id)
   if (!t) return null
@@ -140,7 +151,7 @@ export function taskResume (self, { taskId = null } = {}) {
  * 只记账，不下发动作。
  */
 export function taskPlan (self, { taskId = null, steps = null } = {}) {
-  const id = taskId ?? self.tasks.current()?.taskId ?? null
+  const id = taskId ?? ownCurrentId(self) ?? null
   if (!id) return { ok: false, reason: '现在没有在做的事' }
   const t = steps ? self.tasks.setSteps(id, steps) : self.tasks.get(id)
   if (!t) return { ok: false, reason: '没有这个任务' }
@@ -153,7 +164,7 @@ export function taskPlan (self, { taskId = null, steps = null } = {}) {
  * `pending` = 把这一步**放回"还没做"**（不记失败、也不记完成）—— 给"动作被打断 / 结果未知"用。
  */
 export function taskStep (self, { taskId = null, step = null, status = 'done', why = null } = {}) {
-  const id = taskId ?? self.tasks.current()?.taskId ?? null
+  const id = taskId ?? ownCurrentId(self) ?? null
   if (!id) return { ok: false, reason: '现在没有在做的事' }
   const t0 = self.tasks.get(id)
   if (!t0) return { ok: false, reason: '没有这个任务' }
@@ -172,28 +183,28 @@ export function taskStep (self, { taskId = null, step = null, status = 'done', w
 }
 
 export function taskNote (self, { taskId = null, text = '' } = {}) {
-  const id = taskId ?? self.tasks.current()?.taskId
+  const id = taskId ?? ownCurrentId(self)
   if (!id) return null
   const t = self.tasks.note(id, text)
   return t ? taskBrief(t) : null
 }
 
 export function taskDone (self, { taskId = null, note = null } = {}) {
-  const id = taskId ?? self.tasks.current()?.taskId
+  const id = taskId ?? ownCurrentId(self)
   if (!id) return null
   const t = self.tasks.finish(id, { ok: true, note })
   return t ? taskBrief(t) : null
 }
 
 export function taskCancel (self, { taskId = null, why = '取消' } = {}) {
-  const id = taskId ?? self.tasks.current()?.taskId
+  const id = taskId ?? ownCurrentId(self)
   if (!id) return null
   const t = self.tasks.cancel(id, why)
   return t ? taskBrief(t) : null
 }
 
 export function taskForget (self, { taskId = null } = {}) {
-  const id = taskId ?? self.tasks.current()?.taskId
+  const id = taskId ?? ownCurrentId(self)
   if (!id) return 0
   return self.tasks.forget(id)
 }

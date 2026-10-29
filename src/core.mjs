@@ -22,7 +22,7 @@ import vec3pkg from 'vec3'
 /* 路线图第 ④ 条的第一刀：把**纯函数**搬出去（`lossless`/`redactPath`/`resolveHarnessHome`）。
  * 三个名字在这里**照样导出**（`export { … } from …`），外部 import 一行都不用改。 */
 import { lossless, redactPath, resolveHarnessHome } from './format.mjs'
-import { TaskRunner, TASK_FILE, taskLine, taskBrief } from './task-runner.mjs'
+import { TASK_FILE, taskLine, taskBrief, taskLedgerOf } from './task-runner.mjs'
 import { taskHave, verdictLine, taskSettle ,
   taskStart as taskStartImpl,
   taskList as taskListImpl,
@@ -314,7 +314,7 @@ export class McBot extends EventEmitter {
      * 不只在对话上下文里 —— 掉线、重连、换一轮对话回来都能接着做。
      * 路径由宿主（`index.js` 的 `asTool`）每次调用喂一次 `setTaskDir()`；
      * 拿不到记忆根（脚本直接 new McBot）就退化成"只在内存里记"，不写文件。 */
-    this.tasks = new TaskRunner({ log: (m) => this.log(m) })
+    this.tasks = taskLedgerOf(this, (m) => this.log(m))   // 属主/收工事件：2026-10-29，见 task-runner.mjs
     /* 统一动作调度器（用户 2026-10-14 设计「统一动作调度」的**阶段 P0：只记账**）。
      * 懒建（见 `actionScheduler()`），因为它只维护"谁在占什么"的一张表，
      * 不碰 `_moveGen` / `_ctrlLease` / `interruptMove` —— 抢占仍然只有那一条路。 */

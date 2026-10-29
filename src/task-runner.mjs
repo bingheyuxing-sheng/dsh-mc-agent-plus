@@ -32,7 +32,7 @@
  *      所以 `start()` **不会**自动塞一套模板步骤 —— 没人推进的步骤表就是假数据。
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, statSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 
 /** 任务状态文件（放在记忆根里：按会话分，重连也在同一份） */
@@ -143,6 +143,7 @@ export function migrateTask (t) {
   if (!Array.isArray(t.steps)) t.steps = []
   if (!Number.isFinite(Number(t.maxAttempts))) t.maxAttempts = DEFAULT_MAX_ATTEMPTS
   if (!Number.isFinite(Number(t.epoch)) || Number(t.epoch) < TASK_EPOCH_START) t.epoch = TASK_EPOCH_START
+  if (!('owner' in t)) t.owner = null    // 2026-10-29：任务属主（见 TaskRunner 构造器注释）
   return t
 }
 
@@ -256,7 +257,7 @@ export function taskBrief (t) {
   if (!t) return null
   return {
     taskId: t.taskId, kind: t.kind, goal: goalTextOf(t), goalSpec: goalSpecOf(t),
-    phase: t.phase, status: t.status, steps: t.steps ?? [], step: stepLine(t),
+    phase: t.phase, status: t.status, owner: t.owner ?? null, steps: t.steps ?? [], step: stepLine(t),
     maxAttempts: Number(t.maxAttempts ?? DEFAULT_MAX_ATTEMPTS),
     progress: t.progress, lastError: t.lastError, loopDetected: t.loopDetected ?? null,
     checkpoint: t.checkpoint ?? null, updatedAt: t.updatedAt, startedAt: t.startedAt,
@@ -401,6 +402,12 @@ export function verdictText (outcome, detail = null) {
 }
 
 
+/** McBot 的台账接线（2026-10-29）：属主 = 当前 bot 用户名；收工 → McBot 的 `taskDone` 事件。
+ *  独立出来是因为 core.mjs 有"外壳 ≤1000 行 / 方法 ≤26 行"的硬规矩（tools/check-module-load.mjs）。 */
+export function taskLedgerOf (self, log = () => {}) {
+  return new TaskRunner({ log, owner: () => self.bot?.username ?? null, onDone: (task) => self.emit('taskDone', { task }) })
+}
+
 /**
  * 任务状态机。一个 `McBot` 一个实例；文件是 `<记忆根>/tasks.json`。
  *
@@ -411,12 +418,17 @@ export function verdictText (outcome, detail = null) {
  *   this.tasks.resume(null, { countOf: (name) => this.#countOf(name) })
  */
 export class TaskRunner {
-  constructor ({ file = null, now = () => Date.now(), log = () => {} } = {}) {
+  constructor ({ file = null, now = () => Date.now(), log = () => {}, owner = null, onDone = null } = {}) {
     this.now = now
     this.log = log
+    /* 🔴 2026-10-29 实机（chat-log 22:36，DeepSeek2：「手上这个挖泥土的活是干嘛的来着？」）：
+     *    五个会话共用一份 tasks.json，而任务原来**没有属主** —— 谁上线都可能把别人的活
+     *    捡起来接着做。`owner` 给每件任务记"这是谁的活"（bot 用户名），`auto/resume` 只认
+     *    自己的或无主的；`onDone` 在任务完成时回调（公屏播报走它，见 src/spectate.mjs）。 */
+    this.ownerOf = typeof owner === 'function' ? owner : () => (owner ?? null)
+    this.onDone = typeof onDone === 'function' ? onDone : null
     this.file = null
     this.data = { version: 1, seq: 0, tasks: [] }
-    this.loaded = false
     if (file) this.setFile(file)
   }
 
@@ -425,24 +437,29 @@ export class TaskRunner {
     const f = file ? String(file) : null
     if (f === this.file) return this
     this.file = f
-    this.loaded = false
     return this
   }
 
   /* ── 落盘 ── */
 
   #load () {
-    if (this.loaded) return this.data
-    this.loaded = true
-    if (!this.file) return this.data
+    if (!this.file) return this.data   // 没落盘路径 = 纯内存台账（脚本直接 new McBot 的场景）
+    /* 🔴 2026-10-29：五个会话共享一份 tasks.json。原来"读一次就缓存" ⇒ 别人写的永远看不见、
+     *    自己 save 时拿旧视图盖掉别人的改动；而**无脑每次重读**又会把"两次 #load 之间还没落盘
+     *    的改动"冲掉（start 里 push 完、note 里又一读 ⇒ 新任务当场丢，check-task-owner 抓出来的）。
+     *    折中：**文件签名（mtime+size）没变就直接用内存这份** —— 自己 save 后把签名作废、
+     *    下次强制重读；别人 save 改了文件 ⇒ 签名对不上 ⇒ 重读。同毫秒同大小的并发写可能漏一拍，
+     *    下一次操作会补上。读→改→写之间仍有窗口期，并发写是"后到者赢" —— 队伍规模下可接受。 */
     try {
-      if (!existsSync(this.file)) return this.data
+      const st = statSync(this.file)
+      const sig = `${st.mtimeMs}:${st.size}`
+      if (sig === this._fileSig) return this.data
       const raw = JSON.parse(readFileSync(this.file, 'utf8'))
       if (raw && Array.isArray(raw.tasks)) this.data = { version: 1, seq: Number(raw.seq ?? 0) || 0, tasks: raw.tasks.map(migrateTask) }
+      this._fileSig = sig
     } catch (e) {
-      // 文件坏了不能让整个插件崩：留一条日志，从空任务表开始
-      this.log(`任务文件读不了（${String(e?.message ?? e).slice(0, 80)}）—— 从空表开始：${this.file}`)
-      this.data = { version: 1, seq: 0, tasks: [] }
+      // 文件坏了/没了不能让插件崩：沿用手里这份（清零会把别人刚写的任务也抹掉）
+      if (e?.code !== 'ENOENT') this.log(`任务文件读不了（${String(e?.message ?? e).slice(0, 80)}）—— 沿用手里这份：${this.file}`)
     }
     return this.data
   }
@@ -455,6 +472,7 @@ export class TaskRunner {
       const tmp = `${this.file}.tmp`
       writeFileSync(tmp, JSON.stringify(this.data, null, 1), 'utf8')
       renameSync(tmp, this.file)      // 原子替换：写到一半掉线也不会留半截 JSON
+      this._fileSig = null            // 自己写完作废签名，下次 #load 强制重读（见 #load 的注释）
       return true
     } catch (e) {
       this.log(`任务文件写不进去：${String(e?.message ?? e).slice(0, 120)}`)
@@ -507,6 +525,7 @@ export class TaskRunner {
       checkpoint: null, lastError: null, loopDetected: null,
       status: 'running', params: { ...params, item: item ?? params.item ?? null },
       attempts: {}, history: [], meta: { ...meta },
+      owner: this.ownerOf() ?? null,   // 2026-10-29：任务属主（见构造器注释）
       /* 代次：见 `TASK_EPOCH_START` 的注释 —— 换了这一代要干什么就 +1 */
       epoch: TASK_EPOCH_START, epochWhy: null, epochAt: now,
       startedAt: now, updatedAt: now,
@@ -525,10 +544,15 @@ export class TaskRunner {
      *    挖原木挖到一半跑去挖石头，原木那条任务仍然算数 —— 回头再挖原木应该接着它，
      *    而不是又开一条新任务（否则任务表里会堆一串同名任务，进度也各自从 0 开始）。 */
     const d = this.#load()
+    /* 🔴 2026-10-29：只接**自己的或无主的**活。别人名下还在跑的同类型任务不去碰 ——
+     *    五个 bot 共享这份台账，没这条就会两个 bot 挖同一组石头、进度记在一起。 */
+    const me = this.ownerOf() ?? null
     const cur = d.tasks
-      .filter((t) => LIVE_STATUSES.includes(t.status) && t.kind === kind && (item == null || t.params?.item === item))
+      .filter((t) => LIVE_STATUSES.includes(t.status) && t.kind === kind && (item == null || t.params?.item === item)
+        && (me == null || t.owner == null || t.owner === me))
       .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))[0] ?? null
     if (cur) {
+      if (cur.owner == null && me != null) cur.owner = me    // 无主任务：谁接算谁的
       cur.updatedAt = this.now()
       /* 🔴 2026-10-19 实机（tasks.json 里 `goalSpec.count=10` 而 `progress.total=5`）：
        * 同一条任务被"接着挖剩下的 5 个"又调了一次 `auto({ total: 5 })`，总目标被改小，
@@ -704,6 +728,8 @@ export class TaskRunner {
     if (note) this.note(taskId, note, { save: false })
     this.log(`任务${ok ? '完成' : '失败'} ${taskLine(t)}`)
     this.save()
+    /* 2026-10-29：收工回调（公屏播报走这里，构造函数里接 onDone）。播报炸了不影响记账。 */
+    if (ok) { try { this.onDone?.(taskBrief(t)) } catch { /* 不影响收工 */ } }
     return t
   }
 
@@ -725,6 +751,50 @@ export class TaskRunner {
     d.tasks = d.tasks.filter((t) => t.taskId !== String(taskId))
     if (d.tasks.length !== before) this.save()
     return before - d.tasks.length
+  }
+
+  /* ── 属主 / 队伍任务板（2026-10-29，多会话共享台账的协作面） ── */
+
+  /** 自己的 + 无主的活跃任务（`resume` 的默认选择范围；按最近更新排序） */
+  mine ({ limit = 10 } = {}) {
+    const me = this.ownerOf() ?? null
+    if (me == null) return this.list({ limit })
+    return this.list({ limit: 100 }).filter((t) => t.owner == null || t.owner === me).slice(0, Math.max(1, Number(limit) || 10))
+  }
+
+  /** 队伍任务板：所有活跃任务连属主一起列（账本是共享的，谁都能看） */
+  board ({ limit = 24 } = {}) {
+    return this.list({ limit }).map((t) => ({
+      taskId: t.taskId, kind: t.kind, goal: goalTextOf(t), owner: t.owner ?? null,
+      status: t.status, done: t.progress?.done ?? 0, total: t.progress?.total ?? null, unit: t.progress?.unit ?? '个',
+      updatedAt: t.updatedAt ?? null,
+    }))
+  }
+
+  /** 认领一件活（无主或别人的都行 —— 队伍内信任环境，谁接谁负责） */
+  claim (taskId) {
+    const me = this.ownerOf() ?? null
+    if (me == null) return { ok: false, reason: '还不知道我是谁（还没连上服务器）' }
+    const t = this.get(taskId)
+    if (!t) return { ok: false, reason: '没有这个任务' }
+    t.owner = me
+    t.updatedAt = this.now()
+    this.note(t.taskId, `${me} 认领了这件活`, { save: false })
+    this.save()
+    return { ok: true, task: taskBrief(t) }
+  }
+
+  /** 派活：把一件任务挂到别人名下（队长派活 / 转交用） */
+  assign (taskId, to) {
+    const who = String(to ?? '').trim()
+    if (!who) return { ok: false, reason: '要给出派给谁（to）' }
+    const t = this.get(taskId)
+    if (!t) return { ok: false, reason: '没有这个任务' }
+    t.owner = who
+    t.updatedAt = this.now()
+    this.note(t.taskId, `派活给 ${who}`, { save: false })
+    this.save()
+    return { ok: true, task: taskBrief(t) }
   }
 
   /* ── 步骤台账（只记账，不下发动作 —— 2026-10-14） ── */
@@ -891,10 +961,16 @@ export class TaskRunner {
    * @param {{countOf?: (item:string)=>number|null}} opts 现场状态：背包里某样东西有几个
    */
   resume (taskId = null, { countOf = null } = {}) {
-    const t = taskId ? this.get(taskId) : this.current()
+    /* 🔴 2026-10-29：默认只恢复**自己的/无主的**任务 —— `current()` 是"最近一件活"，不分谁的，
+     *    共享台账下它会捡到别人的任务（见构造器注释）。 */
+    const t = taskId ? this.get(taskId) : (this.mine({ limit: 1 })[0] ?? null)
     if (!t) return { ok: false, reason: '没有可以恢复的任务', next: 'start', task: null }
     if (t.status === 'done') return { ok: true, done: true, next: 'done', task: taskBrief(t), note: '这个任务已经完成了' }
     if (t.status === 'cancelled') return { ok: false, reason: '这个任务已经被取消', next: 'start', task: taskBrief(t) }
+    const me = this.ownerOf() ?? null
+    if (me != null && t.owner != null && t.owner !== me) {
+      return { ok: false, reason: `这是 ${t.owner} 的活，别替别人接着做（要接先 mc_task {action:"claim"} 认领）`, next: 'start', task: taskBrief(t) }
+    }
 
     const item = t.params?.item ?? null
     const total = t.progress?.total ?? null

@@ -43,6 +43,16 @@ export const RUN_DEFAULTS = {
   waitMs: 5000,       // `waiting` 的复查间隔（到点再由外面叫）
 }
 
+/** 默认跑**自己/无主**的最近一件活跃任务（2026-10-29：共享 tasks.json 下 `current()` 会捡到别人的活）。
+ *  mock ledger 没有 mine() 时退回 current()。 */
+function ownCurrent (ledger) {
+  try {
+    const mine = ledger.mine?.({ limit: 1 })
+    if (Array.isArray(mine)) return mine[0] ?? null
+  } catch { /* mock 不全就退回旧行为 */ }
+  return ledger.current()
+}
+
 /**
  * 步骤的 `op` → 工具名。
  * `op` 可以直接写工具名（`mc_dig`），也可以用这里的动词简写（`dig`）。
@@ -192,7 +202,7 @@ export class TaskExecutor {
    */
   async run ({ taskId = null, budgetMs = null, maxRounds = null, force = false, signal = null, call = null } = {}) {
     if (call && typeof call === 'function') this.call = call
-    const t = taskId ? this.ledger.get(taskId) : this.ledger.current()
+    const t = taskId ? this.ledger.get(taskId) : ownCurrent(this.ledger)
     const brief = () => (t ? taskBrief(this.ledger.get(t.taskId) ?? t) : null)
     const lines = []
     if (!t) return { ok: false, rounds: 0, task: null, lines, reason: '没有可执行的任务' }
@@ -453,7 +463,7 @@ export class TaskExecutor {
    * 反过来的话，任务状态说"已取消"，机器人还在挖 —— 下一个动作就会跟它抢控制位。
    */
   async cancel (taskId = null, why = '取消') {
-    const t = taskId ? this.ledger.get(taskId) : this.ledger.current()
+    const t = taskId ? this.ledger.get(taskId) : ownCurrent(this.ledger)
     if (!t) return null
     if (typeof this.cancelStep === 'function') {
       try {

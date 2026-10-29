@@ -204,6 +204,10 @@ window.__ModuleLoader__.load({
   max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 [data-wc-cn-bubbletext]:hover{text-decoration:underline;}
 [data-wc-cn-bubbletext]:disabled{opacity:.6;cursor:default;text-decoration:none;}
+/* 「连接」进行中：本机地址可能正在拉起服务端，给一行说明（不然等二三十秒像卡死；2026-10-29） */
+[data-wc-cn-starttip]{margin-top:4px;font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary);}
+/* 「· 游戏中」：真·在线状态（2026-10-29）；类型标签仍然是灰的，别混一起看 */
+[data-wc-cn-live]{color:var(--dsw-alias-state-success-primary,#3fb950);font-size:11px;}
 [data-wc-cn-bubblex]{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;padding:0;
   border:0;background:transparent;border-radius:999px;cursor:pointer;color:var(--dsw-alias-label-tertiary);}
 [data-wc-cn-bubblex]:hover{background:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-label-primary-foreground,#fff);}
@@ -1385,9 +1389,11 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       )
     }
 
-    /** 账号类型（气泡文案 + 配色） */
+    /** 账号类型（气泡文案 + 配色）
+     *  🔴 2026-10-29 用户："明明都进入游戏了，还是显示离线" —— 那个「（离线）」说的是**账户类型**
+     *  （离线账户 / 第三方 / 微软），不是在线状态。措辞改成「离线账户」，在线状态另给（见 c-n-live）。 */
     const ACCT_TYPE = {
-      offline: { label: '离线', chip: 'data-wc-chip-offline' },
+      offline: { label: '离线账户', chip: 'data-wc-chip-offline' },
       yggdrasil: { label: '第三方', chip: 'data-wc-chip-ygg' },
       microsoft: { label: '微软', chip: 'data-wc-chip-ms' },
     }
@@ -2409,7 +2415,14 @@ select[data-wc-in]{appearance:none;padding-right:22px;
      *   `POST /api/mc/connect`：**插件注入提示词并让该会话跑一轮**（真正的连接由 LLM 去调
      *   `mc_connect`）；本组件**不自己连**。历史只记**手动输入**的地址，局域网直连不记。
      * 「添加/管理」→ 在**本弹窗之上**叠一个受控的设置弹窗（`initialTab='accounts'`）。
+     * 2026-10-29（用户定）：本机地址点「连接」时后端会自动拉起本地服务端，这里给一行说明
+     *   免得等得像卡死（历史气泡的"点一下填入"已经在更早的版本里做好了）。
      * ================================================================== */
+    /** 本机地址？（与后端 src/local-server.mjs 的 isLocalHost 同口径：回环 + localhost） */
+    const isLocalAddr = (address) => /^(localhost|127\.|::1|\[::1\]|0\.0\.0\.0)(:|$)/i.test(String(address ?? '').trim())
+    const startTip = (address) => (isLocalAddr(address)
+      ? '正在连接…本机地址若服务端没开，插件会自动拉起并等它就绪（最多约 25 秒）'
+      : '正在连接…')
     function McConnectModal(props) {
       const open = props?.open === true
       const sessionId = props?.sessionId ?? null
@@ -2419,6 +2432,8 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       const [accountId, setAccountId] = React.useState('')
       const [acctOpen, setAcctOpen] = React.useState(false)
       const [lan, setLan] = React.useState(null)          // null = 探测中
+      /* 2026-10-29：正在游戏里的账户（`/api/mc/sessions`）—— 下拉里标「· 游戏中」 */
+      const [liveSessions, setLiveSessions] = React.useState([])
       const [busy, setBusy] = React.useState(false)
       const [error, setError] = React.useState('')
       const [settingsOpen, setSettingsOpen] = React.useState(false)
@@ -2439,6 +2454,8 @@ select[data-wc-in]{appearance:none;padding-right:22px;
           setAccountId((cur) => cur || a.defaultAccount || list[0]?.innerID || '')
         }).catch(() => { /* 账户拉不到就不显示账户选择 */ })
         apiGet('/api/mc/servers').then((s) => { if (alive) setServers(Array.isArray(s.servers) ? s.servers : []) }).catch(() => {})
+        /* 2026-10-29：谁在游戏里（按账户 innerID 匹配，下拉里标「· 游戏中」） */
+        apiGet('/api/mc/sessions').then((r) => { if (alive) setLiveSessions(Array.isArray(r.sessions) ? r.sessions : []) }).catch(() => {})
         apiPost('/api/mc/lan', {}).then((r) => { if (alive) setLan(Array.isArray(r.servers) ? r.servers : []) })
           .catch(() => { if (alive) setLan([]) })
         /**
@@ -2538,10 +2555,13 @@ select[data-wc-in]{appearance:none;padding-right:22px;
         if (typeof requestAnimationFrame === 'function') requestAnimationFrame(put)
         else setTimeout(put, 0)
       }
-      // 账户显示：`名字（来源）` —— **「（来源）」用灰色**（用户 2026-10-04）
+      // 账户显示：`名字（类型）`——**类型用灰色**（用户 2026-10-04）；
+      // 2026-10-29：正在游戏里的账户额外标一个绿色的「· 游戏中」（用户要的"真在线状态"）
+      const liveAccts = new Set(liveSessions.filter((s) => s?.online && s.accountInnerId).map((s) => s.accountInnerId))
       const acctLabelNode = (a) => h('span', null,
         a.name,
-        h('span', { 'data-wc-cn-src': '' }, `（${(ACCT_TYPE[a.type] ?? {}).label ?? a.type}）`))
+        h('span', { 'data-wc-cn-src': '' }, `（${(ACCT_TYPE[a.type] ?? {}).label ?? a.type}）`),
+        liveAccts.has(a.innerID) ? h('span', { 'data-wc-cn-live': '' }, ' · 游戏中') : null)
       const current = accts.find((x) => x.innerID === accountId)
       // 局域网行：满了 / 版本不支持 → 标红；点它**直接连接**（不填输入框、不记历史）
       const lanFull = (s) => Boolean(s?.players && s.players.max != null && s.players.online != null && s.players.online >= s.players.max)
@@ -2602,6 +2622,8 @@ select[data-wc-in]{appearance:none;padding-right:22px;
                 onClick: () => removeServer(addr),
               }, IconCloseOutlineRegular ? h(IconCloseOutlineRegular, { size: 11 }) : '×'))))
             : null,
+          // ②' 「连接」进行中：本机地址可能在拉起服务端（后端最多等 localServerWaitSec 秒）
+          busy ? h('div', { 'data-wc-cn-starttip': '', role: 'status' }, startTip(address)) : null,
           // ③ 探测中 → ④ 局域网行
           lan === null
             ? h('div', { 'data-wc-cn-probe': '' },

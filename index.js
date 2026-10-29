@@ -76,6 +76,9 @@ import { listenLanBroadcast } from './src/lan.mjs'
 import { statusPing, parseAddress, formatAddress, flattenMotd } from './src/ping.mjs'
 import { ServerHistory } from './src/serverhistory.mjs'
 import { buildConnectPrompt } from './src/connect-prompt.mjs'
+/* 2026-10-29：点「连接」而地址是本机、服务端没开 ⇒ 插件自己拉起服务端；观战页 + 事件播报 */
+import { ensureLocalServer } from './src/local-server.mjs'
+import { startSpectate, wireBroadcasts } from './src/spectate.mjs'
 import { waitForEvents } from './src/wait.mjs'
 import { launchBoat } from './src/boat.mjs'
 import { lookTrack } from './src/look-track.mjs'
@@ -238,6 +241,10 @@ class McSession {
     this.waitInterruptReason = null
     this._wired = false
     this._wiredHandlers = []
+    /* 2026-10-29：getSession 每次工具调用喂一次记忆根（观战页写盘要用） */
+    this.memRoot = null
+    this._spectateStop = null      // 观战页快照定时器的停止柄（C1）
+    this._unwireBroadcasts = null  // 事件公屏播报的摘除柄（C2）
   }
 
   /**
@@ -262,12 +269,36 @@ class McSession {
     const on = (ev, fn) => { this.bot.on(ev, fn); this._wiredHandlers.push([ev, fn]) }
 
     on('log', (line) => pluginCtx.logger?.info?.(`[${self.agentId}] ${line}`))
-    on('spawn', (e) => self.#pushEvent('lifecycle', `已上线 ${e.sub} @ ${JSON.stringify(e.position)}`))
+    on('spawn', (e) => {
+      self.#pushEvent('lifecycle', `已上线 ${e.sub} @ ${JSON.stringify(e.position)}`)
+      /* 2026-10-29 队伍观战页（C1）：在线期间每 10s 写状态快照到 .express/team/ 并重渲 team.html */
+      if (self.config?.get?.('spectate') !== false && self.memRoot) {
+        try { self._spectateStop?.() } catch { /* 上一个定时器摘不掉也照开新的 */ }
+        try {
+          self._spectateStop = startSpectate(self.bot, { dir: join(expressRootOf(self.memRoot), 'team'), log: (m) => self.bot.log(m) })
+        } catch { self._spectateStop = null }
+      }
+    })
     on('death', (e) => self.#pushEvent('lifecycle', `我死了 @ ${JSON.stringify(e.position)}`))
     on('reconnect', (e) => self.#pushEvent('lifecycle', `已重连 ${e.sub}`))
     // 🔴 断线也要进事件队列（2026-09-19）：`mc_events` 里看得见，AI 才不会以为"一直在线"。
-    on('offline', (e) => self.#pushEvent('lifecycle',
-      `连接断开：${e?.reason ?? '连接结束'}${e?.willReconnect ? '（正在自动重连）' : '（不会自动重连）'}`))
+    on('offline', (e) => {
+      self.#pushEvent('lifecycle',
+        `连接断开：${e?.reason ?? '连接结束'}${e?.willReconnect ? '（正在自动重连）' : '（不会自动重连）'}`)
+      /* 观战页（C1）：下线就摘掉自己的快照，队伍页面上立刻"退场" */
+      try { self._spectateStop?.() } catch {}
+      self._spectateStop = null
+    })
+    /* 2026-10-29 事件公屏播报（C2）：死亡（60s 冷却）/ 任务完成。挂在 McBot 上（跨重连存活），
+     *  所以收在 _unwireBroadcasts 里由 destroy() 摘 —— 不进 _wiredHandlers（那是按连接摘的）。 */
+    if (self.config?.get?.('broadcastEvents') !== false) {
+      try {
+        self._unwireBroadcasts = wireBroadcasts(self.bot, {
+          say: (t) => { try { self.bot.chatSay(t) } catch { /* 不在线就别说 */ } },
+          log: (m) => self.bot.log(m),
+        })
+      } catch { self._unwireBroadcasts = null }
+    }
     on('chat', ({ who, text }) => self.#pushEvent('chat', `<${who}> ${text}`, { who }))
     on('system', ({ text }) => self.#pushEvent('system', text))
     on('damage', (e) => self.#pushEvent('damage', `血量降到 ${e.health} @ ${JSON.stringify(e.position)}`))
@@ -285,6 +316,8 @@ class McSession {
 
   destroy() {
     try { this.watchdog?.disarm('会话结束') } catch {}
+    try { this._spectateStop?.() } catch {}      // 观战页（C1）：停快照、从队伍页面退场
+    try { this._unwireBroadcasts?.() } catch {}  // 事件播报（C2）：摘掉 death/taskDone 监听
     try { this.#unwire() } catch {}
     // 🔴 审计：`McBot.disconnect()` 是 **async**（src/core.mjs → src/connection.mjs），
     // 旧写法 `try { … } catch {}` 只挡同步抛出，抓不到 promise 的拒绝 —— 一旦断开过程里抛错
@@ -421,6 +454,11 @@ class McRegistry {
       online: sess.bot.online,
       sub: sess.bot.sub,
       mode: sess.mode,
+      /* 🔴 2026-10-29 用户（"明明都进入游戏了，还是显示离线"）：账户下拉里那个「（离线）」是**账户类型**
+       *    （离线账户 / 第三方 / 微软），不是在线状态，措辞把人骗了。这里把"哪个账户、哪个角色正在游戏里"
+       *    一并给前端，下拉就能标出「· 游戏中」—— 既说清类型，也真的反映在线状态。 */
+      accountInnerId: sess.selectedAccount ?? null,
+      player: sess.bot.bot?.username ?? null,
       connection: sess.bot.connectionView(),
       pendingEvents: sess.events.length,
       watching: sess.watchdog?.status() ?? null,
@@ -2519,7 +2557,22 @@ export function apply(ctx, rawConfig) {
       const view = acc ? accounts.view(acc) : null
       const accountLabel = view ? `${view.name} (id: ${view.innerID})` : '(默认账户)'
       const asUser = body.asUser === true
+      /* 🔴 2026-10-29 用户定：地址是本机（127.x / localhost / 本机网卡 IP）而服务端没开 ⇒
+       *    **自动拉起**（默认 <工作区>/server/start-server.bat），等端口就绪再让 AI 去连。
+       *    远程服一律不碰；找不到脚本/被关闭/等超时都只往提示词里加一条"该怎么办"，不挡连接。 */
+      let localServer = null
+      try {
+        localServer = await ensureLocalServer({
+          address,
+          workspace: workspaceOf(agent),
+          script: pluginConfig.get('localServerScript') || '',
+          autoStart: pluginConfig.get('localServerAutoStart') !== false,
+          waitSec: Number(pluginConfig.get('localServerWaitSec')) || 25,
+          log: (m) => logLine(`本地服务端：${m}`),
+        })
+      } catch (e) { logLine(`本地服务端检查失败（不影响连接）：${e?.message ?? e}`) }
       const text = buildConnectPrompt({ address, account: accountLabel, via })
+        + (localServer?.note ? `\n${localServer.note}` : '')
       if (via !== 'lan') serverHistory.record(address)
       // 唤醒范式（照抄 src/watchdog.mjs）：先打断可能的 mc_events 等待，再 steer
       try { registry.peek(sessionId)?.interruptWait?.('connect') } catch { /* 没在等就算了 */ }
@@ -2535,7 +2588,21 @@ export function apply(ctx, rawConfig) {
         })
       agent.steer(message)
       logLine(`连接到MC：已${asUser ? '投递玩家消息' : '注入提示词'}（${address}｜${accountLabel}｜via=${via}）`)
-      return sendJson(res, 200, { ok: true, injected: true, asUser, address, account: accountLabel })
+      return sendJson(res, 200, {
+        ok: true, injected: true, asUser, address, account: accountLabel,
+        /* 本机地址才有值：{ local, alreadyRunning|started|timedOut|noScript|disabled, waitedMs } —— 前端只用它提示 */
+        localServer: localServer && localServer.local
+          ? {
+            local: true,
+            alreadyRunning: Boolean(localServer.alreadyRunning),
+            started: Boolean(localServer.started),
+            timedOut: Boolean(localServer.timedOut),
+            noScript: Boolean(localServer.noScript),
+            disabled: Boolean(localServer.disabled),
+            waitedMs: Number(localServer.waitedMs) || 0,
+          }
+          : null,
+      })
     }
 
     /* ── 「MC设置」模态框用的接口（门控名单 / 账户 / 认证服务器 / 白名单 / 提示词 / 文件分享 / 服务器历史与探测）──
@@ -3034,7 +3101,11 @@ export function apply(ctx, rawConfig) {
     // 记忆按会话分：每次工具调用都记一笔"这个工作区现在是谁的"，
     // 好让只拿得到工作区路径的调用点（扩展 / GUI / express）也能落到当前会话的记忆根。
     noteAgent(agent)
-    return registry.getOrCreate(agent.id)
+    const sess = registry.getOrCreate(agent.id)
+    /* 2026-10-29：每次工具调用顺手喂一次记忆根（同 setTaskDir 的路子）——
+     *  观战页写盘（C1）要用它。 */
+    try { sess.memRoot = memoryRootFor(workspaceOf(agent), agent.id) } catch { /* 拿不到就 null，相关功能自动跳过 */ }
+    return sess
   }
 
   /* ── 状态与开关 ── */
@@ -4664,11 +4735,13 @@ export function apply(ctx, rawConfig) {
 
   ctx.tools.register(asTool({
     name: 'mc_task',
-    description: '长活儿进度台账（挖 4 个以上自动开），存记忆根 tasks.json，掉线重连都还在。\n'
-      + '`run` 一轮推进一步；`resume` 复核；`plan`/`step` 记账。',
+    description: '长活儿进度台账（挖 4 个以上自动开），存记忆根 tasks.json（**全队共享一份**），掉线重连都还在。\n'
+      + '`run` 一轮推进一步；`resume` 复核（只恢复自己的活）；`plan`/`step` 记账。\n'
+      + '协作：`board` 看全队谁在做哪件；`claim` 认领无主的活；`assign` 把活派给队友（配 to）。',
     parameters: {
-      action: { type: 'string', description: 'list（默认）| run | get | resume | note | done | cancel | forget | plan | step' },
+      action: { type: 'string', description: 'list（默认）| board（队伍任务板：谁在做哪件）| claim（认领）| assign（派活，配 to）| run | get | resume | note | done | cancel | forget | plan | step' },
       taskId: { type: 'string', description: '任务 id（默认最近一件）' },
+      to: { type: 'string', description: 'assign：派给谁（队友 bot 名，如 mimo）' },
       text: { type: 'string', description: 'note 的话 / step 原因' },
       all: { type: 'boolean', description: 'list 含已完成' },
       limit: { type: 'number', description: 'list 条数 / run 步数上限' },
@@ -4785,11 +4858,31 @@ export function apply(ctx, rawConfig) {
         const n = bot.taskForget({ taskId: id })
         return { text: n ? '📋 删掉了' : '📋 没有这个任务' }
       }
+      /* ── 队伍任务板（2026-10-29：五个会话共享 tasks.json，派活/认领/看板） ── */
+      if (action === 'board') {
+        const rows = bot.tasks.board({ limit: args.limit ?? 24 })
+        if (!rows.length) return { text: '📋 任务板上现在没有在做的事。要派活：先让某人开工（mc_dig 这类会自动开账），再 `mc_task {action:"assign", taskId, to:"名字"}`。' }
+        lines.push('📋 队伍任务板（谁认领了哪件活）：')
+        for (const r of rows) {
+          lines.push(`  · [${r.owner ?? '无主'}] ${r.goal}${r.total != null ? ` ${r.done}/${r.total}${r.unit}` : ''} · ${r.status} · ${r.taskId}`)
+        }
+        return { text: lines.join('\n') }
+      }
+      if (action === 'claim') {
+        const r = bot.tasks.claim(id ?? bot.tasks.current()?.taskId)
+        if (!r?.ok) return { text: `📋 ${r?.reason ?? '没认领成'}` }
+        return { text: `📋 好，这件活现在是我的了：${r.task.taskId} · ${r.task.goal ?? ''}` }
+      }
+      if (action === 'assign') {
+        const r = bot.tasks.assign(id ?? bot.tasks.current()?.taskId, args.to)
+        if (!r?.ok) return { text: `📋 ${r?.reason ?? '没派成'}` }
+        return { text: `📋 已把 ${r.task.taskId}（${r.task.goal ?? ''}）派给 ${String(args.to ?? '').trim()} —— 喊他一嗓子让他 ` + '`mc_task {action:"board"}` 看看' }
+      }
       const list = bot.taskList({ limit: args.limit ?? 10, all: Boolean(args.all) })
       if (!list.length) {
         return { text: '📋 现在没有在做的事。要开一件：直接 `mc_dig {count:16}` 这类"一次干一批"的调用，会自动开工并记账。' }
       }
-      for (const t of list) lines.push(`· ${t.line}`)
+      for (const t of list) lines.push(`· ${t.line}${t.owner ? ` · @${t.owner}` : ''}`)
       return { text: lines.join('\n') }
     },
   }))

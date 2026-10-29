@@ -19,6 +19,25 @@ export const SERVERS_FILE = 'servers.json'
 /** 封顶条数 */
 export const MAX_SERVERS = 20
 
+/**
+ * 像不像一个服务器地址（`host` / `host:port` / `[::1]:port`）。
+ * 🔴 2026-10-29 实机：历史里真出现过
+ *    `[system] Connect to the Minecraft server at 127.0.0.1:25565 using the account …`
+ *    （整句注入提示词被粘进地址框点了「连接」），以及 `127.0.0.125565` 这种断行拼错的。
+ *    这些"地址"点一下就填进输入框、还会被本机判定逻辑当成本机 —— 一律不收，读盘时也清掉。
+ */
+export function isPlausibleAddress (address) {
+  const a = String(address ?? '').trim()
+  if (!a || a.length > 260) return false
+  if (/[\s()（）【】<>"'`,;]/.test(a)) return false
+  if (/^\[[0-9A-Fa-f:.]+\](?::\d{1,5})?$/.test(a)) return true
+  if (!/^[A-Za-z0-9._-]+(?::\d{1,5})?$/.test(a)) return false
+  /* 纯数字+点 = 当成 IPv4 就必须**是** IPv4：`127.0.0.125565`（端口粘到 IP 后面）不是地址 */
+  const host = a.replace(/:\d{1,5}$/, '')
+  if (!/^[\d.]+$/.test(host)) return true
+  return /^(\d{1,3}\.){3}\d{1,3}$/.test(host) && host.split('.').every((n) => Number(n) <= 255)
+}
+
 export class ServerHistory {
   /** @param {{dir:string, log?:(msg:string)=>void}} opts dir = 状态目录（`$DSH_HOME/dsh-mc-agent`；自检里是临时目录） */
   constructor ({ dir, log } = {}) {
@@ -39,10 +58,14 @@ export class ServerHistory {
     try {
       if (!existsSync(this.file)) { this.data = { version: 1, recent: [] }; return }
       const parsed = JSON.parse(readFileSync(this.file, 'utf8'))
-      const recent = Array.isArray(parsed?.recent)
+      const raw = Array.isArray(parsed?.recent)
         ? parsed.recent.map((x) => String(x ?? '').trim()).filter(Boolean)
         : []
+      /* 🔴 2026-10-29：不是地址的一律不收（见 `isPlausibleAddress`）；读盘时顺手清一遍旧脏数据 */
+      const recent = raw.filter((a) => isPlausibleAddress(a))
+      this.cleaned = raw.length - recent.length
       this.data = { version: 1, recent }
+      if (this.cleaned > 0) this.save()   // 清掉脏条目后立刻落盘（写失败只记 lastError，不影响读）
     } catch (e) {
       this.data = { version: 1, recent: [] }
       this.lastError = `服务器历史读取失败（已按空跑）：${e.message}`
@@ -83,10 +106,10 @@ export class ServerHistory {
   get loadFailed () { return Boolean(this._loadFailed) }
   get loadError () { return this._loadError ?? null }
 
-  /** 记一条（去重、最近优先、封顶）。空串忽略。返回最新列表。 */
+  /** 记一条（去重、最近优先、封顶）。空串/不像地址的忽略。返回最新列表。 */
   record (address) {
     const addr = String(address ?? '').trim()
-    if (!addr) return this.list()
+    if (!addr || !isPlausibleAddress(addr)) return this.list()
     this.data.recent = [addr, ...this.data.recent.filter((a) => a !== addr)].slice(0, MAX_SERVERS)
     /* 存不下时 save() 内部会 _report（2026-10-26 审计：原来这里调 this.logger?.warn?，而 logger 从没被赋值） */
     this.save()
